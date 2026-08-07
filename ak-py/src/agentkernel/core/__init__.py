@@ -19,8 +19,10 @@ from .model import (
     AgentRequestImage,
     AgentRequestText,
     AgentReply,
+    AgentReplyAny,
     AgentReplyText,
     AgentReplyImage,
+    StreamChunk,
 )
 from .config import AKConfig as Config
 from .module import Module
@@ -29,3 +31,4 @@ from .service import AgentService
 from .hooks import PreHook, PostHook
 from .tool import ToolContext, ToolBuilder
 from .util.key_value_cache import KeyValueCache
+from .chat_service import ChatService

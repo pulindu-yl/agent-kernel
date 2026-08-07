@@ -8,7 +8,7 @@ Build and run your first AI agent with Agent Kernel in under 5 minutes!
 
 :::info Requirements
 **Python Version:** 3.12 - 3.13.x (Python 3.14+ support to be available soon)  
-**Cloud Platforms:** AWS, Azure (multi-cloud support)
+**Cloud Platforms:** AWS, Azure, GCP (multi-cloud support)
 :::
 
 ## Choose Your Framework
@@ -450,13 +450,62 @@ OpenAIModule([triage_agent, math_agent, history_agent])
 
 handler = Lambda.handler
 ```
+
+Create a deployment folder and add `deploy/main.tf`:
+
+```hcl
+terraform {
+    required_version = ">= 1.9.5"
+}
+
+variable "region" {
+    type    = string
+    default = "us-east-1"
+}
+
+variable "openai_api_key" {
+    type      = string
+    sensitive = true
+}
+
+module "serverless_agents" {
+    source  = "yaalalabs/ak-serverless/aws"
+    version = "0.5.1"
+
+    product_alias        = "ak"
+    env_alias            = "dev"
+    module_name          = "quickstart"
+    region               = var.region
+    product_display_name = "AK Quick Start"
+
+    request_handler = {
+        function_name       = "ak-quickstart"
+        function_description = "Agent Kernel Quick Start Lambda"
+        handler_path        = "lambda.handler"
+        module_name         = "quickstart"
+        package_path        = "../dist"
+        package_type        = "Image"
+        memory_size         = 256
+        timeout             = 45
+        environment_variables = {
+            OPENAI_API_KEY = var.openai_api_key
+        }
+    }
+}
+```
+
+Then initialize and deploy:
+
 ```bash
 # Deploy requires AWS credentials configured
-# Terraform module imported and configured (see examples)
+cd deploy
 terraform init
-terraform apply
+terraform plan -var="openai_api_key=$OPENAI_API_KEY"
+terraform apply -var="openai_api_key=$OPENAI_API_KEY"
 
 ```
+
+For advanced patterns (queue/scalable mode, S3 ZIP artifacts, ECR image URI, custom endpoints), see [AWS Serverless Deployment](./deployment/aws-serverless).
 
 ### Configure Memory
 
@@ -490,8 +539,8 @@ See [session configuration](./core-concepts/configuration.md#session-storage) fo
 # Sessions automatically track conversation history
 # Each user/conversation gets a unique session ID
 # Configure via environment variables:
-# AK_SESSION_STORAGE=redis
-# AK_REDIS_URL=redis://localhost:6379
+# AK_SESSION__TYPE=redis
+# AK_SESSION__REDIS__URL=redis://localhost:6379
 ```
 
 ## Examples Gallery

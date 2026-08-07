@@ -1,0 +1,555 @@
+import asyncio
+import base64
+import json
+import logging
+from collections.abc import AsyncGenerator, Generator
+from typing import Any, Dict, List, Optional, Union
+
+from .config import AKConfig
+from .model import (
+    AgentReplyAny,
+    AgentReplyImage,
+    AgentReplyText,
+    AgentRequestAny,
+    AgentRequestFile,
+    AgentRequestImage,
+    AgentRequestText,
+    BaseChatRequest,
+    BaseRunRequest,
+    StreamChunk,
+)
+from .service import AgentService
+from .thread import ConversationThreadManager
+
+
+class RequestBuilder:
+    """Constructs AgentRequest object lists from various input sources."""
+
+    _log = logging.getLogger("ak.chatservice.requestbuilder")
+
+    @staticmethod
+    def _max_file_size() -> int:
+        # Read on demand: importing agentkernel must not load AKConfig
+        return AKConfig.get().api.max_file_size
+
+    @staticmethod
+    def from_base_request_sync(req: BaseRunRequest) -> List[Any]:
+        """Build agent request list from BaseRunRequest synchronously.
+
+        :param req: Base run request containing prompt, images, files, and additional context
+        :return: List of AgentRequest objects for processing
+        """
+        requests = [AgentRequestText(prompt=req.prompt)]
+        RequestBuilder._add_images(requests, req.images)
+        RequestBuilder._add_files(requests, req.files)
+        RequestBuilder._attach_additional_context(req, requests)
+        return requests
+
+    @staticmethod
+    async def from_base_request_async(req: BaseChatRequest) -> List[Any]:
+        """Build agent request list from a BaseChatRequest asynchronously.
+
+        :param req: Base chat request (may be a BaseRunRequest with FileData/ImageData
+                    or a multipart/upload-style request defined elsewhere)
+        :return: List of AgentRequest objects for processing
+        """
+        requests = [AgentRequestText(prompt=req.prompt)]
+
+        # If this is a BaseRunRequest, it contains FileData/ImageData objects
+        # (base64 or URLs) — handle them synchronously. Otherwise, assume
+        # multipart/upload-style objects and attempt to process them
+        # via the async multipart handlers.
+        if isinstance(req, BaseRunRequest):
+            RequestBuilder._add_images(requests, req.images)
+            RequestBuilder._add_files(requests, req.files)
+            RequestBuilder._attach_additional_context(req, requests)
+        else:
+            # For other subclasses (e.g., upload objects) try async multipart
+            await RequestBuilder._add_multipart_files(requests, getattr(req, "files", None))
+            await RequestBuilder._add_multipart_images(requests, getattr(req, "images", None))
+
+        return requests
+
+    @staticmethod
+    def _add_images(requests: List[Any], images):
+        """Add image requests to the request list.
+
+        :param requests: List to append image requests to
+        :param images: List of image objects with image_data, name, and mime_type
+        :return: None
+        """
+        if not images:
+            return
+        for image in images:
+            RequestBuilder._log.debug(f"Adding image: {image.name}")
+            if not image.image_data.startswith(("http://", "https://", "data:", "s3://")) and not image.mime_type:
+                raise ValueError("mime_type is missing for image input, either in the base64 or explicitly")
+            requests.append(
+                AgentRequestImage(
+                    image_data=image.image_data,
+                    name=image.name,
+                    mime_type=image.mime_type,
+                )
+            )
+
+    @staticmethod
+    def _add_files(requests: List[Any], files):
+        """Add file requests to the request list.
+
+        :param requests: List to append file requests to
+        :param files: List of file objects with file_data, name, and mime_type
+        :return: None
+        """
+        if not files:
+            return
+        for file in files:
+            RequestBuilder._log.debug(f"Adding file attachment: {file.name}")
+            if not file.file_data.startswith(("http://", "https://", "data:", "s3://")) and not file.mime_type:
+                raise ValueError("mime_type is missing for file input, either in the base64 or explicitly")
+            requests.append(
+                AgentRequestFile(
+                    file_data=file.file_data,
+                    name=file.name,
+                    mime_type=file.mime_type,
+                )
+            )
+
+    @staticmethod
+    def _attach_additional_context(req: BaseRunRequest, requests: List[Any]):
+        """Attach additional context fields from request as AgentRequestAny objects.
+
+        :param req: Base run request containing additional context fields
+        :param requests: List to append context requests to
+        :return: None
+        """
+        known_fields = {"request_id", "user_id", "group_id", "thread_name", "prompt", "agent", "session_id", "images", "files"}
+        for key, value in req.model_dump().items():
+            if key in known_fields:
+                continue
+            RequestBuilder._log.info(f"Adding additional context: {key}={value}")
+            requests.append(AgentRequestAny(name=key, content=value))
+
+    @staticmethod
+    async def _add_multipart_files(requests: List[Any], files: Optional[List[Any]]):
+        """Process and add multipart uploaded files to request list.
+
+        :param requests: List to append file requests to
+        :param files: Optional list of uploaded file objects from multipart form
+        :return: None
+        """
+        if not files:
+            return
+        for file in files:
+            RequestBuilder._log.debug(f"Processing uploaded file: {file.filename}")
+            content = await file.read()
+            if len(content) > RequestBuilder._max_file_size():
+                raise ValueError(f"File {file.filename} exceeds maximum size ({len(content) / (1024 * 1024):.2f} MB)")
+            requests.append(
+                AgentRequestFile(
+                    file_data=base64.b64encode(content).decode("utf-8"),
+                    name=file.filename or "unknown",
+                    mime_type=file.content_type,
+                )
+            )
+
+    @staticmethod
+    async def _add_multipart_images(requests: List[Any], images: Optional[List[Any]]):
+        """Process and add multipart uploaded images to request list.
+
+        :param requests: List to append image requests to
+        :param images: Optional list of uploaded image objects from multipart form
+        :return: None
+        """
+        if not images:
+            return
+        for image in images:
+            RequestBuilder._log.debug(f"Processing uploaded image: {image.filename}")
+            content = await image.read()
+            if len(content) > RequestBuilder._max_file_size():
+                raise ValueError(f"Image {image.filename} exceeds maximum size ({len(content) / (1024 * 1024):.2f} MB)")
+            if image.content_type and not image.content_type.startswith("image/"):
+                raise ValueError(f"Invalid image type: {image.content_type}")
+            requests.append(
+                AgentRequestImage(
+                    image_data=base64.b64encode(content).decode("utf-8"),
+                    name=image.filename or "unknown",
+                    mime_type=image.content_type,
+                )
+            )
+
+
+class AgentHandler:
+    """Manages AgentService lifecycle: selection, validation, and execution."""
+
+    _log = logging.getLogger("ak.chatservice.agenthandler")
+
+    def __init__(self):
+        """Initialize AgentHandler with no active service.
+
+        :return: None
+        """
+        self.service: Optional[AgentService] = None
+
+    def initialize(self, session_id: str, agent: Optional[str]):
+        """Initialize AgentService with session and agent selection.
+
+        :param session_id: Session identifier for the agent
+        :param agent: Optional agent name/identifier to select
+        :return: None
+        :raises ValueError: If no agent is available after selection
+        """
+        self.service = AgentService()
+        self.service.select(session_id, agent)
+        if not self.service.agent:
+            raise ValueError("No agent available")
+
+    @staticmethod
+    def _run_async_sync(coro) -> Any:
+        """Run an async coroutine from sync code, handling event loop state.
+
+        :param coro: Coroutine to execute
+        :return: Result of the coroutine
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                asyncio.set_event_loop(asyncio.new_event_loop())
+                return asyncio.run(coro)
+            else:
+                return loop.run_until_complete(coro)
+        except RuntimeError:
+            return asyncio.run(coro)
+
+    def run_sync(self, requests: List[Any]) -> Any:
+        """Run agent requests synchronously.
+
+        :param requests: List of AgentRequest objects to process
+        :return: Agent execution result
+        """
+        return AgentHandler._run_async_sync(self.service.run_multi(requests=requests))
+
+    async def run_async(self, requests: List[Any]) -> Any:
+        """Run agent requests asynchronously.
+
+        :param requests: List of AgentRequest objects to process
+        :return: Agent execution result
+        """
+        return await self.service.run_multi(requests=requests)
+
+    def run_stream_sync(self, requests: List[Any]) -> List[Any]:
+        """Run agent streaming requests synchronously.
+
+        Manages event loop lifecycle internally and returns all chunks as a list.
+
+        :param requests: List of AgentRequest objects to process
+        :return: List of StreamChunk objects
+        """
+
+        async def _collect():
+            chunks = []
+            async for chunk in self.service.stream_multi(requests=requests):
+                chunks.append(chunk)
+            return chunks
+
+        return AgentHandler._run_async_sync(_collect())
+
+    async def run_stream_async(self, requests: List[Any]) -> AsyncGenerator[Any, None]:
+        """Run agent streaming requests asynchronously.
+
+        :param requests: List of AgentRequest objects to process
+        :return: AsyncGenerator yielding StreamChunk objects
+        """
+        async for chunk in self.service.stream_multi(requests=requests):
+            yield chunk
+
+    def get_response_session_id(self, session_id: Optional[str]) -> Optional[str]:
+        """Get the session ID for the response.
+
+        :param session_id: Original session ID from request
+        :return: Response session ID from service or original if service unavailable
+        """
+        return self.service.get_response_session_id(session_id) if self.service else session_id
+
+
+class ResponseBuilder:
+    """Formats agent results and errors into response dicts."""
+
+    @staticmethod
+    def build_response(status_code: int, session_id: Optional[str], rest_api_mode: bool, result: Any = None, error: Optional[Exception] = None):
+        """Build response from agent result or error.
+
+        :param status_code: HTTP status code
+        :param session_id: Session identifier for the response
+        :param rest_api_mode: If True, return dict only on success or raise HTTPException on error; if False, return tuple
+        :param result: Agent execution result (mutually exclusive with error)
+        :param error: Exception that occurred (mutually exclusive with result)
+        :return: Response dict or (status_code, response_dict) tuple; raises HTTPException if error in rest_api_mode
+        """
+        if error:
+            response_dict = {"error": str(error)}
+        else:
+            response_dict = {
+                "result": str(result) if isinstance(result, (AgentReplyText, AgentReplyImage, AgentReplyAny)) else "Non textual result received"
+            }
+
+        if session_id:
+            response_dict["session_id"] = session_id
+
+        if error and rest_api_mode:
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=status_code, detail=response_dict)
+
+        return response_dict if rest_api_mode else (status_code, response_dict)
+
+    @staticmethod
+    def stream_chunk(chunk: StreamChunk, session_id: str, sse_format: bool = False) -> str:
+        """Format a StreamChunk as JSON or SSE.
+
+        :param chunk: StreamChunk to format
+        :param session_id: Session identifier to include in the payload
+        :param sse_format: When True, wrap the JSON payload as an SSE frame.
+        :return: JSON string or SSE-formatted string with excluded None values
+        """
+        payload_dict = chunk.model_dump(exclude_none=True)
+        payload_dict["session_id"] = session_id
+        payload = json.dumps(payload_dict)
+        return f"data: {payload}\n\n" if sse_format else payload
+
+
+class ChatService:
+    def __init__(self, rest_api_mode: bool = False):
+        """Initialize ChatService.
+
+        :param rest_api_mode: If True, use FastAPI error handling; if False, use tuple responses
+        :return: None
+        """
+        self._log = logging.getLogger("ak.chatservice")
+        self.rest_api_mode = rest_api_mode
+
+    def process_chat_request(self, req: BaseRunRequest) -> Union[tuple[int, Dict[str, Any]], Dict[str, Any]]:
+        """Process a chat request synchronously.
+
+        :param req: Base run request with prompt, session_id, agent, and attachments
+        :return: When rest_api_mode=False: tuple of (status_code, response_dict).
+                 When rest_api_mode=True: response_dict only.
+        """
+        session_id = req.session_id
+        handler = AgentHandler()
+        try:
+            self._validate(req)
+            thread_manager = self._validate_thread(req)
+            requests = RequestBuilder.from_base_request_sync(req)
+            handler.initialize(session_id, req.agent)
+            requests = self._thread_pre_run(thread_manager, req, requests)
+            result = handler.run_sync(requests)
+            self._thread_post_run(thread_manager, req, result)
+            return ResponseBuilder.build_response(200, handler.get_response_session_id(session_id), self.rest_api_mode, result=result)
+        except ValueError as ve:
+            self._log.error(f"ValueError processing request: {ve}")
+            return ResponseBuilder.build_response(400, handler.get_response_session_id(session_id), self.rest_api_mode, error=ve)
+        except Exception as e:
+            self._log.error(f"Error processing request: {e}")
+            return ResponseBuilder.build_response(500, handler.get_response_session_id(None), self.rest_api_mode, error=e)
+
+    async def process_async_chat_request(self, req: BaseChatRequest) -> Union[tuple[int, Dict[str, Any]], Dict[str, Any]]:
+        """Process a chat request asynchronously.
+
+        :param req: Base chat request (could be a BaseRunRequest or another subclass
+                    that represents multipart/upload requests).
+        :return: When rest_api_mode=False: tuple of (status_code, response_dict).
+                 When rest_api_mode=True: response_dict only.
+        """
+        session_id = req.session_id
+        handler = AgentHandler()
+        try:
+            if not session_id:
+                raise ValueError("No session_id is provided in the request")
+            if not req.prompt:
+                raise ValueError("No prompt provided in the request")
+            thread_manager = self._validate_thread(req)
+            requests = await RequestBuilder.from_base_request_async(req)
+            handler.initialize(session_id, req.agent)
+            requests = self._thread_pre_run(thread_manager, req, requests)
+            result = await handler.run_async(requests)
+            self._thread_post_run(thread_manager, req, result)
+            return ResponseBuilder.build_response(200, handler.get_response_session_id(session_id), self.rest_api_mode, result=result)
+        except ValueError as ve:
+            self._log.error(f"ValueError processing request: {ve}")
+            return ResponseBuilder.build_response(400, handler.get_response_session_id(session_id), self.rest_api_mode, error=ve)
+        except Exception as e:
+            self._log.error(f"Error processing request: {e}")
+            return ResponseBuilder.build_response(500, handler.get_response_session_id(session_id), self.rest_api_mode, error=e)
+
+    async def process_stream_chat_async(
+        self,
+        req: BaseChatRequest,
+        sse_format: bool = False,
+    ) -> AsyncGenerator[str, None]:
+        """Process a streaming chat request asynchronously.
+
+        Validate, initialize, and return a streaming chat response generator.
+
+        :param req: Base chat request with prompt, session_id, agent, and optional attachments
+        :param sse_format: When True, yield Server-Sent Events formatted frames.
+                           When False, yield raw StreamChunk JSON payloads.
+        :return: Async generator yielding StreamChunk payloads as JSON or SSE-formatted strings
+        :raises ValueError: If session_id or prompt is missing, no agent is available,
+                            or user_id is missing while thread support is enabled
+        """
+        session_id = req.session_id
+        if not session_id:
+            raise ValueError("No session_id is provided in the request")
+        if not req.prompt:
+            raise ValueError("No prompt provided in the request")
+        thread_manager = self._validate_thread(req)
+        requests = await RequestBuilder.from_base_request_async(req)
+        requests = self._thread_pre_run(thread_manager, req, requests)
+        handler = AgentHandler()
+        handler.initialize(session_id, req.agent)
+
+        async def _stream() -> AsyncGenerator[str, None]:
+            deltas: List[str] = []
+            error_seen = False
+            try:
+                async for chunk in handler.run_stream_async(requests):
+                    if chunk.error:
+                        error_seen = True
+                    if chunk.delta:
+                        deltas.append(chunk.delta)
+                    yield ResponseBuilder.stream_chunk(chunk, session_id, sse_format=sse_format)
+                # A halted/errored stream (error chunk, no raise) or an empty one must
+                # not record a blank assistant message in the thread.
+                if not error_seen and deltas:
+                    self._thread_post_run(thread_manager, req, "".join(deltas))
+            except Exception as e:
+                error_chunk = StreamChunk(error=str(e), done=True)
+                yield ResponseBuilder.stream_chunk(error_chunk, session_id, sse_format=sse_format)
+
+        return _stream()
+
+    def process_stream_chat_sync(
+        self,
+        req: BaseRunRequest,
+        sse_format: bool = False,
+    ) -> Generator[str, None, None]:
+        """Process a streaming chat request synchronously.
+
+        Validates and initializes eagerly (before returning the generator), then
+        yields formatted streaming chunks. Mirrors the async version's pattern so
+        ValueError is raised at call time, not deferred until the first iteration.
+
+        :param req: Base run request with prompt, session_id, agent, and attachments
+        :param sse_format: When True, yield Server-Sent Events formatted frames.
+                           When False, yield raw StreamChunk JSON payloads.
+        :return: Generator yielding StreamChunk payloads as JSON or SSE-formatted strings
+        :raises ValueError: If session_id or prompt is missing, no agent is available,
+                            or user_id is missing while thread support is enabled
+        """
+        session_id = req.session_id
+        if not session_id:
+            raise ValueError("No session_id is provided in the request")
+        if not req.prompt:
+            raise ValueError("No prompt provided in the request")
+        thread_manager = self._validate_thread(req)
+        requests = RequestBuilder.from_base_request_sync(req)
+        requests = self._thread_pre_run(thread_manager, req, requests)
+        handler = AgentHandler()
+        handler.initialize(session_id, req.agent)
+
+        def _stream() -> Generator[str, None, None]:
+            deltas: List[str] = []
+            error_seen = False
+            try:
+                for chunk in handler.run_stream_sync(requests):
+                    if chunk.error:
+                        error_seen = True
+                    if chunk.delta:
+                        deltas.append(chunk.delta)
+                    yield ResponseBuilder.stream_chunk(chunk, session_id, sse_format=sse_format)
+                # A halted/errored stream (error chunk, no raise) or an empty one must
+                # not record a blank assistant message in the thread.
+                if not error_seen and deltas:
+                    self._thread_post_run(thread_manager, req, "".join(deltas))
+            except Exception as e:
+                error_chunk = StreamChunk(error=str(e), done=True)
+                yield ResponseBuilder.stream_chunk(error_chunk, session_id, sse_format=sse_format)
+
+        return _stream()
+
+    @staticmethod
+    def _validate(req: BaseRunRequest):
+        """Validate that required fields are present in the request.
+
+        :param req: Base run request to validate
+        :return: None
+        :raises ValueError: If session_id or prompt is missing
+        """
+        if req.session_id is None:
+            raise ValueError("No session_id is provided in the request")
+        if not req.prompt:
+            raise ValueError("No prompt provided in the request")
+
+    @staticmethod
+    def _validate_thread(req: BaseChatRequest) -> Optional["ConversationThreadManager"]:
+        """Return the shared ConversationThreadManager when thread support is
+        enabled, enforcing the user_id requirement. Returns None when disabled.
+
+        :param req: Chat request to validate
+        :return: The shared manager, or None when thread support is disabled
+        :raises ValueError: If thread support is enabled and user_id is missing
+        """
+        manager = ConversationThreadManager.get()
+        if manager is not None and not req.user_id:
+            raise ValueError("No user_id is provided in the request — user_id is required when thread support is enabled")
+        return manager
+
+    def _thread_pre_run(
+        self,
+        manager: Optional["ConversationThreadManager"],
+        req: BaseChatRequest,
+        requests: List[Any],
+    ) -> List[Any]:
+        """Thread-mode work done before the agent runs: store attachment bytes,
+        create/load the thread, append the user message, and return the rebuilt
+        request list in which stored attachments are replaced by in-band
+        AgentRequestAttachmentRef entries for MultimodalPreHook to resolve.
+
+        store_attachments runs first — its config-validation rejections (raised
+        as ValueError) must fire before any thread state exists, so a rejected
+        request leaves no phantom thread behind.
+
+        No-op when thread support is disabled (manager is None) — returns the
+        requests unchanged.
+
+        :param manager: The shared ConversationThreadManager, or None
+        :param req: The originating chat request
+        :param requests: The built AgentRequest list (may carry attachments)
+        :return: The (possibly rebuilt) request list to run the agent with.
+        """
+        if manager is None:
+            return requests
+        requests, attachments = manager.store_attachments(session_id=req.session_id, requests=requests)
+        manager.get_or_create_thread(
+            session_id=req.session_id,
+            user_id=req.user_id,
+            group_id=req.group_id,
+            name=req.thread_name,
+            first_prompt=req.prompt,
+        )
+        manager.append_message(req.session_id, "user", req.prompt, attachments=attachments)
+        return requests
+
+    @staticmethod
+    def _thread_post_run(manager: Optional["ConversationThreadManager"], req: BaseChatRequest, result: Any) -> None:
+        """Thread-mode work done after a successful agent run: append the
+        assistant message. No-op when thread support is disabled.
+
+        :param manager: The shared ConversationThreadManager, or None
+        :param req: The originating chat request
+        :param result: The agent's reply
+        :return: None
+        """
+        if manager is None:
+            return
+        manager.append_message(req.session_id, "assistant", str(result))

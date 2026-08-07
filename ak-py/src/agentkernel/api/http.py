@@ -72,7 +72,10 @@ class RESTAPI:
         """
         cls._log.debug(f"Adding custom router")
         for route in router.routes:
-            cls._log.debug(f"Route: {route.path} [{route.methods}]")
+            route_path = getattr(route, "path", None)
+            route_methods = getattr(route, "methods", None)
+            if route_path is not None:
+                cls._log.debug(f"Route: {route_path} [{route_methods}]")
         cls._custom_routers.append(router)
 
     @classmethod
@@ -90,6 +93,15 @@ class RESTAPI:
         for handler in handlers:
             if handler is not None:
                 routers.append(handler.get_router())
+
+        if AKConfig.get().thread is not None:
+            from .thread import ThreadRESTRequestHandler
+
+            # Mount the thread router automatically unless the user supplied their own
+            # (e.g. one constructed with a custom Authoriser).
+            if not any(isinstance(handler, ThreadRESTRequestHandler) for handler in handlers):
+                cls._log.info("Thread support is enabled — mounting thread routes")
+                routers.append(ThreadRESTRequestHandler().get_router())
 
         if AKConfig.get().a2a.enabled:
             from .a2a.handler import A2ARESTRequestHandler

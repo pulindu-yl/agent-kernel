@@ -18,6 +18,11 @@ on:
         required: false
         type: boolean
         default: true
+      enable_cache:
+        description: 'Whether to enable build cache save/restore steps'
+        required: false
+        type: boolean
+        default: true
     secrets:
       APP_ID:
         required: false
@@ -40,12 +45,12 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.checkout_ref }}
       
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       
@@ -61,12 +66,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.checkout_ref }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -78,10 +83,11 @@ jobs:
         run: ./build.sh
 
       - name: Cache ak-py build
-        uses: actions/cache/save@v4
+        if: ${{ inputs.enable_cache }}
+        uses: actions/cache/save@v5
         with:
           path: ak-py/dist
-          key: ak-py-${{ github.sha }}
+          key: ak-py-${{ inputs.checkout_ref }}
 
   script-tests:
     runs-on: ubuntu-latest
@@ -90,12 +96,12 @@ jobs:
         shell: bash -e {0}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.checkout_ref }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -107,6 +113,10 @@ jobs:
         working-directory: scripts
         run: python test_update_terraform_versions.py
 
+      - name: Test update_skills_version script
+        working-directory: scripts
+        run: python test_update_skills_version.py
+
   unit-tests:
     needs: [build-ak-py]
     runs-on: ubuntu-latest
@@ -115,12 +125,12 @@ jobs:
         shell: bash -e {0}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.checkout_ref }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -128,10 +138,11 @@ jobs:
         run: pip install uv
 
       - name: Restore ak-py build
-        uses: actions/cache/restore@v4
+        if: ${{ inputs.enable_cache }}
+        uses: actions/cache/restore@v5
         with:
           path: ak-py/dist
-          key: ak-py-${{ github.sha }}
+          key: ak-py-${{ inputs.checkout_ref }}
 
       - name: Test ak-py
         working-directory: ak-py
@@ -151,12 +162,12 @@ jobs:
         shell: bash -e {0}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.checkout_ref }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -164,10 +175,11 @@ jobs:
         run: pip install uv
 
       - name: Restore ak-py build
-        uses: actions/cache/restore@v4
+        if: ${{ inputs.enable_cache }}
+        uses: actions/cache/restore@v5
         with:
           path: ak-py/dist
-          key: ak-py-${{ github.sha }}
+          key: ak-py-${{ inputs.checkout_ref }}
 
       - name: Run test - ${{ matrix.path }}
         env:

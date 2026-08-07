@@ -21,14 +21,29 @@ variable "module_type" {
 
 variable "source_bucket" {
   type        = string
-  description = "S3 bucket used to store the agent runner source package"
+  description = "S3 bucket containing the agent runner source package (used for signing job)"
   default     = null
 }
 
-variable "cloudwatch_logs_retention_in_days" {
-  type        = number
-  description = "CloudWatch log retention period in days"
-  default     = 90
+variable "source_key" {
+  type        = string
+  description = "S3 key of the agent runner source package (used for signing job)"
+  default     = null
+}
+
+variable "source_version_id" {
+  type        = string
+  description = "S3 object version ID of the source package (required for production code signing)"
+  default     = null
+}
+
+variable "s3_existing_package" {
+  description = "Pre-built s3_existing_package object from lambda-package module (bucket + key). Pass null for non-S3Zip deployments."
+  type = object({
+    bucket = string
+    key    = string
+  })
+  default = null
 }
 
 variable "docker_image_uri" {
@@ -79,6 +94,12 @@ variable "redis_url" {
   default     = null
 }
 
+variable "valkey_url" {
+  type        = string
+  description = "URL of the Valkey cluster"
+  default     = null
+}
+
 variable "is_production" {
   description = "Is production"
   type        = bool
@@ -100,16 +121,17 @@ variable "lambda_signing_config_arn" {
 variable "agent_runner" {
   description = "Agent runner configuration object"
   type = object({
-    function_name         = optional(string, "agent-runner")
-    function_description   = optional(string, "Agent runner Lambda for processing input queue messages")
-    timeout               = optional(number, 30)
-    memory_size           = optional(number, 512)
-    package_path          = string
-    package_type          = optional(string, "LocalZip")
-    handler_path          = optional(string, "agent_runner.handler")
-    module_name           = optional(string, "agent-runner")
-    layers                = optional(list(string), [])
-    environment_variables = optional(map(string), {})
+    function_name                  = optional(string, "agent-runner")
+    function_description           = optional(string, "Agent runner Lambda for processing input queue messages")
+    timeout                        = optional(number, 30)
+    memory_size                    = optional(number, 512)
+    package_path                   = optional(string, null)
+    package_type                   = string
+    handler_path                   = optional(string, "agent_runner.handler")
+    module_name                    = optional(string, "agent-runner")
+    layers                         = optional(list(string), [])
+    environment_variables          = optional(map(string), {})
+    cloudwatch_logs_retention_in_days = optional(number, 90)
   })
 }
 

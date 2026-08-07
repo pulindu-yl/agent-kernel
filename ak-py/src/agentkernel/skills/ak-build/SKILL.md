@@ -26,6 +26,7 @@ Use this skill to add new tools, agents, or handoffs to an existing Agent Kernel
    - `from agentkernel.langgraph import LangGraphModule` → **LangGraph**
    - `from agentkernel.crewai import CrewAIModule` → **CrewAI**
    - `from agentkernel.adk import GoogleADKModule` → **Google ADK**
+   - `from agentkernel.smolagents import SmolagentsModule` → **Smolagents**
 
 2. **Existing agents** — List every agent already defined (names, roles, instructions).
 
@@ -129,6 +130,19 @@ agent = Agent(name="support", model=LiteLlm(model="openai/gpt-4o-mini"),
               description="...", instruction="...", tools=tools)
 ```
 
+**Smolagents:**
+```python
+from agentkernel.smolagents import SmolagentsToolBuilder
+
+tools = SmolagentsToolBuilder.bind([lookup_order, existing_tool_1])
+agent = ToolCallingAgent(
+    tools=tools,
+    model=model,
+    name="support",
+    description="...",
+)
+```
+
 > **Gotcha:** Always add the new tool to the **existing** `bind()` call for that agent. Don't create a second `bind()`.
 
 ---
@@ -202,6 +216,20 @@ support_agent = Agent(
 
 > **Gotcha (Google ADK):** Use `LiteLlm(model="openai/gpt-4o-mini")` — never pass a bare model string like `"gpt-4o-mini"`.
 
+**Smolagents:**
+```python
+from smolagents import LiteLLMModel, ToolCallingAgent
+from agentkernel.smolagents import SmolagentsToolBuilder
+
+model = LiteLLMModel(model_id="openai/gpt-4o")
+support_agent = ToolCallingAgent(
+    tools=SmolagentsToolBuilder.bind([lookup_order]),
+    model=model,
+    name="support",
+    description="You help customers with order lookups, returns, and general support questions.",
+)
+```
+
 #### 4b. Register with the Module
 
 Add the new agent to the **existing** Module constructor call. Do not create a second Module.
@@ -214,7 +242,29 @@ OpenAIModule([triage_agent, math_agent, general_agent])
 OpenAIModule([triage_agent, math_agent, general_agent, support_agent])
 ```
 
-This applies to all frameworks — `LangGraphModule`, `CrewAIModule`, `GoogleADKModule` work the same way.
+This applies to all frameworks — `LangGraphModule`, `CrewAIModule`, `GoogleADKModule`, `SmolagentsModule` work the same way.
+
+#### 4c. Structured Output (Optional)
+
+To make an agent return a typed dict instead of plain text, define a Pydantic model and configure it on the agent (or, for CrewAI, on the module). The runner returns an `AgentReplyAny` whose `content` is the result as a dict; `str(reply)` is the JSON serialization, so text-based consumers (CLI, chat integrations) work unchanged. Applies to non-streaming execution only.
+
+```python
+from pydantic import BaseModel
+
+class OrderStatus(BaseModel):
+    order_id: str
+    status: str
+```
+
+| Framework | How to configure |
+|-----------|------------------|
+| OpenAI Agents SDK | `Agent(..., output_type=OrderStatus)` |
+| LangGraph | `create_react_agent(..., response_format=OrderStatus)` |
+| CrewAI | `CrewAIModule([agent], output_pydantic={"support": OrderStatus})` — or `output_json={...}`; keyed by agent `role` |
+| Google ADK | `LlmAgent(..., output_schema=OrderStatus)` |
+| Smolagents | No schema parameter — have the agent pass a dict or Pydantic instance to `final_answer` |
+
+> **Gotcha (CrewAI):** CrewAI puts the output schema on the `Task`, not the `Agent` — and Agent Kernel builds the task internally per run, so the schema is passed to the `CrewAIModule` constructor keyed by agent role.
 
 ---
 
@@ -283,6 +333,20 @@ Use transfer_to_agent to delegate:
 )
 ```
 
+**Smolagents:**
+
+Add the new agent to the triage agent's `managed_agents` list:
+
+```python
+triage_agent = ToolCallingAgent(
+    tools=[],
+    model=model,
+    name="triage",
+    description="You determine which agent to use based on the user's question.",
+    managed_agents=[math_agent, general_agent, support_agent],  # Add here
+)
+```
+
 ---
 
 ### Step 6: Add Hooks (Optional)
@@ -312,7 +376,7 @@ If the new tool or agent requires additional packages, update `pyproject.toml`:
 
 ```toml
 dependencies = [
-    "agentkernel[openai,api,redis]>=0.2.13",
+    "agentkernel[openai,api,redis]>=0.6.1",
     "httpx>=0.27.0",        # Add any new deps for your tool
 ]
 ```
@@ -360,6 +424,8 @@ curl -X POST http://localhost:8000/run \
 | **LangGraph `name=`** | Always pass `name=` to `create_react_agent()`. Without it, the supervisor cannot route to the agent. |
 | **CrewAI `role=`** | Use `role=` as the agent identifier, not `name=`. Agent Kernel reads `agent.role` as the agent name. |
 | **CrewAI `verbose=`** | Set `verbose=False` on agents to prevent noisy console output. |
+| **CrewAI conversation history** | CrewAI runner keeps its own per-session transcript (last 20 lines) prepended to each task description, independent of the Memory feature. If `Memory.remember()` fails (e.g. no embedder configured), the runner logs a warning and continues instead of failing the run. |
+| **CrewAI structured output** | Configured on the module, not the agent: `CrewAIModule([agent], output_pydantic={"<role>": Model})`. The native `crewai.Agent` rejects an `output_pydantic` attribute (it belongs to the `Task`, which Agent Kernel builds per run). |
 | **Google ADK `LiteLlm`** | Wrap the model string: `LiteLlm(model="openai/gpt-4o-mini")`. A bare string won't work. |
 | **Env var nesting** | Use `__` (double underscore) as the nested delimiter: `AK_REDIS__URL`, `AK_WHATSAPP__ACCESS_TOKEN`. |
 | **Single Module** | Only one Module instance per framework. Add new agents to the existing Module's agent list. |

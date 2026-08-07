@@ -33,6 +33,20 @@ make lint-check       # ak-py only
 make lint-check-all   # ak-py + examples
 ```
 
+### Auto-format a remote branch (CI)
+
+To apply formatting on a remote branch without running the tools locally, trigger the
+**Lint and Commit** GitHub Actions workflow (`.github/workflows/lint-fix.yml`) manually from the
+Actions tab (`workflow_dispatch`). It takes two inputs:
+
+- **`lint_target`**: which Makefile target to run — `lint`, `lint-examples`, or `lint-all`
+  (default).
+- **`branch`**: the branch to format and commit the changes to.
+
+The workflow runs the selected target and pushes a `chore:` commit with any formatting changes
+back to the chosen branch. Protected branches (currently `develop`) are rejected before any
+changes are made.
+
 ### Configuration
 
 In `ak-py/pyproject.toml`:
@@ -112,6 +126,10 @@ test: add unit tests for CosmosDB session store
 
 ## Pull Request Process
 
+### Base Branch
+
+Branch from and target `develop`, not `main` — CI (`.github/workflows/code-quality.yml`) runs on pull requests against `develop`, and `origin/HEAD` points there.
+
 ### Before Submitting
 
 1. **Run tests**: `cd ak-py && uv run pytest`
@@ -126,6 +144,7 @@ test: add unit tests for CosmosDB session store
 - **Update docs** — if the change affects user-facing behavior
 - **Add examples** — for new features, add or update examples
 - **Fill in the PR template** — description, type of change, testing done
+- **Check [CODEOWNERS](../../../CODEOWNERS)** — confirm the required reviewer for the paths touched before assuming no one needs to review a change
 
 ### PR Types
 
@@ -166,6 +185,14 @@ The version appears in:
 
 ```bash
 git clone https://github.com/yaalalabs/agent-kernel.git
+cd agent-kernel
+make dev-setup                # Installs pyenv, Python 3.12, uv, then syncs ak-py venv
+# or directly: ./scripts/dev-setup.sh
+```
+
+Alternatively, set things up manually:
+
+```bash
 cd agent-kernel/ak-py
 ./build.sh                    # Creates venv, installs deps
 ```

@@ -37,7 +37,29 @@ variable "package_path" {
 
 variable "source_bucket" {
   type        = string
-  description = "S3 bucket used to store the request handler source package"
+  description = "S3 bucket containing the request handler source package (used for signing job)"
+  default     = null
+}
+
+variable "source_key" {
+  type        = string
+  description = "S3 key of the request handler source package (used for signing job)"
+  default     = null
+}
+
+variable "source_version_id" {
+  type        = string
+  description = "S3 object version ID of the source package (required for production code signing)"
+  default     = null
+}
+
+variable "s3_existing_package" {
+  description = "Pre-built s3_existing_package object from lambda-package module (bucket + key). Pass null for non-S3Zip deployments."
+  type = object({
+    bucket = string
+    key    = string
+  })
+  default = null
 }
 
 variable "cloudwatch_logs_retention_in_days" {
@@ -191,9 +213,21 @@ variable "redis_url" {
   default     = null
 }
 
+variable "valkey_url" {
+  type        = string
+  description = "URL of the Valkey cluster"
+  default     = null
+}
+
 variable "response_store_redis" {
   type        = any
   description = "Redis response store configuration"
+  default     = null
+}
+
+variable "response_store_valkey" {
+  type        = any
+  description = "Valkey response store configuration"
   default     = null
 }
 
@@ -237,4 +271,13 @@ variable "product_display_name" {
   type        = string
   description = "Product display name"
   default     = null
+}
+
+variable "websocket_connections_dynamodb" {
+  description = "DynamoDB configuration for websocket connections table"
+  type = object({
+    table_name = string
+    table_arn  = string
+  })
+  default = null
 }

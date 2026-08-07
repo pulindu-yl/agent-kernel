@@ -2,12 +2,15 @@
 name: ak-add-capabilities
 description: >
   Add capabilities to an existing Agent Kernel project. This skill guides you through
-  adding guardrails, tracing/observability, session persistence, MCP server, A2A server,
-  pre/post hooks, and multimodal support. Generates configuration and code changes needed.
+  adding guardrails, tracing/observability, session persistence, knowledge bases, MCP server,
+  A2A server, pre/post hooks, multimodal support, and conversation thread support. Session
+  persistence supports Redis, DynamoDB (AWS), Cosmos DB (Azure), and Firestore (GCP).
+  Conversation threads support in-memory, Redis, DynamoDB (AWS), Firestore (GCP), and
+  Cosmos DB (Azure) backends. Generates configuration and code changes needed.
 license: Apache-2.0
 metadata:
   author: yaalalabs
-  version: "0.2.13"
+  version: "0.6.1"
   category: user
 ---
 
@@ -29,11 +32,13 @@ Which capability would you like to add?
 
 1. **Guardrails** — Content safety filters for input and/or output
 2. **Tracing** — Observability and monitoring (Langfuse or OpenLLMetry)
-3. **Session Persistence** — Durable conversation state (Redis, DynamoDB, Cosmos DB)
-4. **MCP Server** — Expose agents as Model Context Protocol tools
-5. **A2A Server** — Agent-to-Agent communication protocol
-6. **Hooks** — Custom pre/post processing (RAG, logging, prompt modification)
-7. **Multimodal** — Image and file attachment support
+3. **Session Persistence** — Durable conversation state (Redis, DynamoDB, Cosmos DB, Firestore)
+4. **Knowledge Base** — Durable cross-session knowledge tools (ChromaDB, Neo4j, Starburst, or custom backend)
+5. **MCP Server** — Expose agents as Model Context Protocol tools
+6. **A2A Server** — Agent-to-Agent communication protocol
+7. **Hooks** — Custom pre/post processing (RAG, logging, prompt modification)
+8. **Multimodal** — Image and file attachment support
+9. **Conversation Threads** — Persistent, named conversation history keyed by `session_id`
 
 ### Step 3: Generate Changes
 
@@ -48,7 +53,7 @@ Which capability would you like to add?
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api]>=0.2.13",
+    "agentkernel[openai,api]>=0.6.1",
     # OpenAI guardrails use the openai extra — already included if using OpenAI framework
 ]
 ```
@@ -102,7 +107,7 @@ guardrail:
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,aws]>=0.2.13",
+    "agentkernel[openai,api,aws]>=0.6.1",
 ]
 ```
 
@@ -128,7 +133,7 @@ guardrail:
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,walledai]>=0.2.13",
+    "agentkernel[openai,api,walledai]>=0.6.1",
 ]
 ```
 
@@ -165,7 +170,7 @@ export WALLED_API_KEY="your-walledai-api-key"
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,langfuse]>=0.2.13",
+    "agentkernel[openai,api,langfuse]>=0.6.1",
 ]
 ```
 
@@ -190,7 +195,7 @@ export LANGFUSE_HOST="https://cloud.langfuse.com"   # or self-hosted URL
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,openllmetry]>=0.2.13",
+    "agentkernel[openai,api,openllmetry]>=0.6.1",
 ]
 ```
 
@@ -207,14 +212,14 @@ trace:
 
 #### Session Persistence
 
-**Ask:** Which backend — Redis, DynamoDB (AWS), or Cosmos DB (Azure)?
+**Ask:** Which backend — Redis, DynamoDB (AWS), Cosmos DB (Azure), or Firestore (GCP)?
 
 **For Redis:**
 
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,redis]>=0.2.13",
+    "agentkernel[openai,api,redis]>=0.6.1",
 ]
 ```
 
@@ -234,7 +239,7 @@ session:
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,aws]>=0.2.13",
+    "agentkernel[openai,api,aws]>=0.6.1",
 ]
 ```
 
@@ -256,7 +261,7 @@ session:
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,azure]>=0.2.13",
+    "agentkernel[openai,api,azure]>=0.6.1",
 ]
 ```
 
@@ -273,6 +278,118 @@ session:
 
 3. Set `AZURE_COSMOS_KEY` environment variable.
 
+**For Firestore (GCP):**
+
+1. Update `pyproject.toml`:
+```toml
+dependencies = [
+    "agentkernel[openai,api,gcp]>=0.6.1",
+]
+```
+
+2. Update `config.yaml`:
+```yaml
+session:
+  type: firestore
+  cache: 256
+  firestore:
+    collection_name: "ak_sessions"
+    project_id: "<your-gcp-project-id>"   # optional, inferred from ADC if omitted
+    ttl: 604800
+```
+
+3. Enable a TTL policy on the Firestore collection pointing to the `expiry_time` field for automatic document expiry.
+
+---
+
+#### Knowledge Base
+
+Add durable knowledge tools that your agents can query and update across sessions.
+
+**Ask:** Which backend do you want to use?
+- ChromaDB (semantic/vector)
+- Neo4j (graph/relationships)
+- Starburst (read-only SQL via Trino)
+- Custom adapter (developer extension)
+
+**1. Update `pyproject.toml` dependencies based on backend:**
+
+```toml
+dependencies = [
+  "agentkernel[openai,api,chromadb]>=0.6.1",  # for Chroma
+  # or "agentkernel[openai,api,neo4j]>=0.6.1"
+  # or "agentkernel[openai,api,trino]>=0.6.1"
+]
+```
+
+**2. Configure backend + `KnowledgeBuilder` in your agent file (OpenAI example):**
+
+```python
+from agents import Agent
+from agentkernel.cli import CLI
+from agentkernel.knowledgebase.chroma import ChromaManager
+from agentkernel.knowledgebase.knowledgebuilder import KnowledgeBuilder
+from agentkernel.openai import OpenAIModule, OpenAIToolBuilder
+
+backend = ChromaManager(name="ChromaDB").add_schema(
+  {
+    "description": "Semantic vector store for unstructured facts",
+    "store_payload": {"text": "string", "source": "string"},
+    "read_payload": {"query": "string", "limit": "int"},
+  }
+)
+
+kb = KnowledgeBuilder([backend])
+kb_tools = kb.build()  # -> get_schemas, read_kb, write_kb, get_all_kb_descriptions
+
+router = Agent(
+  name="kb_router",
+  instructions="Call get_schemas() first, then route reads/writes to the correct backend.",
+  tools=OpenAIToolBuilder.bind(kb_tools),
+)
+
+OpenAIModule([router])
+
+if __name__ == "__main__":
+  CLI.main()
+```
+
+**3. Multi-backend routing with semantic placeholders (for Starburst or mixed backends):**
+
+```python
+kb = KnowledgeBuilder(
+  [backend_a, backend_b],
+  semantic_map={
+    "<SHEETS_SOURCE>": "TABLE(kb_sheets.system.sheet(id => 'SHEET_ID'))",
+    "<MONGO_SOURCE>": "mongodb.default.clients",
+  },
+)
+```
+
+**4. Backend notes:**
+- `ChromaManager`: semantic search and fuzzy retrieval.
+- `Neo4jManager`: entity/relationship graphs and Cypher queries.
+- `StarburstManager`: **read-only**; use `read_kb`, do not route `write_kb`.
+
+**5. Environment variables (examples):**
+
+```bash
+# Neo4j
+export NEO4J_URI="bolt://localhost:7687"
+export NEO4J_USERNAME="neo4j"
+export NEO4J_PASSWORD="password"
+
+# Starburst
+export STARBURST_HOST="<cluster>.trino.galaxy.starburst.io"
+export STARBURST_USER="<user>"
+export STARBURST_PASSWORD="<password-or-token>"
+export STARBURST_PORT=443
+```
+
+**6. If the user asks for a new backend adapter:**
+- Add a custom backend by implementing `KnowledgeBase` under `ak-py/src/agentkernel/knowledgebase/`.
+- Use developer skill `.agents/skills/ak-dev-new-knowledgebase-integration/SKILL.md` for contributor workflows.
+
 ---
 
 #### MCP Server
@@ -282,7 +399,7 @@ Expose your agents as MCP (Model Context Protocol) tools so other AI systems can
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,mcp]>=0.2.13",
+    "agentkernel[openai,api,mcp]>=0.6.1",
 ]
 ```
 
@@ -308,7 +425,7 @@ Enable Agent-to-Agent communication via Google's A2A protocol.
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,a2a]>=0.2.13",
+    "agentkernel[openai,api,a2a]>=0.6.1",
 ]
 ```
 
@@ -344,7 +461,7 @@ class RAGPreHook(PreHook):
         prompt = ""
         for req in requests:
             if isinstance(req, AgentRequestText):
-                prompt = req.text
+                prompt = req.prompt
                 break
 
         # Retrieve relevant context (your RAG logic here)
@@ -353,7 +470,7 @@ class RAGPreHook(PreHook):
         # Modify the prompt with additional context
         if context:
             enhanced_prompt = f"Context: {context}\n\nUser question: {prompt}"
-            return [AgentRequestText(text=enhanced_prompt)]
+            return [AgentRequestText(prompt=enhanced_prompt)]
 
         return requests
 
@@ -376,7 +493,7 @@ class DisclaimerPostHook(PostHook):
     async def on_run(
         self, session: Session, requests: list[AgentRequest], agent: Agent, agent_reply: AgentReply
     ) -> AgentReply:
-        agent_reply.text += "\n\n_Disclaimer: This is AI-generated content._"
+        agent_reply.response += "\n\n_Disclaimer: This is AI-generated content._"
         return agent_reply
 
     def name(self) -> str:
@@ -395,6 +512,14 @@ module.pre_hook(agent, [RAGPreHook()])
 module.post_hook(agent, [DisclaimerPostHook()])
 ```
 
+**Streaming token hook (optional):** override `on_stream_chunk` on a `PostHook` to inspect or modify each token delta while `execution.mode: stream` is active (e.g. redact sensitive text before it reaches the client). Return `None` to drop a token entirely. Only called when streaming; regular `on_run()` still handles the non-streaming path.
+
+```python
+class RedactingPostHook(DisclaimerPostHook):
+    async def on_stream_chunk(self, session, requests, agent, delta: str) -> str | None:
+        return delta.replace("SECRET", "***")
+```
+
 ---
 
 #### Multimodal Support
@@ -408,7 +533,7 @@ Enable image and file processing in your agents.
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,multimodal]>=0.2.13",
+    "agentkernel[openai,api,multimodal]>=0.6.1",
 ]
 ```
 
@@ -433,7 +558,7 @@ multimodal:
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,redis,multimodal]>=0.2.13",
+    "agentkernel[openai,api,redis,multimodal]>=0.6.1",
 ]
 ```
 
@@ -456,7 +581,7 @@ multimodal:
 1. Update `pyproject.toml`:
 ```toml
 dependencies = [
-    "agentkernel[openai,api,aws,multimodal]>=0.2.13",
+    "agentkernel[openai,api,aws,multimodal]>=0.6.1",
 ]
 ```
 
@@ -529,6 +654,133 @@ export AK_MULTIMODAL__DYNAMODB__TABLE_NAME="ak-attachments"
 
 ---
 
+#### Conversation Thread Support
+
+Enable persistent, named conversation threads keyed by `session_id`.
+
+**Ask:** Which thread store backend — in-memory (default, dev), Redis, DynamoDB (AWS), Firestore (GCP), or Cosmos DB (Azure)?
+
+**Basic setup (in-memory store, good for development):**
+
+1. Update `pyproject.toml`:
+```toml
+dependencies = [
+    "agentkernel[openai,api]>=0.6.1",
+]
+```
+
+2. Update `config.yaml`:
+```yaml
+thread:
+  type: memory  # other supported backends: redis | dynamodb | firestore | cosmosdb
+```
+
+3. No further code changes needed. When enabled:
+   - `user_id` becomes required on every chat request
+   - A thread is auto-created on a session's first request
+   - `GET /api/v1/threads` and `GET /api/v1/threads/{session_id}` become available for reading thread history (open by default, or protected by a pluggable `Authoriser`)
+   - Threads are auto-named by an LLM call deriving a concise title from the first prompt (falls back to a truncated prompt prefix without `litellm`/an API key)
+   - Sending `thread_name` on any chat request sets/renames the thread and locks it against automatic naming
+
+**For LLM-based thread naming**, add the `thread` extra:
+```toml
+dependencies = [
+    "agentkernel[openai,api,thread]>=0.6.1",
+]
+```
+```yaml
+thread:
+  type: memory
+  naming:
+    model: "gpt-4o-mini"   # LiteLLM model used to name threads
+    max_length: 80
+```
+
+**For Redis storage (production, persistent, distributed):**
+
+```toml
+dependencies = [
+    "agentkernel[openai,api,redis,thread]>=0.6.1",
+]
+```
+```yaml
+thread:
+  type: redis
+  redis:
+    url: "redis://localhost:6379"
+    prefix: "ak:thread:"
+    ttl: 2592000            # Thread TTL in seconds (30 days, 0 disables)
+```
+
+**For DynamoDB storage (serverless/AWS):**
+
+```toml
+dependencies = [
+    "agentkernel[openai,api,aws,thread]>=0.6.1",
+]
+```
+```yaml
+thread:
+  type: dynamodb
+  dynamodb:
+    table_name: "ak-agent-threads"   # partition key session_id (S), sort key sk (S)
+    ttl: 0
+```
+
+**For Firestore storage (serverless/GCP):**
+
+```yaml
+thread:
+  type: firestore
+  firestore:
+    collection_name: "ak-agent-threads"
+    ttl: 0
+```
+
+**For Cosmos DB storage (Azure, Table API):**
+
+```yaml
+thread:
+  type: cosmosdb
+  cosmosdb:
+    connection_string: "${AZURE_COSMOS_CONNECTION_STRING}"
+    table_name: "akagentthreads"
+```
+
+**Protecting the read endpoints with an Authoriser:**
+
+```python
+from typing import Optional
+from agentkernel.api import RESTAPI, AgentRESTRequestHandler, ThreadRESTRequestHandler
+from agentkernel.core.thread import Authoriser
+
+class DemoAuthoriser(Authoriser):
+    def authorise(self, token: str) -> Optional[str]:
+        # Validate the ****** against your own auth provider, return the user_id or None.
+        return {"alice-token": "alice", "bob-token": "bob"}.get(token)
+
+RESTAPI.run(handlers=[AgentRESTRequestHandler(), ThreadRESTRequestHandler(authoriser=DemoAuthoriser())])
+```
+
+Passing an explicit `ThreadRESTRequestHandler` replaces the default open thread routes that are mounted
+automatically when a `thread` block is present in `config.yaml`. With an Authoriser configured, thread listings
+are scoped to the resolved `user_id` and reading another user's thread is rejected (403).
+
+**Attachments in thread mode:** require `multimodal.enabled: true` with a shared attachment store —
+`in_memory`, `redis`, or `dynamodb` (`session_cache` is rejected).
+
+**Send a chat request with a thread:**
+
+```bash
+curl -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "What is the capital of France?", "session_id": "ses-1", "user_id": "alice", "thread_name": "Capitals quiz"}'
+```
+
+See `examples/api/thread-openai` and `examples/api/multimodal/thread-openai`.
+
+---
+
 ### What to Do Next
 
 You've added new capabilities to your project. Here's what you might do next:
@@ -537,3 +789,4 @@ You've added new capabilities to your project. Here's what you might do next:
 - **Connect a messaging platform** → Use the `ak-add-integration` skill to add Slack, WhatsApp, Telegram, or other channels so users can interact with your enhanced agents.
 - **Deploy to cloud** → Use the `ak-cloud-deploy` skill to deploy your agent (with all its capabilities) to AWS or Azure.
 - **Set up testing** → Use the `ak-test` skill to verify your capabilities work correctly — especially guardrails and hooks.
+- **Extend knowledge backends** → Contributors can use `.agents/skills/ak-dev-new-knowledgebase-integration/SKILL.md` to add new KnowledgeBase adapters.

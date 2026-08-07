@@ -3,19 +3,16 @@
 [![PyPI version](https://badge.fury.io/py/agentkernel.svg)](https://badge.fury.io/py/agentkernel)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 
-Agent Kernel is a lightweight **multi-cloud AI agent runtime** and adapter layer for building and running AI agents across multiple frameworks and cloud providers. Deploy the same agent code to **AWS or Azure** without modification. Migrate your existing agents to Agent Kernel and instantly utilize pre-built execution and testing capabilities.
-
-**Supported Cloud Platforms:** AWS, Azure
+Agent Kernel is a lightweight **AI agent runtime** and adapter layer for building and running AI agents across multiple frameworks. Migrate your existing agents to Agent Kernel and instantly utilize pre-built execution and testing capabilities. Deploy the same agent code without modification — see the "Multi-Cloud Deployment" section below for supported platforms.
 
 ## Features
 
 - **Unified API**: Common abstractions (Agent, Runner, Session, Module, Runtime) across frameworks
 - **Multi-Framework Support**: OpenAI Agents SDK, CrewAI, LangGraph, Google ADK, and Smolagents
-- **Multi-Cloud Deployment**: Deploy to AWS (Lambda, ECS/Fargate) or Azure (Functions, Container Apps) with the same code
-- **Session Management**: Built-in session abstraction with multi-cloud storage (Redis, DynamoDB, Cosmos DB)
+- **Session Management**: Built-in session abstraction with pluggable storage backends
 - **Knowledge Bases**: Unified `KnowledgeBase` interface with ChromaDB, Neo4j, and Starburst/Trino backends via `KnowledgeBuilder`
-- **Flexible Deployment**: Interactive CLI, REST API, serverless (AWS Lambda, Azure Functions), containerized (AWS ECS, Azure Container Apps)
-- **Pluggable Architecture**: Easy to extend with custom framework adapters and cloud providers
+- **Flexible Deployment**: Interactive CLI, REST API, serverless, or containerized deployment — see the "Multi-Cloud Deployment" section below
+- **Pluggable Architecture**: Easy to extend with custom framework adapters
 - **MCP Server**: Built-in Model Context Protocol server for exposing agents as MCP tools and exposing any custom tool
 - **A2A Server**: Built-in Agent-to-Agent communication server for exposing agents with a simple configuration change
 - **REST API**: Built-in REST API server for agent interaction
@@ -33,6 +30,12 @@ Install optional knowledge base extras as needed:
 pip install "agentkernel[chromadb]"
 pip install "agentkernel[neo4j]"
 pip install "agentkernel[trino]"
+```
+
+For LLM-based thread naming with Conversation Thread Support:
+
+```bash
+pip install "agentkernel[thread]"
 ```
 
 **Requirements:**
@@ -168,7 +171,9 @@ Then interact with your agents:
 
 ## Multi-Cloud Deployment
 
-Deploy your agents to AWS or Azure using the built-in cloud deployment handlers.
+**Supported Cloud Platforms:** AWS, Azure, GCP
+
+Deploy your agents to AWS, Azure, or GCP using the built-in cloud deployment handlers.
 
 ### AWS Lambda Deployment
 
@@ -259,6 +264,31 @@ Azure Functions also accepts the normalized envelope, and flat run payloads are 
 - `400` — No agent available
 - `500` — Unexpected error
 
+### GCP Cloud Run Deployment
+
+Deploy your agents to GCP Cloud Run using the built-in `CloudRun` handler.
+
+```python
+from agentkernel.gcp import CloudRun
+from agentkernel.openai import OpenAIModule
+
+OpenAIModule([...])
+
+@CloudRun.register("/app", method="GET")
+def app_handler() -> dict:
+    return {"status": "ok"}
+
+def main() -> None:
+    CloudRun.run()
+
+if __name__ == "__main__":
+    main()
+```
+
+`CloudRun` is the GCP equivalent of `Lambda` (AWS) and `AzureFunctions` (Azure). It wraps `RESTAPI` and starts a FastAPI/uvicorn server. Custom routes are registered with `@CloudRun.register(path, method)`. Use `CloudRun.run()` instead of `RESTAPI.run()` when deploying to GCP.
+
+For full Terraform deployment configuration, see [`ak-deployment/ak-gcp/`](https://github.com/yaalalabs/agent-kernel/tree/develop/ak-deployment/ak-gcp) or the [GCP deployment docs](https://github.com/yaalalabs/agent-kernel/tree/develop/docs/docs/deployment/gcp-serverless.md).
+
 ## Configuration
 
 Agent Kernel can be configured via environment variables, `.env` files, or YAML/JSON configuration files.
@@ -306,7 +336,7 @@ Configure where agent sessions are stored (supports multi-cloud storage backends
 
 - **Field**: `session.type`
 - **Type**: string
-- **Options**: `in_memory`, `redis`, `dynamodb` (AWS), `cosmosdb` (Azure)
+- **Options**: `in_memory`, `redis`, `valkey` (AWS), `dynamodb` (AWS), `cosmosdb` (Azure), `firestore` (GCP)
 - **Default**: `in_memory`
 - **Environment Variable**: `AK_SESSION__TYPE`
 
@@ -332,6 +362,143 @@ Required when `session.type=redis`:
   - **Description**: Key prefix for session storage
   - **Environment Variable**: `AK_SESSION__REDIS__PREFIX`
 
+##### Valkey Configuration
+
+Required when `session.type=valkey` (requires the `agentkernel[valkey]` extra). [Valkey](https://valkey.io/)
+is the open-source, Linux Foundation-governed fork of Redis — wire-compatible with Redis and
+available on AWS ElastiCache at a lower price point than the Redis OSS engine:
+
+- **URL**
+  - **Field**: `session.valkey.url`
+  - **Default**: `valkey://localhost:6379`
+  - **Description**: Valkey connection URL. Use `valkeys://` for SSL
+  - **Environment Variable**: `AK_SESSION__VALKEY__URL`
+
+- **TTL (Time to Live)**
+  - **Field**: `session.valkey.ttl`
+  - **Default**: `604800` (7 days)
+  - **Description**: Session TTL in seconds
+  - **Environment Variable**: `AK_SESSION__VALKEY__TTL`
+
+- **Key Prefix**
+  - **Field**: `session.valkey.prefix`
+  - **Default**: `ak:sessions:`
+  - **Description**: Key prefix for session storage
+  - **Environment Variable**: `AK_SESSION__VALKEY__PREFIX`
+
+#### Conversation Thread Support
+
+Adding a `thread` block to the configuration turns on persistent, named conversation threads keyed by
+`session_id`. Once enabled, `user_id` becomes required on every chat request, a thread is auto-created on a
+session's first request, and history becomes readable over REST (`GET /api/v1/threads` and
+`GET /api/v1/threads/{session_id}` — optionally protected by a pluggable `Authoriser`). Sending
+`thread_name` on any chat request sets or renames the thread's display name and locks it against automatic
+naming. Threads created without an explicit `thread_name` are
+named by a pluggable naming strategy — by default an LLM call derives a concise title from the first prompt
+(falling back to a prefix of the prompt when `litellm` or an API key is unavailable). Attachments in thread
+mode additionally require `multimodal.enabled: true` with a shared attachment store (`in_memory`, `redis`, or
+`dynamodb` — `session_cache` is rejected). See `examples/api/thread-openai` and
+`examples/api/multimodal/thread-openai`.
+
+- **Field**: `thread.type`
+- **Type**: string
+- **Options**: `memory`, `redis`, `dynamodb` (AWS), `firestore` (GCP), `cosmosdb` (Azure)
+- **Default**: `memory`
+- **Environment Variable**: `AK_THREAD__TYPE`
+
+- **Naming Model**
+  - **Field**: `thread.naming.model`
+  - **Type**: string
+  - **Default**: `gpt-4o-mini`
+  - **Description**: LiteLLM model used to generate thread names (requires the `thread` extra — `pip install "agentkernel[thread]"` — and an API key in the environment; falls back to a truncated prompt prefix otherwise)
+  - **Environment Variable**: `AK_THREAD__NAMING__MODEL`
+
+- **Auto-name Max Length**
+  - **Field**: `thread.naming.max_length`
+  - **Type**: integer
+  - **Default**: `80`
+  - **Description**: Maximum length of an auto-generated thread name
+  - **Environment Variable**: `AK_THREAD__NAMING__MAX_LENGTH`
+
+##### Redis Thread Store
+
+Required when `thread.type=redis`:
+
+- **URL**
+  - **Field**: `thread.redis.url`
+  - **Default**: `redis://localhost:6379`
+  - **Description**: Redis connection URL. Use `rediss://` for SSL
+  - **Environment Variable**: `AK_THREAD__REDIS__URL`
+
+- **TTL (Time to Live)**
+  - **Field**: `thread.redis.ttl`
+  - **Default**: `2592000` (30 days)
+  - **Description**: Thread TTL in seconds (0 disables)
+  - **Environment Variable**: `AK_THREAD__REDIS__TTL`
+
+- **Key Prefix**
+  - **Field**: `thread.redis.prefix`
+  - **Default**: `ak:thread:`
+  - **Description**: Key prefix for Redis thread storage
+  - **Environment Variable**: `AK_THREAD__REDIS__PREFIX`
+
+##### DynamoDB Thread Store
+
+Used when `thread.type=dynamodb`:
+
+- **Table Name**
+  - **Field**: `thread.dynamodb.table_name`
+  - **Default**: `ak-agent-threads`
+  - **Description**: DynamoDB table name. The table must have a partition key named `session_id` (S) and a sort key named `sk` (S)
+  - **Environment Variable**: `AK_THREAD__DYNAMODB__TABLE_NAME`
+
+- **TTL (Time to Live)**
+  - **Field**: `thread.dynamodb.ttl`
+  - **Default**: `0` (disabled)
+  - **Description**: DynamoDB item TTL in seconds
+  - **Environment Variable**: `AK_THREAD__DYNAMODB__TTL`
+
+##### Firestore Thread Store
+
+Used when `thread.type=firestore`:
+
+- **Collection Name**
+  - **Field**: `thread.firestore.collection_name`
+  - **Default**: `ak-agent-threads`
+  - **Description**: Firestore collection name; each document ID is a `session_id`
+  - **Environment Variable**: `AK_THREAD__FIRESTORE__COLLECTION_NAME`
+
+- **Project ID**
+  - **Field**: `thread.firestore.project_id`
+  - **Default**: `null` (inferred from Application Default Credentials)
+  - **Environment Variable**: `AK_THREAD__FIRESTORE__PROJECT_ID`
+
+- **Database ID**
+  - **Field**: `thread.firestore.database_id`
+  - **Default**: `null` (the `(default)` database)
+  - **Environment Variable**: `AK_THREAD__FIRESTORE__DATABASE_ID`
+
+- **TTL (Time to Live)**
+  - **Field**: `thread.firestore.ttl`
+  - **Default**: `0` (disabled)
+  - **Description**: Thread TTL in seconds
+  - **Environment Variable**: `AK_THREAD__FIRESTORE__TTL`
+
+##### Cosmos DB Thread Store
+
+Required when `thread.type=cosmosdb`:
+
+- **Connection String**
+  - **Field**: `thread.cosmosdb.connection_string`
+  - **Description**: Cosmos DB connection string (Azure Portal → Keys). Uses the Table API; entities are partitioned by `session_id`. No TTL support
+  - **Environment Variable**: `AK_THREAD__COSMOSDB__CONNECTION_STRING`
+
+- **Table Name**
+  - **Field**: `thread.cosmosdb.table_name`
+  - **Default**: `akagentthreads`
+  - **Description**: Cosmos DB table name for thread storage
+  - **Environment Variable**: `AK_THREAD__COSMOSDB__TABLE_NAME`
+
 #### Execution Configuration
 
 Configure queue-backed and serverless execution behavior.
@@ -340,7 +507,7 @@ Configure queue-backed and serverless execution behavior.
   - **Field**: `execution.mode`
   - **Options**: `rest_sync`, `rest_async`, `stream`, `async`
   - **Default**: `None`
-  - **Description**: Selects the Lambda execution mode
+  - **Description**: Selects the execution mode used for queue-backed and serverless request handling
   - **Environment Variable**: `AK_EXECUTION__MODE`
 
 - **Queues**
@@ -367,6 +534,24 @@ Configure queue-backed and serverless execution behavior.
     - **Default**: `3`
     - **Environment Variable**: `AK_EXECUTION__QUEUES__OUTPUT__MAX_RECEIVE_COUNT`
 
+  - **Input Queue Consumer Count**
+    - **Field**: `execution.queues.input.no_of_consumers`
+    - **Default**: `5`
+    - **Description**: Number of independent consumer threads that each poll the input queue in a continuous loop. Only used by containerized deployments — never set for serverless deployments, which have no consumer threads.
+    - **Environment Variable**: `AK_EXECUTION__QUEUES__INPUT__NO_OF_CONSUMERS`
+
+  - **Output Queue Consumer Count**
+    - **Field**: `execution.queues.output.no_of_consumers`
+    - **Default**: `5`
+    - **Description**: Number of independent consumer threads that each poll the output queue in a continuous loop. Only used by containerized deployments — never set for serverless deployments, which have no consumer threads.
+    - **Environment Variable**: `AK_EXECUTION__QUEUES__OUTPUT__NO_OF_CONSUMERS`
+
+  - **Queue Batch Size**
+    - **Field**: `execution.queues.batch_size`
+    - **Default**: `None`
+    - **Description**: Max number of messages fetched per receive call, shared by the input and output queues. Only used by containerized deployments — never set for serverless deployments, which control batch size differently. Controlled by the deployment tooling via env var `AK_EXECUTION__QUEUES__BATCH_SIZE` — do not set in `config.yaml`.
+    - **Environment Variable**: `AK_EXECUTION__QUEUES__BATCH_SIZE`
+
 - **Response Store**
   - **Field**: `execution.response_store`
   - **Description**: Response persistence settings used by the serverless response handler
@@ -391,12 +576,17 @@ Configure queue-backed and serverless execution behavior.
     - **Field**: `execution.response_store.redis`
     - **Environment Variables**: `AK_EXECUTION__RESPONSE_STORE__REDIS__URL`, `AK_EXECUTION__RESPONSE_STORE__REDIS__PREFIX`, `AK_EXECUTION__RESPONSE_STORE__REDIS__TTL`
 
+  - **Valkey Backend**
+    - **Field**: `execution.response_store.valkey`
+    - **Environment Variables**: `AK_EXECUTION__RESPONSE_STORE__VALKEY__URL`, `AK_EXECUTION__RESPONSE_STORE__VALKEY__PREFIX`, `AK_EXECUTION__RESPONSE_STORE__VALKEY__TTL`
+    - **Description**: Valkey-backed response storage (requires the `agentkernel[valkey]` extra)
+
   - **DynamoDB Backend**
     - **Field**: `execution.response_store.dynamodb`
     - **Environment Variables**: `AK_EXECUTION__RESPONSE_STORE__DYNAMODB__TABLE_NAME`, `AK_EXECUTION__RESPONSE_STORE__DYNAMODB__TTL`
     - **Description**: DynamoDB-backed response storage with table name and TTL
 
-Use either Redis or DynamoDB for the response store backend. The runtime accepts `BaseRunRequest` payloads directly, normalizes them internally when queueing is required, and uses `request_id` plus optional `user_id` as SQS message attributes.
+Use Redis, Valkey, or DynamoDB for the response store backend. The runtime accepts `BaseRunRequest` payloads directly, normalizes them internally when queueing is required, and uses `request_id` plus optional `user_id` as queue message attributes.
 
 #### API Configuration
 
@@ -466,10 +656,15 @@ Configure the REST API server (if using the API module).
   - **Description**: List of agent names to expose as MCP tools
   - **Environment Variable**: `AK_MCP__AGENTS` (comma-separated)
 
-- **URL**
-  - **Field**: `mcp.url`
-  - **Default**: `http://localhost:8000/mcp`
-  - **Environment Variable**: `AK_MCP__URL`
+- **Stateless HTTP**
+  - **Field**: `mcp.stateless_http`
+  - **Default**: `false`
+  - **Description**: Run MCP in stateless HTTP mode (no `Mcp-Session-Id`)
+  - **Environment Variable**: `AK_MCP__STATELESS_HTTP`
+
+- **Endpoint** (not configurable)
+  - The MCP server is always mounted at `/mcp` on the main API server.
+  - Full URL: `http://{api.host}:{api.port}/mcp` — use `api.port` / `AK_API__PORT` to change the port.
 
 #### Trace (Observability) Configuration
 
@@ -537,29 +732,29 @@ trace:
 
 #### Test Configuration
 
-Configure test comparison modes for automated testing.
+Configure test comparison modes for automated testing. Test configuration is separate from the application configuration: it is **not** part of `config.yaml`. It lives in its own `test-config.yaml` file and is only loaded when the testing utilities (`agentkernel.test`) are used — see the [Test Configuration (test-config.yaml)](#test-configuration-test-configyaml) section for file resolution, environment variables, and migration notes.
 
 - **Mode**
-  - **Field**: `test.mode`
+  - **Field**: `mode`
   - **Options**: `fuzzy`, `judge`, `fallback`
   - **Default**: `fallback`
   - **Description**: Test comparison mode
   - **Environment Variable**: `AK_TEST__MODE`
 
 - **Judge Model**
-  - **Field**: `test.judge.model`
+  - **Field**: `judge.model`
   - **Default**: `gpt-4o-mini`
   - **Description**: LLM model for judge evaluation
   - **Environment Variable**: `AK_TEST__JUDGE__MODEL`
 
 - **Judge Provider**
-  - **Field**: `test.judge.provider`
+  - **Field**: `judge.provider`
   - **Default**: `openai`
   - **Description**: LLM provider for judge evaluation
   - **Environment Variable**: `AK_TEST__JUDGE__PROVIDER`
 
 - **Judge Embedding Model**
-  - **Field**: `test.judge.embedding_model`
+  - **Field**: `judge.embedding_model`
   - **Default**: `text-embedding-3-small`
   - **Description**: Embedding model for similarity evaluation
   - **Environment Variable**: `AK_TEST__JUDGE__EMBEDDING_MODEL`
@@ -570,12 +765,12 @@ Configure test comparison modes for automated testing.
 - `fallback`: Tries fuzzy first, falls back to judge if fuzzy fails
 
 ```yaml
-test:
-  mode: fallback
-  judge:
-    model: gpt-4o-mini
-    provider: openai
-    embedding_model: text-embedding-3-small
+# test-config.yaml (separate file — not config.yaml)
+mode: fallback
+judge:
+  model: gpt-4o-mini
+  provider: openai
+  embedding_model: text-embedding-3-small
 ```
 
 #### Guardrails Configuration
@@ -828,6 +1023,7 @@ export AK_TRACE__TYPE=langfuse  # or openllmetry
 # export LANGFUSE_HOST=https://cloud.langfuse.com
 # For OpenLLMetry:
 # export TRACELOOP_API_KEY=your-api-key
+# Test harness (loaded from the separate test-config.yaml — see Test Configuration)
 export AK_TEST__MODE=fallback  # Options: fuzzy, judge, fallback
 export AK_TEST__JUDGE__MODEL=gpt-4o-mini
 export AK_TEST__JUDGE__PROVIDER=openai
@@ -890,24 +1086,37 @@ session:
     url: redis://localhost:6379
     ttl: 604800
     prefix: "ak:sessions:"
+thread: # optional — enables Conversation Thread Support (user_id becomes required on chat requests)
+  type: redis
+  redis:
+    url: redis://localhost:6379
+    ttl: 2592000
+    prefix: "ak:thread:"
 execution:
   mode: rest_sync
   queues:
     input:
-      url: https://sqs.<region>.amazonaws.com/<accountno>/<queuename>
+      url: https://queue.example.com/<accountno>/<queuename>
       max_receive_count: 3
+      no_of_consumers: 5 # Containerized deployments only, ignored by serverless deployments
     output:
-      url: https://sqs.<region>.amazonaws.com/<accountno>/<queuename>
+      url: https://queue.example.com/<accountno>/<queuename>
       max_receive_count: 3
+      no_of_consumers: 5 # Containerized deployments only, ignored by serverless deployments
+    # batch_size is set by the deployment tooling — set via AK_EXECUTION__QUEUES__BATCH_SIZE, never here
   response_store:
     type: redis
     retry_count: 5
     delay: 5
-    redis: # if this is given, then dynamodb response store part cannot be given
+    redis: # if this is given, then valkey/dynamodb response store parts cannot be given
       url: redis://localhost:6379
       prefix: "ak:responses:"
       ttl: 3600
-    dynamodb: # if this is given, then redis response store part cannot be given
+    valkey: # if this is given, then redis/dynamodb response store parts cannot be given (requires the `valkey` extra)
+      url: valkey://localhost:6379
+      prefix: "ak:responses:"
+      ttl: 3600
+    dynamodb: # if this is given, then redis/valkey response store parts cannot be given
       table_name: table-name
       table_arn: table-arn
       ttl: 3600
@@ -925,16 +1134,11 @@ mcp:
   enabled: false
   expose_agents: false
   agents: ["*"]
-  url: http://localhost:8000/mcp
 trace:
   enabled: true
   type: langfuse
-test:
-  mode: fallback
-  judge:
-    model: gpt-4o-mini
-    provider: openai
-    embedding_model: text-embedding-3-small
+# Note: test configuration is no longer set here — it lives in a separate
+# test-config.yaml file (see the Test Configuration section)
 guardrail:
   input:
     enabled: false
@@ -997,20 +1201,11 @@ gmail:
   "mcp": {
     "enabled": false,
     "expose_agents": false,
-    "agents": ["*"],
-    "url": "http://localhost:8000/mcp"
+    "agents": ["*"]
   },
   "trace": {
     "enabled": true,
     "type": "langfuse"
-  },
-  "test": {
-    "mode": "fallback",
-    "judge": {
-      "model": "gpt-4o-mini",
-      "provider": "openai",
-      "embedding_model": "text-embedding-3-small"
-    }
   },
   "guardrail": {
     "input": {
@@ -1058,6 +1253,39 @@ gmail:
 - Environment variables override configuration file values
 - Configuration file values override built-in defaults
 - Nested fields use underscore (`_`) delimiter in environment variables
+
+### Test Configuration (test-config.yaml)
+
+Test harness configuration (comparison mode and judge models) is separate from the application configuration. It is not part of `config.yaml` — it lives in its own `test-config.yaml` file, resolved from the current working directory, and is only loaded when the testing utilities (`agentkernel.test`) are used. A legacy `test:` section in `config.yaml` is ignored. See [Test Configuration](#test-configuration) under Configuration Options for the full list of fields and defaults.
+
+**test-config.yaml:**
+
+```yaml
+mode: fallback
+judge:
+  model: gpt-4o-mini
+  provider: openai
+  embedding_model: text-embedding-3-small
+```
+
+Note that the file is un-nested — there is no top-level `test:` key. If the file is missing, defaults apply silently (fuzzy and fallback tests need no configuration file at all).
+
+**Override the test config file path:**
+
+```bash
+export AK_TEST_CONFIG_PATH_OVERRIDE=/path/to/test-config.yaml
+```
+
+**Environment variables** use the `AK_TEST__` prefix and override `test-config.yaml` values:
+
+```bash
+export AK_TEST__MODE=fallback  # Options: fuzzy, judge, fallback
+export AK_TEST__JUDGE__MODEL=gpt-4o-mini
+export AK_TEST__JUDGE__PROVIDER=openai
+export AK_TEST__JUDGE__EMBEDDING_MODEL=text-embedding-3-small
+```
+
+> **Migration note:** Earlier versions read test configuration from a `test:` section in `config.yaml`. That section is now ignored — move its contents (un-nested, without the `test:` key) to a sibling `test-config.yaml`. The `AK_TEST__*` environment variables are unchanged, so CI pipelines that use them need no updates.
 
 ## Extensibility
 
@@ -1165,3 +1393,4 @@ SPDX-License-Identifier: Apache-2.0
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+

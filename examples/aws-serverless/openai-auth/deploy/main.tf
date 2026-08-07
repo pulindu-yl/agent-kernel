@@ -1,21 +1,33 @@
 # Lambda module configuration for deploying OpenAI Agent Lambda function
 module "serverless_agents" {
   source = "yaalalabs/ak-serverless/aws"
-  version = "0.4.0"
+  version = "0.6.1"
 
   # Basic lambda configuration
   product_alias        = var.product_alias
   env_alias            = var.env_alias
-  function_description = "Agent Kernel OpenAI Auth Sample Lambda"
-  function_name        = "openai-auth-agents"
-  handler_path         = "lambda.handler"
   module_name          = var.module_name
-  package_path         = "../dist"
-  package_type         = "Image"
-  memory_size          = 256
-  create_redis_cluster = true
   product_display_name = "AK OpenAI Auth Serverless Example"
   region               = var.region
+  vpc_id               = var.vpc_id
+  private_subnet_ids   = var.private_subnet_ids
+
+  # Memory DB Config - use existing Redis cluster
+  create_redis_cluster = false
+
+  # Request handler configuration
+  request_handler = {
+    function_name         = "openai-auth-agents"
+    function_description   = "Agent Kernel OpenAI Auth Sample Lambda"
+    handler_path          = "lambda.handler"
+    module_name           = var.module_name
+    package_path          = "../dist"
+    package_type          = "Image"
+    memory_size           = 256
+    environment_variables = {
+      "OPENAI_API_KEY" = var.openai_api_key
+    }
+  }
 
   # To override the default API version, API base path, and agent endpoint
   # api_version    = "v1"
@@ -32,12 +44,7 @@ module "serverless_agents" {
       path           = "app_info",
       method         = "POST",
     }
-  ] 
-
-  # Environment variables passed to lambda
-  environment_variables = {
-    "OPENAI_API_KEY" = var.openai_api_key
-  }
+  ]
   
   # Defining the API Gateway Authorizer
   authorizer = {

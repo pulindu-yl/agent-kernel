@@ -1,7 +1,3 @@
-locals {
-  package_file_name = "source_code.zip"
-}
-
 resource "aws_iam_role" "lambda_role" {
   name = "${var.product_alias}-${var.env_alias}-${var.module_name}-${var.function_name}-lambda-role"
   assume_role_policy = jsonencode({
@@ -128,6 +124,40 @@ resource "aws_iam_role_policy_attachment" "lambda_response_store_dynamodb_attach
   policy_arn = aws_iam_policy.lambda_response_store_dynamodb_policy[0].arn
 }
 
+# Websocket connections DynamoDB permissions
+resource "aws_iam_policy" "lambda_websocket_connections_dynamodb_policy" {
+  count = var.websocket_connections_dynamodb != null ? 1 : 0
+  name  = "${var.product_alias}-${var.env_alias}-${var.module_name}-${var.function_name}-websocket-connections-ddb"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:DescribeTable",
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:Scan"
+        ]
+        Resource = [
+          var.websocket_connections_dynamodb.table_arn,
+          "${var.websocket_connections_dynamodb.table_arn}/index/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_websocket_connections_dynamodb_attachment" {
+  count      = var.websocket_connections_dynamodb != null ? 1 : 0
+  role       = aws_iam_role.lambda_role.name
+  policy_arn = aws_iam_policy.lambda_websocket_connections_dynamodb_policy[0].arn
+}
+
 # SQS permissions for RequestHandler Lambda (conditional on queue_mode)
 resource "aws_iam_policy" "lambda_sqs_policy" {
   count = var.queue_mode ? 1 : 0
@@ -154,34 +184,28 @@ resource "aws_iam_role_policy_attachment" "lambda_sqs_attachment" {
   policy_arn = aws_iam_policy.lambda_sqs_policy[0].arn
 }
 
-data "aws_s3_object" "source_code" {
-  count  = (var.package_type == "S3Zip") ? 1 : 0
-  bucket = var.source_bucket
-  key    = "${var.product_alias}/${var.region}/${var.env_alias}/${var.module_name}/lambda/${local.package_file_name}"
-}
-
 resource "aws_signer_signing_job" "handler_lambda_signing_job" {
-  count = (var.is_production) && (var.package_type != "S3Zip") ? 1 : 0
+  count = var.is_production && var.package_type == "S3Zip" ? 1 : 0
 
   profile_name = var.lambda_signer_profile_name
   source {
     s3 {
       bucket  = var.source_bucket
-      key     = data.aws_s3_object.source_code[0].key
-      version = data.aws_s3_object.source_code[0].version_id
+      key     = var.source_key
+      version = var.source_version_id
     }
   }
   destination {
     s3 {
       bucket = var.source_bucket
-      prefix = "${data.aws_s3_object.source_code[0].key}/signed/${data.aws_s3_object.source_code[0].version_id}"
+      prefix = "${var.source_key}/signed"
     }
   }
   ignore_signing_job_failure = false
 }
 
 data "aws_s3_object" "signed_component_code" {
-  count = (var.is_production) && (var.package_type != "S3Zip") ? 1 : 0
+  count = var.is_production && var.package_type == "S3Zip" ? 1 : 0
 
   bucket = aws_signer_signing_job.handler_lambda_signing_job[0].signed_object[0].s3[0].bucket
   key    = aws_signer_signing_job.handler_lambda_signing_job[0].signed_object[0].s3[0].key
@@ -220,11 +244,10 @@ module "lambda_deployment" {
   vpc_security_group_ids = var.security_group_id != "" ? [var.security_group_id] : []
   code_signing_config_arn = (var.package_type == "S3Zip" && var.is_production == true) ? var.lambda_signing_config_arn : null
 
-  s3_existing_package = (var.package_type == "S3Zip") ? {
-    bucket     = var.is_production ? data.aws_s3_object.signed_component_code[0].bucket : data.aws_s3_object.source_code[0].bucket
-    key        = var.is_production ? data.aws_s3_object.signed_component_code[0].key : data.aws_s3_object.source_code[0].key
-    version_id = var.is_production ? null : data.aws_s3_object.source_code[0].version_id
-  } : {}
+  s3_existing_package = var.is_production && var.package_type == "S3Zip" ? {
+    bucket = data.aws_s3_object.signed_component_code[0].bucket
+    key    = data.aws_s3_object.signed_component_code[0].key
+  } : var.s3_existing_package
 
   environment_variables = merge(var.environment_variables, {
       API_BASE_PATH = var.api_base_path
@@ -233,6 +256,9 @@ module "lambda_deployment" {
     },
       var.redis_url != null ? {
       AK_SESSION__REDIS__URL = var.redis_url
+    } : {},
+      var.valkey_url != null ? {
+      AK_SESSION__VALKEY__URL = var.valkey_url
     } : {},
       var.dynamodb_memory_table_arn != null ? {
       AK_SESSION__DYNAMODB__TABLE_NAME = var.dynamodb_memory_table_name
@@ -243,11 +269,17 @@ module "lambda_deployment" {
       var.response_store_redis != null ? {
       AK_EXECUTION__RESPONSE_STORE__REDIS__URL = var.response_store_redis.url
     } : {},
+      var.response_store_valkey != null ? {
+      AK_EXECUTION__RESPONSE_STORE__VALKEY__URL = var.response_store_valkey.url
+    } : {},
       var.response_store_dynamodb != null ? {
       AK_EXECUTION__RESPONSE_STORE__DYNAMODB__TABLE_NAME = var.response_store_dynamodb.table_name
     } : {},
       var.input_queue_url != null ? {
       AK_EXECUTION__QUEUES__INPUT__URL = var.input_queue_url
+    } : {},
+      var.websocket_connections_dynamodb != null ? {
+      AK_WEBSOCKET_API__CONNECTION_TABLE__TABLE_NAME = var.websocket_connections_dynamodb.table_name
     } : {}
   )
   event_source_mapping = var.event_source_mapping

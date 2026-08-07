@@ -1,4 +1,4 @@
-.PHONY: lint lint-check lint-examples lint-examples-check lint-all lint-check-all help
+.PHONY: dev-setup lint lint-check lint-examples lint-examples-check lint-all lint-check-all help
 
 EXAMPLE_DIRS := examples
 
@@ -13,6 +13,7 @@ endef
 
 help:
 	@echo "Available targets:"
+	@echo "  dev-setup           - Installs prerequisites (pyenv, Python, uv) and syncs ak-py"
 	@echo "  lint                - Formats python code in ak-py"
 	@echo "  lint-check          - Dry run to check code formatting in ak-py"
 	@echo "  lint-examples       - Formats python code in examples directory"
@@ -20,6 +21,9 @@ help:
 	@echo "  lint-all            - Formats python code in both ak-py and examples"
 	@echo "  lint-check-all      - Dry run to check code formatting in both ak-py and examples"
 	@echo "  help                - Show this help message"
+
+dev-setup:
+	@./scripts/dev-setup.sh
 
 lint: lint-fix
 
@@ -43,23 +47,19 @@ lint-check:
 	exit $$EXIT_CODE
 
 lint-examples:
-	@echo "Building ak-py to ensure dependencies are installed..."
-	cd ak-py && ./build.sh
 	@echo "Formatting examples..."
 	@for dir in $$(find $(EXAMPLE_DIRS) -maxdepth 4 -name "pyproject.toml" -type f | sed 's|/pyproject.toml||' | sort); do \
 		echo "Processing $$dir..."; \
 		if [ -f "$$dir/pyproject.toml" ]; then \
 			cd $$dir && \
 			$(ENSURE_PYENV_VENV) && \
-			uv run --dev isort --skip .venv --skip .terraform --skip dist --skip __pycache__ . || true; \
-			uv run --dev black --exclude '/\.venv/|/\.terraform/|/dist/|/__pycache__/' . || true; \
+			uv run --only-dev isort --skip .venv --skip .terraform --skip dist --skip __pycache__ . || true; \
+			uv run --only-dev black --exclude '/\.venv/|/\.terraform/|/dist/|/__pycache__/' . || true; \
 			cd - > /dev/null; \
 		fi; \
 	done
 
 lint-examples-check:
-	@echo "Building ak-py to ensure dependencies are installed..."
-	cd ak-py && ./build.sh
 	@echo "Checking examples formatting..."
 	@EXIT_CODE=0; \
 	for dir in $$(find $(EXAMPLE_DIRS) -maxdepth 4 -name "pyproject.toml" -type f | sed 's|/pyproject.toml||' | sort); do \
@@ -67,8 +67,8 @@ lint-examples-check:
 		if [ -f "$$dir/pyproject.toml" ]; then \
 			cd $$dir && \
 			$(ENSURE_PYENV_VENV) && \
-			uv run --dev isort --check-only --skip .venv --skip .terraform --skip dist --skip __pycache__ . || EXIT_CODE=1; \
-			uv run --dev black --check --exclude '/\.venv/|/\.terraform/|/dist/|/__pycache__/' . || EXIT_CODE=1; \
+			uv run --only-dev isort --check-only --skip .venv --skip .terraform --skip dist --skip __pycache__ . || EXIT_CODE=1; \
+			uv run --only-dev black --check --exclude '/\.venv/|/\.terraform/|/dist/|/__pycache__/' . || EXIT_CODE=1; \
 			cd - > /dev/null; \
 		fi; \
 	done; \

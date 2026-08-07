@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import json
 from enum import Enum
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import boto3
 from pydantic import BaseModel, ConfigDict
 
 from ....core.config import AKConfig
+from ...common.queue_handler import QueueHandler
 
 
-class SQSHandler:
+class SQSHandler(QueueHandler):
     """Shared helper for building and sending SQS messages.
 
     When used in a Non-Agent Kernel lambda/environment, the following environment variables
@@ -107,14 +108,15 @@ class SQSHandler:
 
     @classmethod
     def _build_message_attribute(cls, custom_attribute: "SQSHandler.CustomAttribute") -> Dict[str, Any]:
-        """Build a boto3-compatible SQS message attribute payload.
+        """
+        Build a boto3-compatible SQS message attribute payload.
 
         Binary attributes are mapped to BinaryValue. All other attribute types are
         serialized as strings, which matches how SQS expects string and number
         attributes to be sent.
 
-        :param custom_attribute: The custom attribute definition to convert.
-        :return: A dictionary shaped for the SQS MessageAttributes field.
+        :param custom_attribute: The custom attribute definition to convert
+        :return: A dictionary shaped for the SQS MessageAttributes field
         """
         message_attribute: Dict[str, Any] = {"DataType": custom_attribute.datatype.value}
         if custom_attribute.datatype == cls.AttributeDataType.BINARY:
@@ -130,13 +132,15 @@ class SQSHandler:
         cls,
         message_attributes: list["SQSHandler.CustomAttribute"] | None,
     ) -> Optional[Dict[str, Any]]:
-        """Convert a list of custom attributes into an SQS attributes map.
+        """
+        Convert a list of custom attributes into an SQS attributes map.
 
         Duplicate attribute names are rejected because SQS requires each message
         attribute key to be unique.
 
-        :param message_attributes: The custom attributes to convert, or None.
-        :return: A dictionary of message attributes, or None when no attributes are provided.
+        :param message_attributes: The custom attributes to convert, or None
+        :return: A dictionary of message attributes, or None when no attributes are provided
+        :raises ValueError: If duplicate attribute names are found
         """
         if message_attributes is None:
             return None
@@ -150,26 +154,37 @@ class SQSHandler:
 
     @staticmethod
     def get_message_system_attributes(raw_queue_message_record: Mapping[str, Any]) -> Dict[str, Any]:
-        """Return the SQS system attributes from a raw Lambda queue record.
-
-        :param raw_queue_message_record: Raw SQS record from Lambda containing the ``attributes`` block.
-        :return: A shallow copy of the record's system ``attributes`` mapping.
         """
-        return dict(raw_queue_message_record.get("attributes", {}) or {})
+        Return the SQS system attributes from a raw SQS message record.
+
+        Handles both Lambda event records (``attributes`` key, camelCase)
+        and boto3 receive_message records (``Attributes`` key, PascalCase).
+
+        :param raw_queue_message_record: Raw SQS record
+        :return: A shallow copy of the record's system attributes mapping
+        """
+        # Lambda uses "attributes", boto3 receive_message uses "Attributes"
+        attrs = raw_queue_message_record.get("Attributes") or raw_queue_message_record.get("attributes") or {}
+        return dict(attrs)
 
     @staticmethod
     def get_message_custom_attributes(raw_queue_message_record: Mapping[str, Any]) -> Dict[str, Any]:
-        """Return the custom SQS message attributes from a raw Lambda queue record.
-
-        :param raw_queue_message_record: Raw SQS record from Lambda containing ``messageAttributes``.
-        :return: A dictionary mapping custom attribute names to their scalar values.
         """
-        message_attributes = raw_queue_message_record.get("messageAttributes", {}) or {}
+        Return the custom SQS message attributes from a raw SQS message record.
+
+        Handles both Lambda event records (``messageAttributes`` key, camelCase)
+        and boto3 receive_message records (``MessageAttributes`` key, PascalCase).
+
+        :param raw_queue_message_record: Raw SQS record
+        :return: A dictionary mapping custom attribute names to their scalar values
+        """
+        # Lambda uses "messageAttributes", boto3 receive_message uses "MessageAttributes"
+        message_attributes = raw_queue_message_record.get("MessageAttributes") or raw_queue_message_record.get("messageAttributes") or {}
         flattened_attributes: Dict[str, Any] = {}
         for attribute_name, attribute in message_attributes.items():
             if isinstance(attribute, Mapping):
                 attribute_value = (
-                    attribute.get("stringValue") or attribute.get("StringValue") or attribute.get("binaryValue") or attribute.get("BinaryValue")
+                    attribute.get("StringValue") or attribute.get("stringValue") or attribute.get("BinaryValue") or attribute.get("binaryValue")
                 )
             else:
                 attribute_value = attribute
@@ -186,17 +201,18 @@ class SQSHandler:
         message_attributes: list["SQSHandler.CustomAttribute"] | None = None,
         **extra_kwargs: Any,
     ) -> Dict[str, Any]:
-        """Assemble the keyword arguments expected by boto3 send_message.
+        """
+        Assemble the keyword arguments expected by boto3 send_message.
 
         This helper normalizes the body, optional FIFO identifiers, and message
         attributes into a single dictionary that can be passed directly to boto3.
 
-        :param message_body: The payload to place in the SQS message body.
-        :param message_group_id: The FIFO message group id, if required.
-        :param message_deduplication_id: The FIFO deduplication id, if required.
-        :param message_attributes: Optional custom SQS message attributes.
-        :param extra_kwargs: Additional send_message keyword arguments to include.
-        :return: A dictionary of boto3 send_message keyword arguments.
+        :param message_body: The payload to place in the SQS message body
+        :param message_group_id: The FIFO message group id, if required
+        :param message_deduplication_id: The FIFO deduplication id, if required
+        :param message_attributes: Optional custom SQS message attributes
+        :param extra_kwargs: Additional send_message keyword arguments to include
+        :return: A dictionary of boto3 send_message keyword arguments
         """
         queue_input_message = cls.SQSQueueInputMessage(
             MessageBody=cls._serialize_message_body(message_body),
@@ -217,18 +233,19 @@ class SQSHandler:
         message_attributes: list["SQSHandler.CustomAttribute"] | None = None,
         **extra_kwargs: Any,
     ):
-        """Serialize a payload and send it to SQS.
+        """
+        Serialize a payload and send it to SQS.
 
         The method builds boto3-compatible keyword arguments, injects the target
         queue URL, and delegates the actual send to the cached SQS client.
 
-        :param queue_url: The destination SQS queue URL.
-        :param message_body: The payload to send.
-        :param message_group_id: The FIFO message group id, if required.
-        :param message_deduplication_id: The FIFO deduplication id, if required.
-        :param message_attributes: Optional custom SQS message attributes.
-        :param extra_kwargs: Additional send_message keyword arguments to include.
-        :return: The boto3 send_message response.
+        :param queue_url: The destination SQS queue URL
+        :param message_body: The payload to send
+        :param message_group_id: The FIFO message group id, if required
+        :param message_deduplication_id: The FIFO deduplication id, if required
+        :param message_attributes: Optional custom SQS message attributes
+        :param extra_kwargs: Additional send_message keyword arguments to include
+        :return: The boto3 send_message response
         """
         message_kwargs = cls.build_send_message_kwargs(
             message_body=message_body,
@@ -241,100 +258,136 @@ class SQSHandler:
 
     @classmethod
     def send_prepared_message(cls, queue_url: str, message_kwargs: Mapping[str, Any]):
-        """Send a pre-built message payload to SQS.
+        """
+        Send a pre-built message payload to SQS.
 
         Use this when the caller has already prepared a boto3-compatible message
         payload and only needs the queue URL injected at send time.
 
-        :param queue_url: The destination SQS queue URL.
-        :param message_kwargs: A mapping of boto3 send_message keyword arguments.
-        :return: The boto3 send_message response.
+        :param queue_url: The destination SQS queue URL
+        :param message_kwargs: A mapping of boto3 send_message keyword arguments
+        :return: The boto3 send_message response
         """
         return cls.get_sqs_client().send_message(QueueUrl=queue_url, **dict(message_kwargs))
 
     @classmethod
-    def send_message_to_input_queue(
+    def _build_standard_message_attributes(
         cls,
-        message_group_id: Optional[str] = None,
-        message_deduplication_id: Optional[str] = None,
-        message_body: Optional[Any] = None,
-        request_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        **extra_kwargs: Any,
-    ):
-        """Send a message to the input queue with standard custom attributes.
-
-        This method handles the common pattern of sending messages to the input queue
-        with request_id and user_id as custom message attributes.
-
-        :param message_group_id: The FIFO message group id, if required.
-        :param message_deduplication_id: The FIFO deduplication id, if required.
-        :param message_body: The payload to send.
-        :param request_id: Optional request ID custom attribute.
-        :param user_id: Optional user ID custom attribute.
-        :param extra_kwargs: Additional send_message keyword arguments to include.
-        :return: The boto3 send_message response.
+        request_id: Optional[str],
+        user_id: Optional[str],
+        custom_message_attributes: Optional[List["SQSHandler.CustomAttribute"]],
+    ) -> Optional[List["SQSHandler.CustomAttribute"]]:
         """
-        queue_url = cls.get_input_queue_url()
-        if not queue_url:
-            raise ValueError("Input queue URL is not configured in AKConfig")
+        Combine the standard request_id/user_id attributes with caller-supplied ones.
 
-        # Build custom message attributes
+        :param request_id: Optional request ID custom attribute
+        :param user_id: Optional user ID custom attribute
+        :param custom_message_attributes: Additional custom message attributes
+        :return: The combined attribute list, or None when there are no attributes
+        """
         message_attributes = []
         if request_id is not None:
             message_attributes.append(cls.CustomAttribute(name="request_id", value=request_id, datatype=cls.AttributeDataType.STRING))
         if user_id is not None:
             message_attributes.append(cls.CustomAttribute(name="user_id", value=user_id, datatype=cls.AttributeDataType.STRING))
 
+        message_attributes.extend(custom_message_attributes or [])
+        return message_attributes if message_attributes else None
+
+    @staticmethod
+    def _get_session_id(message_body: Any) -> Optional[str]:
+        """
+        Extract session_id from a message body, if present.
+
+        :param message_body: A mapping, Pydantic model, or arbitrary payload
+        :return: The session_id value, or None when the body does not carry one
+        """
+        if isinstance(message_body, Mapping):
+            return message_body.get("session_id")
+        return getattr(message_body, "session_id", None)
+
+    @classmethod
+    def send_message_to_input_queue(
+        cls,
+        message_body: "SQSHandler.QueueMessageBody | Dict[str, Any]",
+        attributes: "SQSHandler.SendMessageAttributes | Dict[str, Any] | None" = None,
+        request_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        custom_message_attributes: Optional[List["SQSHandler.CustomAttribute"]] = None,
+        **extra_kwargs: Any,
+    ):
+        """
+        Send a message to the input queue with standard custom attributes.
+
+        This method handles the common pattern of sending messages to the input queue
+        with request_id and user_id as custom message attributes. The FIFO message
+        group id defaults to the body's session_id unless overridden via attributes.
+
+        :param message_body: The payload to send; must contain prompt and session_id, and may contain agent (extra fields are preserved)
+        :param attributes: Optional FIFO send attributes (message_group_id, message_deduplication_id)
+        :param request_id: Optional request ID custom attribute
+        :param user_id: Optional user ID custom attribute
+        :param custom_message_attributes: Additional custom message attributes
+        :param extra_kwargs: Additional send_message keyword arguments to include
+        :return: The boto3 send_message response
+        :raises ValueError: If input queue URL is not configured
+        :raises pydantic.ValidationError: If message_body is missing prompt or session_id
+        """
+        queue_url = cls.get_input_queue_url()
+        if not queue_url:
+            raise ValueError("Input queue URL is not configured in AKConfig")
+
+        body = cls.QueueMessageBody.model_validate(message_body)
+        send_attributes = cls.SendMessageAttributes.model_validate(attributes or {})
+
         return cls.send_message(
             queue_url=queue_url,
-            message_body=message_body,
-            message_group_id=message_group_id,
-            message_deduplication_id=message_deduplication_id,
-            message_attributes=message_attributes if message_attributes else None,
+            message_body=body,
+            message_group_id=send_attributes.message_group_id or body.session_id,
+            message_deduplication_id=send_attributes.message_deduplication_id,
+            message_attributes=cls._build_standard_message_attributes(request_id, user_id, custom_message_attributes),
             **extra_kwargs,
         )
 
     @classmethod
     def send_message_to_output_queue(
         cls,
-        message_group_id: Optional[str] = None,
-        message_deduplication_id: Optional[str] = None,
-        message_body: Optional[Any] = None,
+        message_body: Any,
+        attributes: "SQSHandler.SendMessageAttributes | Dict[str, Any] | None" = None,
         request_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        custom_message_attributes: Optional[List["SQSHandler.CustomAttribute"]] = None,
         **extra_kwargs: Any,
     ):
-        """Send a message to the output queue with standard custom attributes.
+        """
+        Send a message to the output queue with standard custom attributes.
 
         This method handles the common pattern of sending messages to the output queue
-        with request_id and user_id as custom message attributes.
+        with request_id and user_id as custom message attributes. The FIFO message
+        group id defaults to the body's session_id (when the body carries one) unless
+        overridden via attributes.
 
-        :param message_group_id: The FIFO message group id, if required.
-        :param message_deduplication_id: The FIFO deduplication id, if required.
-        :param message_body: The payload to send.
-        :param request_id: Optional request ID custom attribute.
-        :param user_id: Optional user ID custom attribute.
-        :param extra_kwargs: Additional send_message keyword arguments to include.
-        :return: The boto3 send_message response.
+        :param message_body: The payload to send
+        :param attributes: Optional FIFO send attributes (message_group_id, message_deduplication_id)
+        :param request_id: Optional request ID custom attribute
+        :param user_id: Optional user ID custom attribute
+        :param custom_message_attributes: Additional custom message attributes
+        :param extra_kwargs: Additional send_message keyword arguments to include
+        :return: The boto3 send_message response
+        :raises ValueError: If output queue URL is not configured
         """
         queue_url = cls.get_output_queue_url()
         if not queue_url:
             raise ValueError("Output queue URL is not configured in AKConfig")
 
-        # Build custom message attributes
-        message_attributes = []
-        if request_id is not None:
-            message_attributes.append(cls.CustomAttribute(name="request_id", value=request_id, datatype=cls.AttributeDataType.STRING))
-        if user_id is not None:
-            message_attributes.append(cls.CustomAttribute(name="user_id", value=user_id, datatype=cls.AttributeDataType.STRING))
+        send_attributes = cls.SendMessageAttributes.model_validate(attributes or {})
 
         return cls.send_message(
             queue_url=queue_url,
             message_body=message_body,
-            message_group_id=message_group_id,
-            message_deduplication_id=message_deduplication_id,
-            message_attributes=message_attributes if message_attributes else None,
+            message_group_id=send_attributes.message_group_id or cls._get_session_id(message_body),
+            message_deduplication_id=send_attributes.message_deduplication_id,
+            message_attributes=cls._build_standard_message_attributes(request_id, user_id, custom_message_attributes),
             **extra_kwargs,
         )
 
