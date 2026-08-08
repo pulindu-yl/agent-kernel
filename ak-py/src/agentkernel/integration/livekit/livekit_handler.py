@@ -1,117 +1,63 @@
 import asyncio
 import base64
 import io
+import json
 import logging
+import uuid
+from collections.abc import AsyncIterable
 from typing import Awaitable, Callable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from livekit import agents, api, rtc
-from livekit.agents import AgentServer, JobContext, WorkerOptions, WorkerType, llm
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, ModelSettings, WorkerOptions, WorkerType, llm
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, APIConnectOptions, NotGivenOr
-from livekit.agents.voice import Agent as VoicePipelineAgent
-from livekit.agents.voice import AgentSession
 from livekit.plugins import deepgram, openai, silero
 from PIL import Image
 
 from ...api import RESTRequestHandler
 from ...core import AgentService, Config
-from ...core.model import AgentRequestImage, AgentRequestText
+from ...core.model import AgentRequest, AgentRequestImage, AgentRequestText
 
-logger = logging.getLogger("ak.integration.livekit")
+logger = logging.getLogger("ak.api.livekit")
 
-
-class LiveKitLLMStream(llm.LLMStream):
-    """
-    A simple LLMStream implementation that yields a single response string.
-    LiveKit's TTS engine consumes this stream and synthesizes it into speech.
-    """
-
-    def __init__(self, parent_llm: llm.LLM, text: str, chat_ctx: llm.ChatContext):
-        super().__init__(parent_llm, chat_ctx=chat_ctx, tools=[], conn_options=DEFAULT_API_CONNECT_OPTIONS)
-        self._text = text
-
-    async def _run(self) -> None:
-        pass
-
-    async def __anext__(self):
-        if self._text is None:
-            raise StopAsyncIteration
-
-        text = self._text
-        self._text = None
-
-        return llm.ChatChunk(id="livekit_chunk", delta=llm.ChoiceDelta(content=text, role="assistant"))
+_NO_AGENT_MESSAGE = "No Agent Kernel agent is available to handle this request."
+_INTERNAL_ERROR_MESSAGE = "I'm sorry, I encountered an internal error while processing your request."
+_STREAMING_UNSUPPORTED_MESSAGE = "This agent does not support streaming. Set livekit.streaming_mode to buffered."
+_VALID_STREAMING_MODES = frozenset({"streaming", "buffered"})
 
 
-class LiveKitLLMStreamWrapper(llm.LLMStream):
-    """
-    An asynchronous generator wrapper that bridges LiveKit's streaming interface
-    with Agent Kernel's request-response architecture. It awaits the Agent Kernel
-    response and yields it to the LiveKit voice pipeline.
-    """
-
-    def __init__(
-        self,
-        parent_llm: llm.LLM,
-        chat_ctx: llm.ChatContext,
-        agent_name: str,
-        session_id: str,
-        user_message: str,
-        frame_data: Optional[str] = None,
-    ):
-        super().__init__(parent_llm, chat_ctx=chat_ctx, tools=[], conn_options=DEFAULT_API_CONNECT_OPTIONS)
-        self.agent_name = agent_name
-        self.session_id = session_id
-        self.user_message = user_message
-        self._frame_data = frame_data
-        self._service = AgentService()
-        self._fetched = False
-
-    async def _run(self) -> None:
-        pass
-
-    async def __anext__(self):
-        if self._fetched:
-            raise StopAsyncIteration
-
-        self._fetched = True
-
-        self._service.select(name=self.agent_name, session_id=self.session_id)
-
-        if not self._service.agent:
-            return llm.ChatChunk(
-                id="livekit_chunk", delta=llm.ChoiceDelta(content="Error: No agent available to handle this request.", role="assistant")
-            )
-
-        try:
-            if self._frame_data:
-                requests = [
-                    AgentRequestText(text=self.user_message),
-                    AgentRequestImage(image_data=self._frame_data, mime_type="image/jpeg", name="webcam_frame"),
-                ]
-                reply = await self._service.run_multi(requests)
-                response_text = reply.text if hasattr(reply, "text") else str(reply)
-            else:
-                reply = await self._service.run(self.user_message)
-                response_text = str(reply)
-        except Exception as e:
-            logger.error(f"Agent Kernel error: {e}", exc_info=True)
-            response_text = "I'm sorry, I encountered an internal error while processing your request."
-
-        return llm.ChatChunk(id="livekit_chunk", delta=llm.ChoiceDelta(content=response_text, role="assistant"))
+def _validate_streaming_mode(streaming_mode: str) -> str:
+    if streaming_mode not in _VALID_STREAMING_MODES:
+        raise ValueError("LiveKit streaming_mode must be either 'streaming' or 'buffered'")
+    return streaming_mode
 
 
 class LiveKitLLM(llm.LLM):
-    """
-    A custom LiveKit LLM implementation that intercepts user speech (transcribed to text)
-    and routes it to the Agent Kernel runtime.
-    """
+    """LiveKit LLM adapter retained for ``chat()`` compatibility."""
 
-    def __init__(self, agent_name: str, session_id: str, frame_holder: Optional[dict] = None):
+    def __init__(
+        self,
+        agent_name: str | None = None,
+        session_id: str | None = None,
+        frame_holder: Optional[dict] = None,
+        *,
+        streaming_mode: str = "streaming",
+        service: AgentService | None = None,
+    ) -> None:
         super().__init__()
-        self.agent_name = agent_name
-        self.session_id = session_id
+        self._agent_name = agent_name
+        self._session_id = session_id
         self._frame_holder = frame_holder
+        self._streaming_mode = _validate_streaming_mode(streaming_mode)
+        self._service = service
+
+    @property
+    def model(self) -> str:
+        return "agent-kernel"
+
+    @property
+    def provider(self) -> str:
+        return "agent-kernel"
 
     def chat(
         self,
@@ -122,196 +68,329 @@ class LiveKitLLM(llm.LLM):
         parallel_tool_calls: NotGivenOr[bool] = NOT_GIVEN,
         tool_choice: NotGivenOr[llm.ToolChoice] = NOT_GIVEN,
         extra_kwargs: NotGivenOr[dict] = NOT_GIVEN,
-    ) -> "LiveKitLLMStreamWrapper | LiveKitLLMStream":
-        """
-        Called by LiveKit's AgentSession when the user has finished speaking and
-        the STT has finalized the transcript.
-        """
-        # Find the last user message
-        user_message = ""
-        for msg in reversed(chat_ctx.messages()):
-            if msg.role == "user" and msg.text_content:
-                user_message = msg.text_content
-                break
-
-        if not user_message:
-            return LiveKitLLMStream(self, "I did not hear anything.", chat_ctx)
-
-        logger.debug(f"Received transcribed user speech: {user_message}")
-
-        # Grab and consume the latest video frame
-        frame_data = None
-        if self._frame_holder and self._frame_holder.get("frame"):
-            try:
-                frame = self._frame_holder.pop("frame")
-                # Convert to RGBA buffer
-                rgba_frame = frame.convert(rtc.VideoBufferType.RGBA)
-                # Create PIL image from raw bytes
-                image = Image.frombytes("RGBA", (rgba_frame.width, rgba_frame.height), rgba_frame.data)
-                # Convert to RGB to save as JPEG
-                rgb_image = image.convert("RGB")
-                # Save to buffer
-                buffer = io.BytesIO()
-                rgb_image.save(buffer, format="JPEG")
-                # Store as base64
-                frame_data = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                logger.debug("Attaching webcam frame to this voice turn")
-            except Exception as e:
-                logger.error(f"Failed to encode video frame for LLM: {e}")
-
-        return LiveKitLLMStreamWrapper(
-            parent_llm=self,
+    ) -> llm.LLMStream:
+        del parallel_tool_calls, tool_choice, extra_kwargs
+        if not self._agent_name or not self._session_id:
+            raise RuntimeError("LiveKitLLM.chat() requires agent_name and session_id; use AgentKernelVoiceAgent for the default pipeline")
+        return _LiveKitCompatibilityStream(
+            self,
             chat_ctx=chat_ctx,
-            agent_name=self.agent_name,
-            session_id=self.session_id,
-            user_message=user_message,
-            frame_data=frame_data,
+            tools=tools or [],
+            conn_options=conn_options,
         )
 
 
-async def _default_entrypoint(ctx: JobContext):
-    """
-    Default entrypoint for the LiveKit worker.
-    Initializes an AgentSession using Deepgram (STT), OpenAI (TTS), and AgentKernel (LLM).
+class _LiveKitCompatibilityStream(llm.LLMStream):
+    """Expose Agent Kernel through LiveKit's ``LLMStream`` API."""
 
-    When vision_enabled is true in config, the entrypoint also subscribes to video tracks
-    and captures the latest webcam frame on each voice turn, passing it through the
-    multimodal pipeline as an AgentRequestImage.
-    """
-    logger.info(f"Connecting to room {ctx.room.name}")
-    vad = silero.VAD.load()
+    def __init__(
+        self,
+        parent_llm: LiveKitLLM,
+        *,
+        chat_ctx: llm.ChatContext,
+        tools: list[llm.Tool],
+        conn_options: APIConnectOptions,
+    ) -> None:
+        super().__init__(parent_llm, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
+        self._parent_llm = parent_llm
+        self._chunk_id = f"agent-kernel-{uuid.uuid4()}"
 
-    agent_name = Config.get().livekit.agent
-    if not agent_name:
-        logger.warning("No agent configured for LiveKit interactions. Set 'agent' under 'livekit' in config.yaml.")
+    async def _run(self) -> None:
+        assert self._parent_llm._agent_name is not None
+        assert self._parent_llm._session_id is not None
+        voice_agent = AgentKernelVoiceAgent(
+            agent_name=self._parent_llm._agent_name,
+            session_id=self._parent_llm._session_id,
+            frame_holder=self._parent_llm._frame_holder,
+            streaming_mode=self._parent_llm._streaming_mode,
+            service=self._parent_llm._service,
+        )
+        async for content in voice_agent.llm_node(self.chat_ctx, self.tools, ModelSettings()):
+            self._event_ch.send_nowait(llm.ChatChunk(id=self._chunk_id, delta=llm.ChoiceDelta(content=content, role="assistant")))
 
-    vision_enabled = Config.get().livekit.vision_enabled
 
-    stt_provider = Config.get().livekit.stt_provider
-    if stt_provider == "openai":
-        from livekit.plugins import openai as lk_openai
+def _session_id_for_room(room: rtc.Room, participant_identity: str | None = None) -> str:
+    """Build a session ID from the room SID and optional participant identity."""
 
-        stt_plugin = lk_openai.STT()
+    room_id = getattr(room, "sid", None) or room.name
+    return f"livekit:{room_id}:{participant_identity}" if participant_identity else f"livekit:{room_id}"
+
+
+def _participant_identity(ctx: JobContext) -> str | None:
+    job = getattr(ctx, "job", None)
+    participant = getattr(job, "participant", None)
+    if participant and getattr(participant, "identity", None):
+        return participant.identity
+
+    metadata = getattr(job, "metadata", None)
+    if metadata:
+        try:
+            dispatch_metadata = json.loads(metadata)
+            if not isinstance(dispatch_metadata, dict):
+                logger.debug("Ignoring non-object LiveKit job metadata")
+                return None
+            identity = dispatch_metadata.get("participant_identity")
+            return identity if isinstance(identity, str) and identity else None
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("Invalid LiveKit job metadata")
+    return None
+
+
+class AgentKernelVoiceAgent(Agent):
+    """LiveKit voice agent whose LLM node delegates to Agent Kernel."""
+
+    def __init__(
+        self,
+        *,
+        agent_name: str,
+        session_id: str,
+        frame_holder: Optional[dict] = None,
+        streaming_mode: str = "streaming",
+        service: AgentService | None = None,
+    ) -> None:
+        super().__init__(
+            instructions="Route user turns to Agent Kernel.",
+            llm=LiveKitLLM(),
+        )
+        self._agent_name = agent_name
+        self._session_id = session_id
+        self._frame_holder = frame_holder
+        self._streaming_mode = _validate_streaming_mode(streaming_mode)
+        self._service = service or AgentService()
+
+    def _select_service(self) -> bool:
+        if not self._service.agent:
+            self._service.select(name=self._agent_name, session_id=self._session_id)
+        return self._service.agent is not None
+
+    def _requests_for_turn(self, user_message: str) -> list[AgentRequest]:
+        requests: list[AgentRequest] = [AgentRequestText(prompt=user_message)]
+        frame_data = _consume_video_frame(self._frame_holder)
+        if frame_data:
+            requests.append(AgentRequestImage(image_data=frame_data, mime_type="image/jpeg", name="webcam_frame"))
+        return requests
+
+    async def llm_node(
+        self,
+        chat_ctx: llm.ChatContext,
+        tools: list[llm.Tool],
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[str]:
+        # Agent Kernel handles tools and model settings.
+        del tools, model_settings
+
+        user_message = _latest_user_message(chat_ctx)
+        if not user_message:
+            yield "I did not hear anything."
+            return
+
+        output_emitted = False
+        try:
+            if not self._select_service():
+                logger.warning("No agent available for name: %s", self._agent_name)
+                output_emitted = True
+                yield _NO_AGENT_MESSAGE
+                return
+
+            requests = self._requests_for_turn(user_message)
+            if self._streaming_mode == "buffered":
+                response = str(await self._service.run_multi(requests))
+                output_emitted = True
+                yield response
+                return
+
+            stream = self._service.stream_multi(requests)
+            error_spoken = False
+            try:
+                async for chunk in stream:
+                    if chunk.error and not error_spoken:
+                        error_spoken = True
+                        output_emitted = True
+                        yield chunk.error
+                    if chunk.delta:
+                        output_emitted = True
+                        yield chunk.delta
+            finally:
+                await stream.aclose()
+        except asyncio.CancelledError:
+            raise
+        except NotImplementedError:
+            logger.warning(
+                "Agent %s does not support streaming; set livekit.streaming_mode to buffered",
+                self._agent_name,
+            )
+            if not output_emitted:
+                yield _STREAMING_UNSUPPORTED_MESSAGE
+        except Exception:
+            logger.exception("Error handling LiveKit turn")
+            if not output_emitted:
+                yield _INTERNAL_ERROR_MESSAGE
+
+
+def _latest_user_message(chat_ctx: llm.ChatContext) -> str:
+    for message in reversed(chat_ctx.messages()):
+        if message.role == "user" and message.text_content:
+            return message.text_content
+    return ""
+
+
+def _consume_video_frame(frame_holder: Optional[dict]) -> str | None:
+    if not frame_holder or not frame_holder.get("frame"):
+        return None
+
+    try:
+        frame = frame_holder.pop("frame")
+        rgba_frame = frame.convert(rtc.VideoBufferType.RGBA)
+        image = Image.frombytes("RGBA", (rgba_frame.width, rgba_frame.height), rgba_frame.data)
+        buffer = io.BytesIO()
+        image.convert("RGB").save(buffer, format="JPEG")
+        logger.debug("Encoded LiveKit video frame")
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    except Exception:
+        logger.exception("Failed to encode a LiveKit video frame")
+        return None
+
+
+async def _default_entrypoint(ctx: JobContext) -> None:
+    """Run the default LiveKit STT -> Agent Kernel -> TTS pipeline."""
+
+    config = Config.get().livekit
+    logger.info("Connecting to LiveKit room %s", ctx.room.name)
+
+    if config.vision_enabled:
+        await ctx.connect(auto_subscribe=agents.AutoSubscribe.SUBSCRIBE_ALL)
+        logger.info("Subscribing to audio and video tracks")
+    else:
+        await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
+
+    if not config.agent:
+        logger.warning("No LiveKit agent configured; set livekit.agent")
+
+    if config.stt_provider == "openai":
+        stt_plugin = openai.STT()
     else:
         stt_plugin = deepgram.STT()
 
-    tts_provider = Config.get().livekit.tts_provider
-    if tts_provider == "elevenlabs":
+    if config.tts_provider == "elevenlabs":
         from livekit.plugins import elevenlabs
 
         tts_plugin = elevenlabs.TTS()
-    elif tts_provider == "google":
+    elif config.tts_provider == "google":
         from livekit.plugins import google
 
         tts_plugin = google.TTS()
     else:
         tts_plugin = openai.TTS()
 
-    # Shared mutable dict to pass the latest frame from the video capture task to the LLM
-    frame_holder = {} if vision_enabled else None
-
-    agent = VoicePipelineAgent(
-        vad=vad,
-        stt=stt_plugin,
-        llm=LiveKitLLM(agent_name=agent_name, session_id=ctx.room.name, frame_holder=frame_holder),
-        tts=tts_plugin,
-        instructions="You are a helpful voice assistant.",
+    frame_holder = {} if config.vision_enabled else None
+    voice_agent = AgentKernelVoiceAgent(
+        agent_name=config.agent,
+        session_id=_session_id_for_room(ctx.room, _participant_identity(ctx)),
+        frame_holder=frame_holder,
+        streaming_mode=config.streaming_mode,
     )
+    session = AgentSession(vad=silero.VAD.load(), stt=stt_plugin, tts=tts_plugin)
+    await session.start(agent=voice_agent, room=ctx.room)
 
-    if vision_enabled:
-        await ctx.connect(auto_subscribe=agents.AutoSubscribe.SUBSCRIBE_ALL)
-        logger.info("Vision enabled: subscribing to audio and video tracks")
-    else:
-        await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
-
-    session = AgentSession()
-    await session.start(agent, room=ctx.room)
-
-    # If vision is enabled, start a background task to capture the latest video frame
-    if vision_enabled:
-        _start_video_capture(ctx.room, frame_holder)
+    if frame_holder is not None:
+        cleanup_video = _start_video_capture(ctx.room, frame_holder)
+        ctx.add_shutdown_callback(cleanup_video)
 
 
-def _start_video_capture(room, frame_holder: dict):
-    """
-    Starts a background task that continuously reads video frames from the first
-    available video track in the room. Only the latest frame is kept in memory;
-    older frames are overwritten.
-    """
-    video_stream = None
-    tasks = []
+def _start_video_capture(room: rtc.Room, frame_holder: dict) -> Callable[[], Awaitable[None]]:
+    """Capture the latest video frame and return a job-shutdown callback."""
 
-    def _create_stream(track: rtc.Track):
-        nonlocal video_stream
+    video_stream: rtc.VideoStream | None = None
+    reader_task: asyncio.Task | None = None
+
+    def _reader_done(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        if error := task.exception():
+            logger.error("LiveKit video capture task failed", exc_info=(type(error), error, error.__traceback__))
+
+    def _create_stream(track: rtc.Track) -> None:
+        nonlocal video_stream, reader_task
+        if reader_task and not reader_task.done():
+            reader_task.cancel()
         if video_stream is not None:
             video_stream.close()
 
-        video_stream = rtc.VideoStream(track)
+        stream = rtc.VideoStream(track)
+        video_stream = stream
 
-        async def _read_stream():
-            async for event in video_stream:
-                try:
-                    # Only store the raw frame to avoid CPU overhead on every tick
-                    frame_holder["frame"] = event.frame
-                except Exception as e:
-                    logger.debug(f"Failed to capture video frame: {e}")
+        async def _read_stream() -> None:
+            async for event in stream:
+                frame_holder["frame"] = event.frame
 
-        task = asyncio.create_task(_read_stream())
-        task.add_done_callback(lambda t: tasks.remove(t) if t in tasks else None)
-        tasks.append(task)
+        reader_task = asyncio.create_task(_read_stream())
+        reader_task.add_done_callback(_reader_done)
 
-    # Check for existing video tracks from remote participants
     for participant in room.remote_participants.values():
         for publication in participant.track_publications.values():
             if publication.track and publication.track.kind == rtc.TrackKind.KIND_VIDEO:
                 _create_stream(publication.track)
-                logger.info("Started video frame capture from existing track")
-                return
+                logger.info("Capturing video from existing track")
+                break
+        if video_stream is not None:
+            break
 
-    # Watch for new video tracks that are published later
     @room.on("track_subscribed")
-    def _on_track_subscribed(track: rtc.Track, publication, participant):
+    def _on_track_subscribed(track: rtc.Track, publication, participant) -> None:
+        del publication, participant
         if track.kind == rtc.TrackKind.KIND_VIDEO:
             _create_stream(track)
-            logger.info("Started video frame capture from newly subscribed track")
+            logger.info("Capturing video from subscribed track")
+
+    async def _cleanup() -> None:
+        room.off("track_subscribed", _on_track_subscribed)
+        if reader_task and not reader_task.done():
+            reader_task.cancel()
+            await asyncio.gather(reader_task, return_exceptions=True)
+        if video_stream is not None:
+            video_stream.close()
+
+    return _cleanup
 
 
 class AgentLiveKitRequestHandler(RESTRequestHandler):
-    """
-    API routers that expose endpoints to interact with LiveKit using Agent Kernel.
-    Endpoints:
-    - GET /livekit/token: Generates a secure LiveKit Access Token for a frontend client to join the voice room.
-
-    This handler also runs a LiveKit Worker as a background asyncio task seamlessly tied to the FastAPI lifecycle.
-    """
+    """Expose LiveKit tokens and run the LiveKit worker with the REST API."""
 
     def __init__(
         self,
         entrypoint_fnc: Optional[Callable[[JobContext], Awaitable[None]]] = None,
         auth_dependency: Optional[Callable] = None,
-    ):
-        self._log = logging.getLogger("ak.api.livekit")
+    ) -> None:
+        self._log = logger
         self._entrypoint = entrypoint_fnc or _default_entrypoint
         self._auth_dependency = auth_dependency
-        self._worker_task = None
-        self._server = None
+        self._worker_task: asyncio.Task | None = None
+        self._server: AgentServer | None = None
+        self._worker_started = False
 
-        # Pull config
-        self.url = Config.get().livekit.url
-        self.api_key = Config.get().livekit.api_key
-        self.api_secret = Config.get().livekit.api_secret
+        config = Config.get().livekit
+        self.url = config.url
+        self.api_key = config.api_key
+        self.api_secret = config.api_secret
+        self.worker_name = config.worker_name
+
+    def _worker_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        if error := task.exception():
+            self._log.error("LiveKit background worker failed", exc_info=(type(error), error, error.__traceback__))
 
     def get_router(self) -> APIRouter:
         from contextlib import asynccontextmanager
 
         @asynccontextmanager
-        async def lifespan(r: APIRouter):
-            if not getattr(self, "_worker_started", False):
+        async def lifespan(router: APIRouter):
+            del router
+            if not self._worker_started:
                 self._worker_started = True
-                self._log.info("Starting up LiveKit Background Worker")
+                self._log.info("Starting LiveKit background worker")
 
-                # Setup worker options
-                kwargs = {}
+                kwargs = {"port": 0}
                 if self.url:
                     kwargs["ws_url"] = self.url
                 if self.api_key:
@@ -319,57 +398,59 @@ class AgentLiveKitRequestHandler(RESTRequestHandler):
                 if self.api_secret:
                     kwargs["api_secret"] = self.api_secret
 
-                # Set port to 0 to assign a random port
-                kwargs["port"] = 0
-
-                # We initialize the AgentServer and start it as an asyncio task
-                worker_opts = WorkerOptions(agent_name="agent-kernel-worker", entrypoint_fnc=self._entrypoint, worker_type=WorkerType.ROOM, **kwargs)
-
-                self._server = AgentServer.from_server_options(worker_opts)
+                worker_options = WorkerOptions(
+                    agent_name=self.worker_name,
+                    entrypoint_fnc=self._entrypoint,
+                    worker_type=WorkerType.ROOM,
+                    **kwargs,
+                )
+                self._server = AgentServer.from_server_options(worker_options)
                 self._worker_task = asyncio.create_task(self._server.run())
+                self._worker_task.add_done_callback(self._worker_done)
 
-            yield
-
-            if self._worker_task and not self._worker_task.done():
-                self._log.info("Shutting down LiveKit Background Worker")
-                self._worker_task.cancel()
-                try:
-                    await self._worker_task
-                except asyncio.CancelledError:
-                    pass
+            try:
+                yield
+            finally:
+                if self._server:
+                    self._log.info("Shutting down LiveKit background worker")
+                    try:
+                        await self._server.aclose()
+                    except Exception:
+                        self._log.exception("Failed to close LiveKit worker")
+                if self._worker_task:
+                    if not self._worker_task.done():
+                        self._worker_task.cancel()
+                    try:
+                        await self._worker_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        # _worker_done already logged this exception.
+                        pass
 
         router = APIRouter(prefix="/livekit", tags=["LiveKit Integration"], lifespan=lifespan)
-
         dependencies = [Depends(self._auth_dependency)] if self._auth_dependency else []
 
         @router.get("/token", dependencies=dependencies)
         def get_token(room: str, identity: str):
-            """
-            Generates a secure LiveKit Access Token for a frontend client to join the voice room.
-            :param room: The name of the room the client is joining.
-            :param identity: The identity of the client.
-            :return: A dictionary containing the generated JWT token.
-
-            """
             if not self.api_key or not self.api_secret:
                 raise HTTPException(
                     status_code=500,
                     detail=(
                         "LiveKit API key or secret not configured. Set them in config.yaml under "
-                        "'livekit' or via environment variables such as "
-                        "AK_LIVEKIT__API_KEY and AK_LIVEKIT__API_SECRET."
+                        "'livekit' or via AK_LIVEKIT__API_KEY and AK_LIVEKIT__API_SECRET."
                     ),
                 )
+
+            if self._worker_started and (self._worker_task is None or self._worker_task.done()):
+                raise HTTPException(status_code=503, detail="The LiveKit worker is not running. Check the server logs before issuing tokens.")
 
             token = api.AccessToken(self.api_key, self.api_secret)
             token.with_identity(identity)
             token.with_name(identity)
-            token.with_grants(
-                api.VideoGrants(
-                    room_join=True,
-                    room=room,
-                )
-            )
+            token.with_grants(api.VideoGrants(room_join=True, room=room))
+            dispatch_metadata = json.dumps({"participant_identity": identity})
+            token.with_room_config(api.RoomConfiguration(agents=[api.RoomAgentDispatch(agent_name=self.worker_name, metadata=dispatch_metadata)]))
             return {"token": token.to_jwt()}
 
         return router

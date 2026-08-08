@@ -195,13 +195,6 @@ Agent Kernel currently supports:
 - **Google ADK** - Google's Agent Development Kit
 - **Smolagents** - Hugging Face's lightweight agentic framework
 
-Coming soon:
-<<<<<<< HEAD
-- **Smol Agents** - Hugging Face's lightweight agentic framework
-=======
-- **LiveKit Agents** - Real-time audio/video agent framework for voice-enabled AI applications
->>>>>>> develop
-
 ### Flexible Deployment
 
 ```mermaid

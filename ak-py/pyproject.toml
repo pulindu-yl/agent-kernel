@@ -126,14 +126,17 @@ gmail = [
     "google-api-python-client>=2.0.0",
 ]
 livekit = [
-    "livekit-agents>=1.0.0",
-    "livekit-plugins-openai>=1.0.0",
-    "livekit-plugins-deepgram>=1.0.0",
-    "livekit-plugins-silero>=1.0.0",
-    "livekit-plugins-elevenlabs>=1.0.0",
-    "livekit-plugins-google>=1.0.0",
-    "livekit-api>=0.2.0",
+    "livekit-agents~=1.6",
+    "livekit-plugins-openai~=1.6",
+    "livekit-plugins-deepgram~=1.6",
+    "livekit-plugins-silero~=1.6",
+    "livekit-plugins-elevenlabs~=1.6",
+    "livekit-plugins-google~=1.6",
+    "livekit-api~=1.2",
     "Pillow>=10.0.0",
+]
+gcp = [
+    "google-cloud-firestore>=2.19.0",
 ]
 test = [
     "pytest>=8.4.1",

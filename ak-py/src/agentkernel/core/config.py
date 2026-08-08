@@ -177,6 +177,12 @@ class _GmailConfig(BaseModel):
 
 class _LiveKitConfig(BaseModel):
     agent: str = Field(default="", description="Default agent to use for LiveKit Voice interactions")
+    worker_name: str = Field(default="agent-kernel-worker", min_length=1, description="Named LiveKit worker used for explicit room dispatch")
+    streaming_mode: str = Field(
+        default="streaming",
+        pattern="^(streaming|buffered)$",
+        description="LiveKit response mode: streaming forwards incremental chunks and buffered waits for the full reply",
+    )
     url: str = Field(default="", description="LiveKit WebSocket URL (e.g., wss://my-project.livekit.cloud)")
     api_key: str = Field(default="", description="LiveKit API Key")
     api_secret: str = Field(default="", description="LiveKit API Secret")
@@ -190,8 +196,7 @@ class _LiveKitConfig(BaseModel):
     )
 
 
-class _MultimodalStorageRedisConfig(BaseModel):
-    url: str = Field(default="redis://localhost:6379", description="Redis connection URL")
+class _MultimodalStorageRedisConfig(_RedisConfig):
     ttl: int = Field(default=604800, description="Attachment TTL in seconds")
     prefix: str = Field(default="ak:attachments:", description="Key prefix for attachment keys")
 

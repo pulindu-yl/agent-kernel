@@ -1,7 +1,9 @@
 livekit:
   agent: "my-voice-agent"
+  worker_name: "agent-kernel-worker"
   stt_provider: "deepgram"
   tts_provider: "openai"
+  streaming_mode: "streaming"
   vision_enabled: true
 
 multimodal:

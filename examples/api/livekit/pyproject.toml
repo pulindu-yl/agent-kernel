@@ -3,15 +3,15 @@ name = "api-livekit"
 version = "0.1.0"
 description = "LiveKit Integration Demo for Agent Kernel"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
-    "agentkernel[api,openai,livekit]>=0.4.0",
+    "agentkernel[api,livekit,multimodal,openai]>=0.6.1",
     "python-dotenv"
 ]
 
 [dependency-groups]
 dev = [
-    "agentkernel[test]>=0.4.0",
+    "agentkernel[test]>=0.6.1",
     "black>=23.0.0",
     "isort>=5.0.0",
     "mypy>=1.0.0",
@@ -19,6 +19,9 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+agentkernel = { path = "../../../ak-py", editable = true }
 
 [tool.isort]
 profile = "black"
