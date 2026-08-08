@@ -39,13 +39,12 @@ flowchart LR
     D["CrewAI"] --> B
     E["LangGraph"] --> B
     F["Google ADK"] --> B
-    SA["Smol Agents *(soon)*"] --> B
+    SA["Smolagents"] --> B
     G["Test Framework"]
     B --> G
     style A fill:#2e8555,stroke:#fff,stroke-width:2px,color:#fff
     style B fill:#2e4555,stroke:#fff,stroke-width:2px,color:#fff
     style G fill:#005073,stroke:#fff,stroke-width:2px,color:#fff
-    style SA fill:#555,stroke:#fff,stroke-width:1px,color:#ccc,stroke-dasharray: 5 5
 ```
 
 ## Why Agent Kernel?

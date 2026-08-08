@@ -15,11 +15,12 @@ graph LR
     A --> D[LangGraph]
     A --> E[Google ADK]
     A --> F[Smolagents]
-    A -.->|coming soon| LK[LiveKit Agents]
     
     style A fill:#2e8555,stroke:#fff,stroke-width:2px,color:#fff
-    style LK fill:#555,stroke:#ccc,stroke-width:1px,color:#ccc
 ```
+
+For real-time voice and video, use the [LiveKit integration](../integrations/livekit) with any
+supported framework adapter.
 
 ## Framework Comparison
 
@@ -30,7 +31,6 @@ graph LR
 | **LangGraph** | Complex workflows | High | Yes |
 | **Google ADK** | Google ecosystem | Low | Yes |
 | **Smolagents** | Lightweight tool-driven agents | Medium | Yes |
-| **LiveKit Agents** *(coming soon)* | Real-time voice/video agents | Medium | Yes |
 
 ## Capability Matrix
 
@@ -87,12 +87,6 @@ Not every Agent Kernel capability is available on every framework:
 - Great for fast experimentation and mixed-agent setups
 
 [Learn more →](./smolagents)
-
-### LiveKit Agents *(coming soon)*
-- Real-time audio and video agent framework
-- Voice-enabled AI applications
-- Low-latency media pipelines
-- Ideal for conversational voice assistants and live-streaming AI bots
 
 ## Migration Between Frameworks
 

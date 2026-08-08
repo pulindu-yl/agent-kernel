@@ -97,7 +97,7 @@ That's it. Same code deploys to AWS Lambda, ECS, Azure Functions, or Container A
 ### 🧩 Works with the Frameworks You Already Use
 
 <p align="center">
-  <b>OpenAI Agents SDK</b> &nbsp;•&nbsp; <b>LangGraph</b> &nbsp;•&nbsp; <b>CrewAI</b> &nbsp;•&nbsp; <b>Google ADK</b> &nbsp;•&nbsp; <i>Smol Agents (soon)</i> &nbsp;•&nbsp; <i>LiveKit (soon)</i>
+  <b>OpenAI Agents SDK</b> &nbsp;•&nbsp; <b>LangGraph</b> &nbsp;•&nbsp; <b>CrewAI</b> &nbsp;•&nbsp; <b>Google ADK</b> &nbsp;•&nbsp; <b>Smolagents</b>
 </p>
 
 No rewrites. No re-learning. Bring your agents — Agent Kernel handles the platform layer.
@@ -128,6 +128,11 @@ Enterprises can't ship agents they can't audit. Agent Kernel makes compliance th
 Slack • WhatsApp • Microsoft Teams • Telegram • Gmail • Messenger • Instagram
 
 Build once. Ship to every channel your users live on. No bespoke bot code.
+
+### 🎙️ Real-Time Voice and Vision
+
+[LiveKit](https://kernel.yaala.ai/docs/integrations/livekit) connects Agent Kernel agents to
+WebRTC voice and video rooms with streaming or buffered responses.
 
 ### 🔌 Open Protocols
 
