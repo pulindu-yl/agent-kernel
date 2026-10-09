@@ -184,7 +184,10 @@ jobs:
 
       - name: Install chart
         run: |
+          # `openai` feeds the baremetal/eks extraEnv path; `openai-credentials` is the file the
+          # dev flavor's secretStore mounts (the example's ak-values.yaml).
           kubectl create secret generic openai --from-literal=api-key="${{ secrets.OPENAI_API_KEY }}"
+          kubectl create secret generic openai-credentials --from-literal=OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
           if [[ "${{ matrix.flavor }}" == "dev" ]]; then
             # The example's own install script in local mode (this checkout's chart plus the
             # example overlay), exactly what its README documents, sized for a CI node by the

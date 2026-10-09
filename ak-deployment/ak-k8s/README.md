@@ -345,11 +345,14 @@ subcharts are smoke-test conveniences, not production settings.
 
 ```bash
 ct lint --config ak-deployment/ak-k8s/ci/ct.yaml
-ct install --config ak-deployment/ak-k8s/ci/ct.yaml    # against a kind cluster
+ct install --config ak-deployment/ak-k8s/ci/ct.yaml \
+  --helm-extra-set-args "--set extraEnv[0].name=OPENAI_API_KEY --set extraEnv[0].value=placeholder"   # against a kind cluster
 ```
 
 `chart/ci/kind-smoke-values.yaml` is the values file ct installs with: the dev flavor sized
-for a CI node, expecting the example image preloaded via `kind load docker-image`.
+for a CI node, expecting the example image preloaded via `kind load docker-image`. The placeholder
+`OPENAI_API_KEY` keeps the example's agent runner (which reads the key at import) from crash-looping, since
+`ct install` provides neither the key nor the Secret mount; the gate checks that pods start, not that chat works.
 
 ## Publishing
 
