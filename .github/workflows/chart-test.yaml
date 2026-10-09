@@ -68,7 +68,10 @@ jobs:
         run: |
           for values in values.yaml values-dev.yaml values-baremetal.yaml values-eks.yaml; do
             echo "--- $values"
-            helm template smoke "$CHART_DIR" -f "$CHART_DIR/$values" > /dev/null
+            out=$(helm template smoke "$CHART_DIR" -f "$CHART_DIR/$values")
+            if grep -q '/var/run/secrets/agentkernel' <<<"$out"; then
+              echo "default render of $values must not mount secrets"; exit 1
+            fi
           done
           echo "--- websocket mode"
           helm template smoke "$CHART_DIR" -f "$CHART_DIR/values-baremetal.yaml" \
@@ -89,6 +92,41 @@ jobs:
             --set transport.type=kafka --set transport.kafka.bootstrapServers=kafka.shared:9092 \
             --set responseStore.type=redis --set responseStore.url=redis://shared:6379 \
             --set session.type=redis --set session.url=redis://shared:6379 > /dev/null
+          echo "--- secretStore: two Secrets on the agent-runner"
+          STORE=(--set secretStore.enabled=true \
+            --set 'secretStore.secrets[0].name=openai-credentials' --set 'secretStore.secrets[1].name=slack-credentials')
+          runner=$(helm template smoke "$CHART_DIR" "${STORE[@]}" --show-only templates/deployment-agent-runner.yaml)
+          io=$(helm template smoke "$CHART_DIR" "${STORE[@]}" --show-only templates/deployment-io.yaml)
+          grep -q 'mountPath: /var/run/secrets/agentkernel/openai-credentials' <<<"$runner"
+          grep -q 'mountPath: /var/run/secrets/agentkernel/slack-credentials' <<<"$runner"
+          grep -q 'secretName: slack-credentials' <<<"$runner"
+          # `! grep` is exempt from `set -e`, so absence is asserted with an explicit exit.
+          if grep -q '/var/run/secrets/agentkernel' <<<"$io"; then echo "io must not mount"; exit 1; fi
+          echo "--- secretStore: single-process profile mounts on io"
+          SINGLE=(--set agentRunner.enabled=false --set transport.type=in_memory)
+          io=$(helm template smoke "$CHART_DIR" "${STORE[@]}" "${SINGLE[@]}" --show-only templates/deployment-io.yaml)
+          grep -q 'mountPath: /var/run/secrets/agentkernel/openai-credentials' <<<"$io"
+          grep -q 'mountPath: /var/run/secrets/agentkernel/slack-credentials' <<<"$io"
+          echo "--- secretStore: websocket tier never mounts"
+          ws=$(helm template smoke "$CHART_DIR" -f "$CHART_DIR/values-baremetal.yaml" "${STORE[@]}" \
+            --set execution.mode=stream --set wsGateway.enabled=true --set wsGateway.auth.token=render \
+            --show-only templates/deployment-ws-gateway.yaml)
+          if grep -q '/var/run/secrets/agentkernel' <<<"$ws"; then echo "ws-gateway must not mount"; exit 1; fi
+          echo "--- secretStore: expected failures"
+          expect_fail() {  # <expected message> <helm args...>
+            local err="$RUNNER_TEMP/expect-fail.txt"
+            if helm template smoke "$CHART_DIR" "${@:2}" >/dev/null 2>"$err"; then echo "rendered: $*"; exit 1; fi
+            grep -qF "$1" "$err" || { echo "expected '$1', got:"; cat "$err"; exit 1; }
+          }
+          expect_fail "must list at least one Secret" --set secretStore.enabled=true
+          expect_fail "must be objects with a name" --set secretStore.enabled=true --set 'secretStore.secrets[0]=a'
+          expect_fail "secretStore.secrets[].name is required" --set secretStore.enabled=true --set 'secretStore.secrets[0].other=x'
+          expect_fail "more than once" --set secretStore.enabled=true \
+            --set 'secretStore.secrets[0].name=a' --set 'secretStore.secrets[1].name=a'
+          expect_fail "needs an agent-executing tier" --set secretStore.enabled=true \
+            --set 'secretStore.secrets[0].name=a' --set agentRunner.enabled=false --set ioHandler.enabled=false
+          expect_fail "needs an agent-executing tier" --set secretStore.enabled=true \
+            --set 'secretStore.secrets[0].name=a' --set agentRunner.enabled=false   # broker transport, runner elsewhere
 
   kind-smoke:
     needs: lint
