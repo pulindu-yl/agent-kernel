@@ -24,7 +24,7 @@ Update `pyproject.toml`:
 ```toml
 [dependency-groups]
 dev = [
-    "agentkernel[test]>=0.9.4",
+    "agentkernel[test]>=0.9.5",
     "black>=23.0.0",
     "isort>=5.0.0",
     "mypy>=1.0.0",
@@ -352,7 +352,7 @@ pip install "agentkernel[maf]"        # For Microsoft Agent Framework (add a pro
 
 Or in `pyproject.toml`:
 ```toml
-dependencies = ["agentkernel[openai,api]>=0.9.4"]
+dependencies = ["agentkernel[openai,api]>=0.9.5"]
 ```
 
 #### Issue: Redis connection errors

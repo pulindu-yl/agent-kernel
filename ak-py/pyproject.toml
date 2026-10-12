@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "agentkernel"
-version = "0.9.4"
+version = "0.9.5"
 description = "Agent Kernel - Unified AI Agents Runtime"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -118,7 +118,7 @@ trino = [
 ]
 
 openai = [
-    "openai-agents>=0.7.0",
+    "openai-agents>=0.20.0",
     "openinference-instrumentation-openai-agents>=1.4.0",
     "openai-guardrails>=0.2.1",
 ]
