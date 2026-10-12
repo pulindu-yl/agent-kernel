@@ -5,12 +5,16 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from agentkernel.core.event import (
+    AudioDelta,
     DataMessage,
+    Interrupt,
     MessageEnd,
     MessageStart,
+    PausedInterruption,
     ReasoningDelta,
     ReasoningEnd,
     ReasoningStart,
+    RunPaused,
     StepEnd,
     StepStart,
     StreamEvent,
@@ -42,7 +46,10 @@ ALL_EVENTS = [
     ReasoningStart(message_id="m1"),
     ReasoningDelta(message_id="m1", content="thinking"),
     ReasoningEnd(message_id="m1"),
-    DataMessage(message_id="m1", content={"version": "v1.0"}, media_type="application/a2ui+json"),
+    AudioDelta(message_id="m1", content="YmFzZTY0Cg=="),
+    Interrupt(),
+    RunPaused(run_id="run-1", agent="refunds", interruptions=[PausedInterruption(id="i1", kind="tool_call", tool_name="refund")]),
+    DataMessage(message_id="m1", content={"version": "v1.0", "cost": 1.5}, media_type="application/a2ui+json"),
 ]
 
 
@@ -62,16 +69,31 @@ def test_event_round_trips_through_the_discriminated_union(event):
     assert parsed == event
 
 
+def _leaves(value):
+    """Yields every scalar inside a dumped event, descending through lists and dicts."""
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _leaves(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _leaves(item)
+    else:
+        yield value
+
+
 @pytest.mark.parametrize("event", ALL_EVENTS, ids=lambda ev: ev.type)
 def test_event_is_json_serialisable(event):
-    # No field may carry a framework-native object: a StreamChunk crosses the queue transport. The
-    # scalar set matches spec §1 rule 4 rather than being narrower than it, so an int or bool field
-    # added by a later adapter PR is accepted here instead of failing a spec-legal change. A dict or
-    # list is admitted for a payload field, whose JSON-safety the shared annotated type guarantees,
-    # and None for an optional one.
+    """No field may carry a framework-native object: a StreamChunk crosses the queue transport.
+
+    Descends rather than checking top-level values only, because RunPaused.interruptions is a list
+    of models and DataMessage.content is a payload of arbitrary depth — the invariant is that every
+    leaf is a JSON primitive, not that every field is. float is in the set for the payload's sake:
+    a JSON number may be fractional, and the annotated type that normalises content is what
+    guarantees nothing worse than a float reaches here.
+    """
     dumped = event.model_dump()
     assert json.loads(json.dumps(dumped)) == dumped
-    assert all(value is None or isinstance(value, (str, int, bool, dict, list)) for value in dumped.values())
+    assert all(leaf is None or isinstance(leaf, (str, int, float, bool)) for leaf in _leaves(dumped))
 
 
 @pytest.mark.parametrize("event", ALL_EVENTS, ids=lambda ev: ev.type)

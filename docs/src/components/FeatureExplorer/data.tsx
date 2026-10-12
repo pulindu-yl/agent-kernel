@@ -93,6 +93,15 @@ export const FEATURE_TABS: FeatureTab[] = [
         example: "api/slack",
       },
       {
+        title: "LiveKit",
+        description:
+          "Connect OpenAI Agents SDK and Google ADK agents to LiveKit WebRTC rooms. A stateful gateway carries user audio and text and returns streamed model audio and transcripts through the realtime pipeline.",
+        tags: ["Voice integration", "WebRTC", "Realtime"],
+        // Drop /next after the LiveKit integration is released.
+        docs: "/docs/next/integrations/livekit",
+        example: "api/livekit-voice",
+      },
+      {
         title: "REST, WebSocket & Streaming",
         description:
           "A FastAPI server with sync, async and SSE streaming modes, a WebSocket gateway for push delivery, and multipart uploads for attachments.",
@@ -268,6 +277,14 @@ export const FEATURE_TABS: FeatureTab[] = [
         example: "api/schedule-openai",
       },
       {
+        title: "Human in the Loop",
+        description:
+          "Pause a run for a person's approval or answer and resume from their decision later, on any replica. Works on OpenAI, LangGraph, Pydantic AI and Google ADK, over REST, streaming and AG-UI.",
+        tags: ["Approvals", "Pause & resume", "AG-UI"],
+        docs: "/docs/advanced/human-in-the-loop",
+        example: "api/hitl",
+      },
+      {
         title: "Fault Tolerance",
         description:
           "Multi-AZ deployments, automatic recovery, health monitoring and zero-downtime rollouts on the cloud and Kubernetes deployment modes. Local mode stays single-instance for development.",
@@ -285,8 +302,8 @@ export const FEATURE_TABS: FeatureTab[] = [
       {
         title: "Tracing",
         description:
-          "One config line enables Langfuse, OpenLLMetry on OpenTelemetry, or Pydantic Logfire across agents, LLM calls and tool invocations, with cost and latency.",
-        tags: ["Langfuse", "OpenLLMetry", "Logfire", "OpenTelemetry"],
+          "One config line enables Langfuse, OpenLLMetry on OpenTelemetry, Pydantic Logfire, or AWS CloudWatch across agent runs, plus LLM calls and tool invocations where the framework supports them, with cost and latency.",
+        tags: ["Langfuse", "OpenLLMetry", "Logfire", "CloudWatch", "OpenTelemetry"],
         docs: "/docs/advanced/traceability",
         example: "cli/logfire",
       },
