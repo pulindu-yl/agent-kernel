@@ -192,6 +192,9 @@ the volumeMounts cannot drift apart.
 {{- fail (printf "secretStore.secrets entries must be objects with a name, e.g. '- name: %v'" .) }}
 {{- end }}
 {{- $name := required "secretStore.secrets[].name is required" .name }}
+{{- if not (kindIs "string" $name) }}
+{{- fail (printf "secretStore.secrets[].name must be a string, got %v: quote names such as \"true\" or \"123\"" $name) }}
+{{- end }}
 {{- if hasKey $seen $name }}
 {{- fail (printf "secretStore.secrets lists '%s' more than once" $name) }}
 {{- end }}
@@ -205,7 +208,7 @@ the volumeMounts cannot drift apart.
 {{- range $i, $s := .Values.secretStore.secrets }}
 - name: ak-secret-{{ $i }}
   secret:
-    secretName: {{ $s.name }}
+    secretName: {{ $s.name | quote }}
     optional: false
 {{- end }}
 {{- end }}
