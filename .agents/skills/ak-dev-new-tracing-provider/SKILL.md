@@ -37,7 +37,8 @@ ak-py/src/agentkernel/trace/<provider>/
 ├── crewai.py            # Traced CrewAI runner
 ├── adk.py               # Traced Google ADK runner
 ├── smolagents.py        # Traced Smolagents runner
-└── pydanticai.py        # Traced Pydantic AI runner
+├── pydanticai.py        # Traced Pydantic AI runner
+└── maf.py               # Traced Microsoft Agent Framework runner
 ```
 
 ### 2. Implement the Main Trace Class
@@ -162,7 +163,7 @@ class <Provider>LangGraphRunner(LangGraphRunner):
             return await super().run(agent, session, requests)
 ```
 
-Follow the same pattern for CrewAI, Google ADK, Smolagents, and Pydantic AI runners (see `trace/langfuse/smolagents.py` and `trace/openllmetry/smolagents.py` for reference).
+Follow the same pattern for CrewAI, Google ADK, Smolagents, Pydantic AI, and Microsoft Agent Framework runners (see `trace/langfuse/smolagents.py` and `trace/openllmetry/smolagents.py` for reference).
 
 ### 4. Update the `__init__.py`
 

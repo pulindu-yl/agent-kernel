@@ -40,6 +40,7 @@ Command-line interface examples for local development and testing:
 - **`langgraph/`** - LangGraph framework integration examples
 - **`logfire/`** - Pydantic Logfire tracing over the OpenAI Agents SDK example
 - **`cloudwatch/`** - AWS CloudWatch tracing (OpenTelemetry to X-Ray) over the OpenAI Agents SDK example
+- **`maf/`** - Microsoft Agent Framework (MAF) integration examples
 - **`multi/`** - Multi-agent examples combining different frameworks
 - **`openai/`** - OpenAI Agent SDK integration examples
 - **`openai-dynamic/`** - OpenAI Agent SDK agents registered dynamically at runtime
@@ -55,6 +56,7 @@ Per-run framework context/state demos — a grocery assistant that carries a car
 - **`langgraph_context/`** - LangGraph, via a declared state channel on a custom graph
 - **`adk_context/`** - Google ADK, via `ToolContext.state`
 - **`pydanticai_context/`** - Pydantic AI, via `RunContext.deps`
+- **`maf_context/`** - Microsoft Agent Framework, via `FunctionInvocationContext.session.state`
 
 Per-agent native run options demos, one per framework plus a per-run factory variant: each declares that framework's turn-limit option and progress-hook option through `Module.run_options` and appends a deterministic `Run stats:` line to every reply (see the [Runner](../core-concepts/runner.md#native-run-options) guide):
 
@@ -155,6 +157,7 @@ Agent Kernel supports multiple AI agent frameworks:
 | **LangGraph** | Graph-based agent framework | CLI, AWS Serverless, Azure Serverless |
 | **OpenAI Agent SDK** | OpenAI's official agent framework | CLI, Containerized, AWS Serverless, AWS Containerized, Azure Serverless, Azure Containerized, GCP Serverless, GCP Containerized, API |
 | **Pydantic AI** | Type-safe agent framework from the Pydantic team | CLI, API |
+| **Microsoft Agent Framework** | Microsoft's unified agent framework, successor to AutoGen and Semantic Kernel | CLI, API |
 | **smolagents** | HuggingFace's code-first agent framework | CLI |
 
 ## Deployment Patterns

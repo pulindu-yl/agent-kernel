@@ -18,9 +18,11 @@ from ...core.config import AKConfig
 from ...core.event import (
     MessageEnd,
     MessageStart,
+    PausedInterruption,
     ReasoningDelta,
     ReasoningEnd,
     ReasoningStart,
+    RunPaused,
     StreamEvent,
     TextDelta,
     ToolCallArgs,
@@ -29,6 +31,7 @@ from ...core.event import (
     ToolCallStart,
 )
 from ...core.model import (
+    AgentPausedReplyAny,
     AgentReply,
     AgentReplyAny,
     AgentReplyText,
@@ -37,7 +40,9 @@ from ...core.model import (
     AgentRequestFile,
     AgentRequestImage,
     AgentRequestText,
+    ResumeDecision,
 )
+from ...core.paused_run import PausedRun, PausedRunState
 from ...core.util.error_util import user_facing_error_message
 from ...trace import Trace
 
@@ -138,18 +143,23 @@ class MAFRunner(Runner):
 
         return "\n".join(prompt_parts), inputs
 
-    def _prepare_session(self, session: Session | None, options: Mapping[str, Any]) -> tuple[dict[str, Any], AgentSession | None, dict | None]:
+    def _prepare_session(
+        self, session: Session | None, options: Mapping[str, Any], state: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any], AgentSession | None, dict | None]:
         """
         Restores the native MAF session and injects the framework context for one run.
         :param session: The AK session, or None for a stateless run.
         :param options: The run options resolved for this run.
+        :param state: A serialized native session to restore instead of the stored one: a paused run's snapshot.
         :return: Tuple of (native run kwargs, native session or None, framework context loaded this turn).
         """
         if session is None:
             return self._native_kwargs(options), None, None
 
-        state = self._session(session).get_state()
-        native_session = AgentSession.from_dict(state) if state else AgentSession(session_id=session.id)
+        if state is None:
+            state = self._session(session).get_state()
+        # Deep copy so restoring never mutates the stored snapshot: a failed resume must be retryable from it.
+        native_session = AgentSession.from_dict(copy.deepcopy(state)) if state else AgentSession(session_id=session.id)
 
         # Tools reach the framework context as `FunctionInvocationContext.session.state["ak_context"]`.
         incoming = self._load_framework_context(session)
@@ -181,8 +191,10 @@ class MAFRunner(Runner):
         :param agent: The MAF agent to run.
         :param session: The session to use for the agent.
         :param requests: The requests to the agent.
-        :return: The result of the agent's execution.
+        :return: The result of the agent's execution, or a paused reply when a tool needs approval.
         """
+        self._reject_while_a_decision_is_outstanding(session)
+
         context: ToolContext | None = None
         prompt = ""
         try:
@@ -201,13 +213,7 @@ class MAFRunner(Runner):
 
             # Only write back after a successful run.
             self._finalize_session(session, native_session, incoming)
-
-            structured = AgentReplyAny.from_output(getattr(result, "value", None), prompt)
-            if structured is not None:
-                return structured
-
-            output = getattr(result, "text", None)
-            return AgentReplyText(response=str(result) if output is None else output, prompt=prompt)
+            return self._reply(agent, session, native_session, result, prompt)
         except Exception as e:
             return AgentReplyText(response=user_facing_error_message(e), prompt=prompt)
         finally:
@@ -216,17 +222,14 @@ class MAFRunner(Runner):
 
     async def stream(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AsyncGenerator[StreamEvent, None]:
         """
-        Streams the MAF agent response as Agent Kernel stream events.
-
-        Text and reasoning streams are keyed by the update's native `message_id` (or a generated id when MAF
-        supplies none); tool events are correlated by MAF's own `call_id`. `streams` / `open_calls` / `call_ids`
-        are locals — the runner is shared across sessions.
-
+        Streams the MAF agent response as Agent Kernel stream events, ending in `RunPaused` when a tool needs approval.
         :param agent: The MAF agent to run.
         :param session: The session to use for the agent.
         :param requests: The requests to the agent.
         :return: An async generator yielding StreamEvent objects.
         """
+        self._reject_while_a_decision_is_outstanding(session)
+
         context: ToolContext | None = None
         try:
             context = ToolContext(Runtime.current(), agent, session, requests).set()
@@ -239,27 +242,292 @@ class MAFRunner(Runner):
             options = await agent.resolve_run_options(session, requests)
             kwargs, native_session, incoming = self._prepare_session(session, options)
 
-            stream_result = await agent.agent.run(Message("user", inputs), stream=True, **kwargs)
-
-            fallback_id = uuid4().hex
-            streams: dict[str, str] = {}  # native content type -> id of the open text/reasoning stream
-            open_calls: dict[str, None] = {}  # insertion-ordered set of call ids awaiting a result
-            call_ids: dict[Any, str] = {}  # tool_call_index -> call id; the None key holds the latest call
-
-            async for update in stream_result:
-                for event in self._map_update(update, fallback_id, streams, open_calls, call_ids):
-                    yield event
-            for event in self._close_streams(streams, open_calls):
+            async for event in self._stream_turn(agent, session, Message("user", inputs), kwargs, native_session, incoming, None):
                 yield event
-
-            # After a normal drain only — disconnect/error leaves the stored session and context intact.
-            try:
-                self._finalize_session(session, native_session, incoming)
-            except Exception as e:
-                self._log_framework_context_stream_failure(session, e)
         finally:
             if context is not None:
                 context.reset()
+
+    @property
+    def supports_pause(self) -> bool:
+        """
+        :return: True — a tool declared with `approval_mode="always_require"` pauses the run, and the native session
+            that holds the pending call serializes, so the decision can arrive later on any replica.
+        """
+        return True
+
+    async def resume(
+        self,
+        agent: Any,
+        session: Session,
+        requests: list[AgentRequest],
+        decisions: list[ResumeDecision],
+        record: PausedRun,
+    ) -> AgentReply:
+        """
+        Continues a paused run from the human's decisions.
+
+        The native session is restored from the record's snapshot, not the stored one, so the pause stays
+        resumable whatever the session does next; the decisions travel as one user message of approval responses.
+        :param agent: The agent that paused.
+        :param session: The session holding the record.
+        :param requests: The hook-processed request list, carrying the resume request.
+        :param decisions: One per interruption being answered.
+        :param record: The record Runtime validated.
+        :return: The continued run's reply, which may itself be paused again.
+        """
+        self._reject_unresumable(decisions, record, requests)
+
+        context: ToolContext | None = None
+        try:
+            context = ToolContext(Runtime.current(), agent, session, requests).set()
+            options = await agent.resolve_run_options(session, requests)
+            kwargs, native_session, incoming = self._prepare_session(session, options, state=record.payload["session"])
+
+            result = await agent.agent.run(self._approval_message(decisions, record), **kwargs)
+
+            self._finalize_session(session, native_session, incoming)
+            # Cleared only once the framework has accepted the decisions, so a failed resume can be retried.
+            PausedRunState.clear(session, record.id)
+            return self._reply(agent, session, native_session, result, "")
+        except Exception as e:
+            return AgentReplyText(response=user_facing_error_message(e))
+        finally:
+            if context is not None:
+                context.reset()
+
+    async def resume_stream(
+        self,
+        agent: Any,
+        session: Session,
+        requests: list[AgentRequest],
+        decisions: list[ResumeDecision],
+        record: PausedRun,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """
+        Streaming counterpart of `resume()`, mapping events exactly as `stream()` does.
+        :param agent: The agent that paused.
+        :param session: The session holding the record.
+        :param requests: The hook-processed request list, carrying the resume request.
+        :param decisions: One per interruption being answered.
+        :param record: The record Runtime validated.
+        :return: The events the continued run produces, ending in RunPaused if it pauses again.
+        """
+        self._reject_unresumable(decisions, record, requests)
+
+        context: ToolContext | None = None
+        try:
+            context = ToolContext(Runtime.current(), agent, session, requests).set()
+            options = await agent.resolve_run_options(session, requests)
+            kwargs, native_session, incoming = self._prepare_session(session, options, state=record.payload["session"])
+
+            async for event in self._stream_turn(agent, session, self._approval_message(decisions, record), kwargs, native_session, incoming, record):
+                yield event
+        finally:
+            if context is not None:
+                context.reset()
+
+    async def _stream_turn(
+        self,
+        agent: Any,
+        session: Session | None,
+        message: Message,
+        kwargs: dict[str, Any],
+        native_session: AgentSession | None,
+        incoming: dict | None,
+        record: PausedRun | None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """
+        Runs one streamed native turn and maps it, shared by `stream()` and `resume_stream()` so both emit the same events.
+
+        Text and reasoning streams are keyed by the update's native `message_id` (or a generated id when MAF supplies
+        none); tool events are correlated by MAF's own `call_id`. `streams` / `open_calls` / `call_ids` are locals —
+        the runner is shared across sessions. The pause is read off the final response, as `run()` reads it, so the
+        streamed and non-streamed paths cannot drift apart.
+        :param agent: The agent being run.
+        :param session: The AK session, or None for a stateless run.
+        :param message: The user message to send: the prompt, or the approval responses on a resume.
+        :param kwargs: The native run kwargs built by `_prepare_session`.
+        :param native_session: The native session used for the run, or None.
+        :param incoming: The framework context loaded this turn, or None.
+        :param record: The paused run being resumed, cleared after a normal drain; None for an ordinary turn.
+        :return: An async generator yielding StreamEvent objects.
+        """
+        stream_result = await agent.agent.run(message, stream=True, **kwargs)
+
+        fallback_id = uuid4().hex
+        streams: dict[str, str] = {}  # native content type -> id of the open text/reasoning stream
+        open_calls: dict[str, None] = {}  # insertion-ordered set of call ids awaiting a result
+        call_ids: dict[Any, str] = {}  # tool_call_index -> call id; the None key holds the latest call
+
+        async for update in stream_result:
+            for event in self._map_update(update, fallback_id, streams, open_calls, call_ids):
+                yield event
+        for event in self._close_streams(streams, open_calls):
+            yield event
+        final = await stream_result.get_final_response()
+
+        # After a normal drain only — disconnect/error leaves the stored session, context and record intact.
+        try:
+            self._finalize_session(session, native_session, incoming)
+        except Exception as e:
+            self._log_framework_context_stream_failure(session, e)
+        if record is not None:
+            PausedRunState.clear(session, record.id)
+
+        approvals = self._approval_requests(final)
+        if approvals:
+            paused = self._paused_reply(agent, session, native_session, approvals)
+            yield RunPaused(run_id=paused.run_id, agent=agent.name, interruptions=paused.interruptions)
+
+    def _reply(self, agent: Any, session: Session | None, native_session: AgentSession | None, result: Any, prompt: str) -> AgentReply:
+        """
+        Maps a finished native run onto an AgentReply, shared by `run()` and `resume()` so a resumed turn answers in
+        the same shapes. A pause is checked first: a run waiting on approval may still carry text produced on the way.
+        :param agent: The agent that ran.
+        :param session: The AK session, or None for a stateless run.
+        :param native_session: The native session used for the run, or None.
+        :param result: The native `AgentResponse`.
+        :param prompt: The text prompt sent to the agent.
+        :return: A paused reply, a structured reply, or a text reply.
+        """
+        approvals = self._approval_requests(result)
+        if approvals:
+            return self._paused_reply(agent, session, native_session, approvals)
+
+        structured = AgentReplyAny.from_output(getattr(result, "value", None), prompt)
+        if structured is not None:
+            return structured
+
+        output = getattr(result, "text", None)
+        return AgentReplyText(response=str(result) if output is None else output, prompt=prompt)
+
+    @staticmethod
+    def _approval_requests(result: Any) -> list[Content]:
+        """
+        :param result: A native `AgentResponse`, or None.
+        :return: The tool approvals the run is waiting on; empty when it finished.
+        """
+        requests = getattr(result, "user_input_requests", None) or []
+        return [request for request in requests if getattr(request, "type", None) == "function_approval_request"]
+
+    def _paused_reply(
+        self, agent: Any, session: Session | None, native_session: AgentSession | None, approvals: list[Content]
+    ) -> AgentPausedReplyAny:
+        """
+        Records a paused run and returns the reply that carries it back to the caller.
+
+        Replaces rather than appends: MAF keeps one conversation per session, so an earlier pause of this runner
+        could never be resumed. Scoped to this runner, since a pause another framework holds on the same session
+        is a separate conversation and still answerable. The record carries the native session snapshot and the
+        pending requests, so the resume needs nothing else from the session.
+        :param agent: The agent that paused.
+        :param session: The session the record is written to.
+        :param native_session: The native session holding the pending tool calls.
+        :param approvals: The `function_approval_request` items MAF returned.
+        :return: The paused reply, carrying the assigned run id.
+        :raises ValueError: If the run has no session to record the pause in.
+        """
+        if session is None or native_session is None:
+            raise ValueError("A Microsoft Agent Framework run paused for tool approval, but a pause needs a session to be recorded in.")
+
+        PausedRunState.clear_for_runner(session, self.name)
+        record = PausedRunState.add(
+            session,
+            agent=agent.name,
+            runner=self.name,
+            interruptions=[self._interruption(request) for request in approvals],
+            payload={"session": native_session.to_dict(), "requests": [request.to_dict() for request in approvals]},
+        )
+        return AgentPausedReplyAny(run_id=record.id, session_id=session.id, agent=agent.name, interruptions=record.interruptions)
+
+    @classmethod
+    def _interruption(cls, request: Content) -> PausedInterruption:
+        """
+        Maps one `function_approval_request` onto an interruption, keyed by MAF's own request id.
+        :param request: The pending approval request.
+        :return: The interruption to carry back to the caller.
+        """
+        call = getattr(request, "function_call", None)
+        arguments = getattr(call, "arguments", None)
+        return PausedInterruption(
+            id=request.id,
+            kind="tool_call",
+            tool_name=getattr(call, "name", None),
+            arguments=None if arguments is None else cls._as_text(arguments),
+        )
+
+    def _reject_while_a_decision_is_outstanding(self, session: Session | None) -> None:
+        """
+        Refuses an ordinary turn while this framework's pause is still unanswered.
+
+        MAF does not refuse one: it drops the pending tool calls from the conversation and answers the new prompt,
+        so the pause would be lost without anyone being told. This makes the turn fail saying why, and names the run
+        to resume. Only this runner's records are consulted: another framework's pause on the same session is a
+        separate conversation.
+        :param session: The session whose paused runs to inspect, or None.
+        :raises ValueError: If this runner holds an unanswered paused run in this session.
+        """
+        if session is None:
+            return
+        outstanding = next((record for record in PausedRunState.list(session) if record.runner == self.name), None)
+        if outstanding is not None:
+            raise ValueError(
+                f"Microsoft Agent Framework cannot take a new prompt while run '{outstanding.id}' is waiting on a decision: "
+                f"MAF would drop the pending tool calls. Answer it with a 'resume' block first, or start a new session."
+            )
+
+    @staticmethod
+    def _reject_unresumable(decisions: list[ResumeDecision], record: PausedRun, requests: list[AgentRequest]) -> None:
+        """
+        Refuses what a MAF resume cannot carry, before the adapter's `try` opens, so the caller gets the reason rather
+        than a generic reply.
+
+        - A partial answer: MAF holds the approved calls back until every pending one is answered and re-asks for
+          the rest, so a partial resume would run nothing while appearing to succeed.
+        - A payload: a MAF approval is only approved or rejected, with no channel for replacement arguments.
+        - A prompt beside the decisions: MAF places it between the tool calls and their results, an order model
+          APIs reject.
+        :param decisions: The human's decisions.
+        :param record: The record Runtime validated.
+        :param requests: The hook-processed request list.
+        :raises ValueError: If the resume is partial, carries a payload, or carries a prompt.
+        """
+        answered = {decision.id for decision in decisions}
+        missing = sorted(i.id for i in record.interruptions if i.id not in answered)
+        if missing:
+            raise ValueError(
+                f"Microsoft Agent Framework needs every pending approval answered in one resume; {missing} were not answered. "
+                f"Answer all of {sorted(i.id for i in record.interruptions)} together."
+            )
+
+        with_payload = sorted(decision.id for decision in decisions if decision.payload is not None)
+        if with_payload:
+            raise ValueError(
+                f"The Microsoft Agent Framework adapter cannot deliver a structured answer: decision(s) {with_payload} carry a payload, "
+                f"and a MAF approval is only approved or rejected. Model the question as a gated tool's arguments instead."
+            )
+
+        if any(isinstance(req, AgentRequestText) and req.prompt for req in requests):
+            raise ValueError(
+                "The Microsoft Agent Framework adapter cannot carry a prompt alongside a decision: MAF would place it between the "
+                "tool calls and their results, which model APIs reject. Send the prompt as a separate turn once the run has resumed."
+            )
+
+    @staticmethod
+    def _approval_message(decisions: list[ResumeDecision], record: PausedRun) -> Message:
+        """
+        Renders the decisions as the one user message MAF resumes from.
+
+        `approved` approves; `denied` and `cancelled` both reject, since MAF has only those two verbs. MAF tells the
+        model the call was rejected by the user; a decision's `message` has no channel and is not forwarded.
+        :param decisions: The human's decisions, one per pending request (`_reject_unresumable` has checked).
+        :param record: The record holding the pending requests.
+        :return: The message of approval responses.
+        """
+        approved = {decision.id: decision.status == "approved" for decision in decisions}
+        pending = [Content.from_dict(request) for request in record.payload["requests"]]
+        return Message("user", [request.to_function_approval_response(approved[request.id]) for request in pending])
 
     def _map_update(
         self, update: Any, fallback_id: str, streams: dict[str, str], open_calls: dict[str, None], call_ids: dict[Any, str]
@@ -523,15 +791,21 @@ class MAFToolBuilder(ToolBuilder):
     """
 
     @classmethod
-    def bind(cls, funcs: list[Callable]) -> list[Any]:
+    def bind(cls, funcs: list[Callable], **options: Any) -> list[Any]:
         """
         Bind generic tool functions to MAF ``@tool`` definitions.
+
+        Keyword options are forwarded to MAF's ``tool()`` untouched and apply to every function in the call, so tools
+        wanting different options are bound in separate calls. ``approval_mode="always_require"`` is the one that
+        matters: it is this framework's gate for a tool needing a human verdict, which pauses the run.
         :param funcs: List of generic tool functions to bind.
+        :param options: Keyword arguments passed to ``tool()``, e.g. ``approval_mode="always_require"``.
         :return: List of MAF tool definitions.
+        :raises TypeError: If any item in funcs is not callable, or an option ``tool()`` does not take.
         """
         tools = []
         for func in funcs:
             if not callable(func):
                 raise TypeError(f"Expected a callable, got {type(func).__name__}")
-            tools.append(maf_tool(func))
+            tools.append(maf_tool(func, **options))
         return tools

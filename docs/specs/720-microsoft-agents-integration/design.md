@@ -47,6 +47,15 @@ The existing Pydantic AI and OpenAI adapters (`framework/pydanticai/pydanticai.p
 - Must implement real token streaming natively yielding AK's `StreamEvent` objects (`MessageStart`, `TextDelta`, `ReasoningDelta`, `ToolCallStart`, `ToolCallArgs`, `ToolCallEnd`, `ToolCallResult`, `MessageEnd`).
 - Must correlate tool events by MAF's own `call_id`, never a generated id; argument chunks that arrive without an id (Chat Completions-style clients) are tied to their call through `tool_call_index`.
 
+### Human in the loop
+
+- `supports_pause = True`: a tool declared with `approval_mode="always_require"` (natively, or via `MAFToolBuilder.bind(..., approval_mode=...)`) pauses the run.
+- Pause detection reads the final response's `function_approval_request` items, before the reply mapping, identically in `run()` and `stream()`; `stream()` ends with `RunPaused`.
+- The record (`PausedRunState.add`, after `clear_for_runner` — one conversation per session) carries the serialized `AgentSession` and the pending requests, so a resume needs nothing else and works on any replica.
+- `resume()` / `resume_stream()` send one user message of approval responses: `approved` approves; `denied` and `cancelled` reject. They share the reply/stream helpers with `run()` / `stream()`, and clear the record only after the native call succeeds.
+- Refused above the `try`, naming the cause: a partial resume, a decision payload, a prompt beside the decisions, and a new prompt while a pause is outstanding (MAF would drop the pending calls).
+- Out of scope: free-text questions (`input_required`) — MAF agents have no native equivalent.
+
 ### Tool binding
 
 - `MAFToolBuilder.bind(funcs)` must wrap each plain function as a native MAF tool using MAF's `@tool` decorator (`from agent_framework import tool as maf_tool`).

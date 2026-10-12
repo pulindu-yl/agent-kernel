@@ -83,6 +83,70 @@ client = AnthropicClient(model="claude-sonnet-5-5")  # reads ANTHROPIC_API_KEY
 
 If the provider package is missing, MAF raises an error naming the package to install.
 
+## Tool Binding
+
+Use `MAFToolBuilder` to bind plain Python functions as MAF tools:
+
+```python
+from agent_framework import Agent
+from agent_framework.openai import OpenAIChatClient
+from agentkernel.maf import MAFModule, MAFToolBuilder
+
+def get_weather(city: str) -> str:
+    """Returns the weather for a given city."""
+    return f"Weather in {city}: sunny, 25°C"
+
+agent = Agent(
+    OpenAIChatClient(model="gpt-4.1-mini"),
+    name="weather",
+    description="Provides weather information.",
+    instructions="You provide weather information.",
+    tools=MAFToolBuilder.bind([get_weather]),
+)
+
+MAFModule([agent])
+```
+
+Tools bound this way reach execution context (session, agent, requests) through `ToolContext.get()` —
+the same portable mechanism as every other adapter, so a tool function bound here also works unchanged on
+any other framework. Native MAF tools that take a `FunctionInvocationContext` instead read the per-run
+[framework context](#framework-context). See [Tools](../core-concepts/tools) for the full guide.
+
+## Structured Output
+
+Configure structured output with MAF's `response_format` option, either in the agent's `default_options` or per
+agent through [Run Options](#run-options). Agent Kernel detects the parsed result and returns an
+`AgentReplyAny` whose `content` is the result as a dict; no re-parsing of text needed:
+
+```python
+from pydantic import BaseModel
+from agent_framework import Agent
+from agent_framework.openai import OpenAIChatClient
+from agentkernel.maf import MAFModule
+
+class CalendarEvent(BaseModel):
+    name: str
+    date: str
+
+agent = Agent(
+    OpenAIChatClient(model="gpt-4.1-mini"),
+    name="extractor",
+    description="Extracts calendar events from text.",
+    instructions="Extract the calendar event from the text.",
+    default_options={"response_format": CalendarEvent},
+)
+
+MAFModule([agent])
+```
+
+Pydantic results are converted via `model_dump(mode="json")`, and `str(reply)` returns the JSON-serialized
+content, so text-based consumers (chat integrations, logging) work unchanged. See
+[Reply Types](../core-concepts/runner#structured-replies) for how structured replies are surfaced,
+and [Execution Hooks](../integrations/hooks#structured-replies-in-hooks) for how hooks receive them.
+
+Structured output applies to non-streaming runs (`execution.mode: invoke`). In stream mode the answer is
+streamed as text.
+
 ## Streaming
 
 Agent Kernel converts text, reasoning, and tool updates from MAF's `AgentResponseUpdate` stream into native Agent Kernel `StreamEvent`s (including `TextDelta`, `ToolCallStart`, and `ToolCallArgs`), allowing real-time rendering in Agent Kernel's CLI, UI, and WebSocket integrations.
@@ -164,8 +228,73 @@ The following keys are reserved by the MAF adapter and cannot be injected via dy
 | `stream` | Managed by the runner based on whether `run()` or `stream()` was called. |
 | `session` | Managed by the runner based on the AK session context. |
 
+## Human in the loop
+
+This adapter pauses on MAF's native **tool approval**. A tool declared with
+`approval_mode="always_require"` is held back when the model calls it, and the run returns a paused reply
+(`kind: "tool_call"`, with the tool name and arguments) instead of running it:
+
+```python
+from agent_framework import tool
+
+@tool(approval_mode="always_require")
+def issue_refund(order_id: str) -> str:
+    """Refund an order."""
+    ...
+```
+
+Or keep the tool a plain function and gate it through the tool builder, which forwards its keyword options
+to MAF's `tool()`. The options apply to every function in the call, so tools wanting different ones are
+bound separately:
+
+```python
+tools = MAFToolBuilder.bind([issue_refund], approval_mode="always_require")
+```
+
+The pause is durable: the record carries MAF's serialized `AgentSession` and the pending requests, so the
+decision can arrive later on any replica with a shared session backend. Answer it with a `resume` block;
+`approved` runs the tool, while `denied` and `cancelled` both reject it, and MAF tells the model the call was
+rejected by the user.
+
+What MAF cannot carry, refused with a message rather than flattened into a generic reply:
+
+- **A partial resume.** Answer every pending approval together; Agent Kernel names the ids you missed.
+- **A payload.** A MAF approval is only approved or rejected, with no channel for replacement arguments.
+- **A prompt beside the decisions.** MAF would place it between the tool calls and their results, an order
+  model APIs reject. Send it as the next turn.
+- **A new prompt while a pause is outstanding.** MAF would silently drop the pending calls, so the turn is
+  refused, naming the run to resume.
+
+MAF agents have no native free-text question (`input_required`); ask for a value as an ordinary turn, or
+model it as a gated tool's arguments. See [Human in the Loop](../advanced/human-in-the-loop.md).
+
+## Features
+
+- ✅ Function calling (`MAFToolBuilder` and native MAF tools)
+- ✅ Per-run context/state (`framework_context` → `session.state["ak_context"]`, full round-trip)
+- ✅ Streaming responses (native token streaming with reasoning and tool-call events)
+- ✅ Structured output (`response_format` → `AgentReplyAny`)
+- ✅ Session management (`AgentSession` snapshot persisted per session)
+- ✅ Multimodal input (text, images and files sent as one user message)
+- ✅ Native run options (`options`, `response_format`, …)
+- ✅ Any MAF chat client (OpenAI, Azure OpenAI, Anthropic, …)
+- ✅ Human in the loop (tool approval pause/resume, durable across replicas)
+
+## Example
+
+See [examples/cli/maf](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/cli/maf) for a
+complete CLI example with a bound weather tool.
+
+For per-run context/state carried across turns, see
+[examples/cli/maf_context](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/cli/maf_context)
+— a cart kept in the framework context and mutated by native MAF tools through `FunctionInvocationContext`.
+
+For REST, see [examples/api/maf](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/api/maf), and
+[examples/api/maf-streaming](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/api/maf-streaming)
+for token streaming over Server-Sent Events.
+
 ## Supported scope
 
 This adapter targets native MAF `Agent` instances and maps their execution to Agent Kernel's request/reply, session, framework-context, tool, and streaming interfaces.
 
-Native approval exchanges and background continuation tokens are not exposed through these interfaces. Native background continuation is separate from Agent Kernel's queue-based asynchronous execution. MAF workflow agents have not yet been validated with this adapter.
+Background continuation tokens are not exposed through these interfaces. Native background continuation is separate from Agent Kernel's queue-based asynchronous execution. MAF workflow agents have not yet been validated with this adapter.
