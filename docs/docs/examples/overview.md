@@ -46,6 +46,7 @@ Command-line interface examples for local development and testing:
 - **`openai_structured/`** - OpenAI Agent SDK agent returning structured (Pydantic) output
 - **`openai-secret/`** - Secrets resolved through `SecretManager` with the default `env` provider: a required model key read at startup and an optional tool key that degrades gracefully (see the [Secret Resolution](../advanced/secrets.md) guide)
 - **`pydanticai/`** - Pydantic AI framework integration examples
+- **`claude/`** - Claude Agent SDK integration example: a triage agent delegating to subagents, with an Agent Kernel tool
 - **`smolagents/`** - HuggingFace smolagents `CodeAgent` integration examples
 - **`knowledgebase/openai/`** - OpenAI Agents knowledge base demos split into `chromadb/`, `neo4j/`, `starburst/`, `okf/` (Open Knowledge Format markdown bundle), and `multi/`
 
@@ -155,6 +156,7 @@ Agent Kernel supports multiple AI agent frameworks:
 | **LangGraph** | Graph-based agent framework | CLI, AWS Serverless, Azure Serverless |
 | **OpenAI Agent SDK** | OpenAI's official agent framework | CLI, Containerized, AWS Serverless, AWS Containerized, Azure Serverless, Azure Containerized, GCP Serverless, GCP Containerized, API |
 | **Pydantic AI** | Type-safe agent framework from the Pydantic team | CLI, API |
+| **Claude Agent SDK** | Anthropic's Claude Code agent harness | CLI |
 | **smolagents** | HuggingFace's code-first agent framework | CLI |
 
 ## Deployment Patterns

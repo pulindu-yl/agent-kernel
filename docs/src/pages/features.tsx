@@ -40,6 +40,7 @@ import {
   FaGithub,
 } from "react-icons/fa";
 import {
+  SiClaude,
   SiGmail,
   SiGooglegemini,
   SiLangchain,
@@ -790,7 +791,7 @@ function CoreFeatures() {
         "Agent, Runner, Session, Module, Runtime, and Tools, a unified API across all frameworks. Build once, run on any supported framework.",
       highlights: [
         "Unified Python API",
-        "Framework adapters for 4 SDKs",
+        "Framework adapters for 7 SDKs",
         "Portable tool functions via ToolBuilder",
         "Framework-agnostic hooks",
       ],
@@ -800,7 +801,7 @@ function CoreFeatures() {
       icon: <MdSwapHoriz />,
       title: "Framework-Neutral Runtime",
       description:
-        "OpenAI Agents, LangGraph, CrewAI, Google ADK, Smolagents, and Pydantic AI, run them all simultaneously in one runtime. Switch frameworks by changing 2 import lines.",
+        "OpenAI Agents, LangGraph, CrewAI, Google ADK, Smolagents, Pydantic AI, and the Claude Agent SDK, run them all simultaneously in one runtime. Switch frameworks by changing 2 import lines.",
       highlights: [
         "OpenAI Agents SDK",
         "LangGraph",
@@ -808,6 +809,7 @@ function CoreFeatures() {
         "Google ADK",
         "Smolagents",
         "Pydantic AI",
+        "Claude Agent SDK",
       ],
       link: "/docs/frameworks/overview",
     },
@@ -1263,6 +1265,15 @@ function FrameworkSupport() {
           height={50}
         />
       ),
+    },
+    {
+      key: "claude-agent-sdk",
+      name: "Claude Agent SDK",
+      description:
+        "Anthropic's Claude Code agent harness: built-in file, shell and web tools, subagents, hooks and permissions, on Claude models.",
+      // Drop /next after the Claude Agent SDK adapter is released.
+      link: "/docs/next/frameworks/claude-agent-sdk",
+      logo: <SiClaude className={styles.frameworkLogoImg} size={52} color="#D97757" aria-hidden="true" />,
     },
   ];
 

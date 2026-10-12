@@ -52,3 +52,12 @@ class BaseTrace(ABC):
         Initialize Pydantic AI instrumentation
         """
         raise NotImplementedError
+
+    def claude(self) -> Runner:
+        """
+        Initialize Claude Agent SDK instrumentation.
+
+        Not abstract, so a bring-your-own tracer written before this adapter existed still loads; such a tracer
+        raises here only when a Claude module is built with tracing enabled.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support Claude Agent SDK tracing")
