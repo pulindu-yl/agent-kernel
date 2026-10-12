@@ -137,6 +137,11 @@ standard library only).
   application code does not say which Secret holds it. The same key in **two** places raises `SecretError`
   naming both paths (never the values). An empty file is a miss. Only one directory level is searched, and
   entries starting with `.` (the kubelet's `..data` bookkeeping) are skipped.
+- **Environment first:** a set, non-empty environment variable still wins, so an `OPENAI_API_KEY` injected
+  with an `extraEnv` `secretKeyRef` is used and the mount is not read.
+- **Symlinks** are followed, since the kubelet builds the mount from them, but a matching file that resolves
+  outside `mount_path` (a symlinked directory or file pointing elsewhere) raises `SecretError` instead of being
+  read. A permission error on `mount_path` or on a Secret directory is also a `SecretError`, not a miss.
 - **Key compatibility:** data keys must be named exactly like the AK key, i.e. match `^[A-Z][A-Z0-9_]*$`. A
   differently named data key (for example `api-key`) is silently unreachable; there is no remapping. Create
   compatible keys with `kubectl create secret generic openai-credentials --from-literal=OPENAI_API_KEY=...`
@@ -163,12 +168,13 @@ secretStore:
 
 Each listed Secret becomes a `secret` volume (`ak-secret-<index>`, `optional: false`) mounted read-only and
 whole at `/var/run/secrets/agentkernel/<name>`. A listed Secret that does not exist leaves the pod in
-`ContainerCreating` with a `FailedMount` event.
+`ContainerCreating` with a `FailedMount` event. To add a Secret, create it, add it to `secretStore.secrets`
+and roll out; a new key in an already-listed Secret needs no values change.
 
 - **Placement:** only the tier that executes agents gets the mounts — `agent-runner`, or `io-handler` in the
   single-process profile (`agentRunner.enabled: false` and `transport.type: in_memory`). The `ws-gateway` and
   `sandbox-worker` never mount. `secretStore.enabled` with no agent-executing tier, an empty list, a duplicate
-  name or an entry without a name fails `helm template` / `install`.
+  name or an entry without a string name fails `helm template` / `install`.
 - **No subPath:** the chart never uses `items`, `subPath` or `defaultMode`. Whole-Secret mounts are what let
   new keys and rotated values reach the pod.
 - **Rotation:** the kubelet refreshes mounted Secret files after a short delay. Values read per call are

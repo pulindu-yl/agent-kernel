@@ -35,7 +35,7 @@ make lint-check-all
   2. `TestKubernetesProviderContract` seeding across two Secret directories.
   3. Provider-specific cases: kubelet symlink layout and re-pointed `..data`, top-level key,
      duplicates, dot-entry skip, depth, directory named `KEY`, empty file, `mount_path` errors,
-     unreadable dir, invalid UTF-8 `from None`, vanished file, key guard, `__init__` laziness,
+     unreadable dir and Secret dir, symlink containment, invalid UTF-8 `from None`, vanished file, key guard, `__init__` laziness,
      re-discovery — spec.md § Testing.
 - **Verify:** `uv run pytest tests/test_secret_providers.py`
 
@@ -66,8 +66,9 @@ make lint-check-all
   2. Helpers: mount path, `secretStoreTier`, `secretStoreValidate`, volumes, volume mounts.
   3. Include the validate helper at the top of `configmap-env.yaml`.
   4. Volume/mount insertions: agent-runner on `secretStore.enabled`; io on tier `io`.
-  5. *Render every flavor and mode*: the two-Secret runner render, the single-process io render,
-     the ws-gateway exclusion, every `expect_fail`, and the no-mount assertion in the per-flavor
+  5. *Render every flavor and mode*: the two-Secret runner render, the quoted-name render, the
+     single-process io render, the ws-gateway exclusion, every `expect_fail` (including the
+     non-string name), and the no-mount assertion in the per-flavor
      loop — spec.md § Examples and docs, CI.
 - **Verify:** the render step's script locally against the chart; `ct lint --config
   ak-deployment/ak-k8s/ci/ct.yaml`; the byte-identical default-render diff from spec.md § Testing →
@@ -84,7 +85,7 @@ make lint-check-all
   1. Example config, values, entrypoint and README per spec.md § Examples and docs (including key
      naming, local run, rotation-needs-restart for this example, and the upgrade migration note).
   2. *Install chart* creates both `openai` and `openai-credentials` on every flavor.
-  3. Apply the resolved spec.md § Open decision to the `ct install` command in the k8s README.
+  3. Apply spec.md § Decision: the `ct install` gate to the `ct install` command in the k8s README.
 - **Verify:** `kind-smoke` passes for `dev`, `baremetal` and `eks`; the README's `local` flow works
   on a kind cluster. The published (non-`local`) flow is verified only after the release bumps the
   chart and `agentkernel` pins — spec.md § Release sequencing.

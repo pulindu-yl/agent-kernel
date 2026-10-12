@@ -126,23 +126,26 @@ secretStore:
     - name: slack-credentials
 ```
 
-- Each listed Secret becomes a `secret` volume (`ak-secret-<index>`) mounted read-only and whole at
+- Each listed Secret becomes a non-optional `secret` volume (`ak-secret-<index>`) mounted read-only and whole at
   `/var/run/secrets/agentkernel/<name>`, one file per data key. The Secrets must exist in the release
   namespace, or the pod stays `ContainerCreating` (`FailedMount`).
 - **Placement.** Only the tier that executes agents mounts them: `agentRunner` or, in the
   single-process profile (`agentRunner.enabled: false`, `transport.type: in_memory`), `ioHandler`.
   `wsGateway` and `sandboxWorker` never do. `secretStore.enabled` with no such tier, an empty list, a
-  duplicate name or an entry without a `name` fails `helm template` / `install`.
+  duplicate name, or an entry without a string `name` fails `helm template` / `install`.
+- **Mount path.** Leave the application's `secret.provider.kubernetes.mount_path` at its default
+  (`/var/run/secrets/agentkernel`); the chart always mounts there and has no value to move it.
 - **No RBAC.** The app reads files; it never calls the Kubernetes API. The chart creates no Role,
   RoleBinding or ServiceAccount for this.
 - **Key names.** Data keys must be the AK key name (`OPENAI_API_KEY`); other keys are never read.
-- **Security.** Every key of every listed Secret is readable by code in that tier. List only what
-  agents need.
+- **Security.** Every key of every listed Secret is readable by any code in that tier, including code
+  run by a `local_subprocess` sandbox. List only what agents need, keep unrelated keys out of those
+  Secrets, and run untrusted code in an isolated sandbox provider.
 - **Rotation.** Kubelet refreshes the files after a short delay; no checksum annotation is added, so
   a Secret change does not roll the pods. Values the app reads once at startup need a rollout restart.
 
-The environment still wins: a set, non-empty `OPENAI_API_KEY` in the container is used before any
-mounted file. See [Secret Resolution](https://github.com/yaalalabs/agent-kernel/tree/develop/docs/docs/advanced/secrets.md) for the
+The environment still wins: a set, non-empty `OPENAI_API_KEY` in the container (for example from
+an `extraEnv` `secretKeyRef`) is used before any mounted file. See [Secret Resolution](https://github.com/yaalalabs/agent-kernel/tree/develop/docs/docs/advanced/secrets.md) for the
 provider side.
 
 ## Transports

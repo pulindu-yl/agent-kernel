@@ -9,8 +9,9 @@ description: >
   Parameter Store secret resolution (`ssm_enabled`).
   GCP supports Cloud Run serverless (scale-to-zero)
   and containerized (always-on) with Redis or Firestore session backends. Kubernetes runs
-  the queue pipeline over NATS JetStream, Kafka, or SQS with KEDA autoscaling and an
-  optional WebSocket gateway tier.
+  the queue pipeline over NATS JetStream, Kafka, or SQS with KEDA autoscaling, an
+  optional WebSocket gateway tier, and Kubernetes Secrets mounted for secret resolution
+  (`secretStore`).
 license: Apache-2.0
 metadata:
   author: yaalalabs

@@ -700,9 +700,10 @@ failure raises `SecretError` even with a `default`. The capability is always ava
   - **Type**: string
   - **Default**: `env`
   - **Options**: `env` (the process environment), `aws_ssm` (AWS SSM Parameter Store; requires
-    `secret.prefix` and the `aws` extra — `OPENAI_API_KEY` is read from `/ak/<prefix>/openai_api_key`), or a
-    dotted path to a `SecretProvider` subclass; `kubernetes` (one file per key from Kubernetes Secrets mounted
-    under `secret.provider.kubernetes.mount_path`, standard library only, no API calls)
+    `secret.prefix` and the `aws` extra — `OPENAI_API_KEY` is read from `/ak/<prefix>/openai_api_key`),
+    `kubernetes` (one file per key from Kubernetes Secrets mounted under
+    `secret.provider.kubernetes.mount_path`, standard library only, no API calls), or a dotted path to a
+    `SecretProvider` subclass
   - **Environment Variable**: `AK_SECRET__PROVIDER__TYPE`
 
 - **Kubernetes Mount Path**

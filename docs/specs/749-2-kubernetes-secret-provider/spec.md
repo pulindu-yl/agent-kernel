@@ -79,13 +79,21 @@ class KubernetesSecretProvider(SecretProvider):
    - an entry named `key` for which `entry.is_file()` is true is a top-level candidate,
      `<mount_path>/<key>`;
    - for every other entry where `entry.is_dir()` is true, `<mount_path>/<entry>/<key>` is a
-     candidate when `os.path.isfile` is true for it;
-   - both `is_file`/`is_dir` and `os.path.isfile` follow symlinks. The kubelet layout,
+     candidate when `os.stat` reports a regular file (`stat.S_ISREG`). `FileNotFoundError` and
+     `NotADirectoryError` mean no candidate; any other `OSError` (e.g. a Secret directory that
+     cannot be searched) is a `SecretError`, not a silent miss as `os.path.isfile` would make it;
+   - both `is_file`/`is_dir` and `os.stat` follow symlinks. The kubelet layout,
      `<dir>/KEY -> ..data/KEY` and `..data -> ..<timestamp>`, therefore resolves to the current
      revision. **A candidate is a path that resolves to a regular file.** A directory with the
      key's name is never a candidate; a directory at the top level is searched as a Secret
      directory instead.
    - No level deeper than `<mount_path>/<dir>/` is searched.
+   - **Containment.** After listing, every candidate's `os.path.realpath` must lie under
+     `os.path.realpath(mount_path)` (`os.path.commonpath`). One that resolves outside (a Secret
+     directory or key file symlinked elsewhere) raises `SecretError` naming the path, never the
+     contents. The kubelet's `KEY -> ..data/KEY -> ..<timestamp>/KEY` chain stays inside the Secret
+     directory, and a `mount_path` that is itself a symlink passes because the root is resolved
+     too.
 4. **The decision is made on the candidate count, before any file is read.** Zero candidates is a
    miss (`None`). Two or more raise `SecretError` naming every candidate path, sorted. One
    candidate is read. As a result, an empty file and a non-empty file with the same key are still
@@ -260,6 +268,9 @@ the per-Secret path and the volume names, so `volumes` and `volumeMounts` cannot
 {{- fail (printf "secretStore.secrets entries must be objects with a name, e.g. '- name: %v'" .) }}
 {{- end }}
 {{- $name := required "secretStore.secrets[].name is required" .name }}
+{{- if not (kindIs "string" $name) }}
+{{- fail (printf "secretStore.secrets[].name must be a string, got %v: quote names such as \"true\" or \"123\"" $name) }}
+{{- end }}
 {{- if hasKey $seen $name }}
 {{- fail (printf "secretStore.secrets lists '%s' more than once" $name) }}
 {{- end }}
@@ -272,7 +283,7 @@ the per-Secret path and the volume names, so `volumes` and `volumeMounts` cannot
 {{- range $i, $s := .Values.secretStore.secrets }}
 - name: ak-secret-{{ $i }}
   secret:
-    secretName: {{ $s.name }}
+    secretName: {{ $s.name | quote }}
     optional: false
 {{- end }}
 {{- end }}
@@ -294,6 +305,10 @@ the per-Secret path and the volume names, so `volumes` and `volumeMounts` cannot
   and both Deployments ask it, so the rule cannot drift between them.
 - The map check runs before `.name` is read: on a bare string (`secrets: [openai-credentials]`),
   `.name` would otherwise fail with Go's "can't evaluate field name in type interface {}".
+- `secretName` is quoted, and a name that is not a string fails the render. Valid Secret names
+  such as `true`, `null` or `123` would otherwise render as a YAML boolean, null or integer, which
+  the API server rejects; an unquoted `name: true` in values arrives as a boolean and would also
+  break the duplicate check.
 
 **Where validation runs.** `templates/configmap-env.yaml` includes
 `agent-kernel.secretStoreValidate` once, at the top of the template, rendering nothing. That
@@ -377,9 +392,9 @@ every flavor file. [Testing → Verify](#verify-one-off-for-this-change) checks 
 - `pyproject.toml`: unchanged, because no extra is needed.
 
 **Release sequencing.** Both of the example's published pins predate this change:
-- `agentkernel>=0.9.3` (`pyproject.toml:8`): until a release carries the provider, `kubernetes`
+- `agentkernel>=0.9.5` (`pyproject.toml:8`): until a release carries the provider, `kubernetes`
   is an unknown provider type.
-- chart `0.9.3` (`deploy/deploy.sh:25`): helm silently ignores the unknown `secretStore` value, so
+- chart `0.9.5` (`deploy/deploy.sh:25`): helm silently ignores the unknown `secretStore` value, so
   no volume renders and the runner fails at startup with `SecretError` (mount path missing).
 
 The README's non-`local` flow therefore works only after a release publishes both and the
@@ -412,9 +427,13 @@ therefore CI, uses this checkout for both.
   io=$(helm template smoke "$CHART_DIR" "${STORE[@]}" --show-only templates/deployment-io.yaml)
   grep -q 'mountPath: /var/run/secrets/agentkernel/openai-credentials' <<<"$runner"
   grep -q 'mountPath: /var/run/secrets/agentkernel/slack-credentials' <<<"$runner"
-  grep -q 'secretName: slack-credentials' <<<"$runner"
+  grep -q 'secretName: "slack-credentials"' <<<"$runner"
   # `! grep` is exempt from `set -e`, so absence is asserted with an explicit exit.
   if grep -q '/var/run/secrets/agentkernel' <<<"$io"; then echo "io must not mount"; exit 1; fi
+  echo "--- secretStore: a name YAML would read as a boolean renders as a string"
+  runner=$(helm template smoke "$CHART_DIR" --set secretStore.enabled=true \
+    --set-string 'secretStore.secrets[0].name=true' --show-only templates/deployment-agent-runner.yaml)
+  grep -q 'secretName: "true"' <<<"$runner"
   echo "--- secretStore: single-process profile mounts on io"
   SINGLE=(--set agentRunner.enabled=false --set transport.type=in_memory)
   io=$(helm template smoke "$CHART_DIR" "${STORE[@]}" "${SINGLE[@]}" --show-only templates/deployment-io.yaml)
@@ -433,6 +452,7 @@ therefore CI, uses this checkout for both.
   expect_fail "must list at least one Secret" --set secretStore.enabled=true
   expect_fail "must be objects with a name" --set secretStore.enabled=true --set 'secretStore.secrets[0]=a'
   expect_fail "secretStore.secrets[].name is required" --set secretStore.enabled=true --set 'secretStore.secrets[0].other=x'
+  expect_fail "must be a string" --set secretStore.enabled=true --set 'secretStore.secrets[0].name=true'
   expect_fail "more than once" --set secretStore.enabled=true \
     --set 'secretStore.secrets[0].name=a' --set 'secretStore.secrets[1].name=a'
   expect_fail "needs an agent-executing tier" --set secretStore.enabled=true \
@@ -497,6 +517,8 @@ which this change leaves untouched. `docs/docs/examples/overview.md` has no entr
 | Key empty, starting with `.`, or containing `/`/`os.sep` (direct provider call) | `ValueError` | `get_secret` | Programming error; through the manager it is already rejected by `_validate_key` |
 | `mount_path` does not exist (`FileNotFoundError`) or is not a directory (`NotADirectoryError`) | `SecretError` naming `mount_path`, saying to set `secretStore.enabled`/`secretStore.secrets`, mount Secrets there, or correct `secret.provider.kubernetes.mount_path`; chained | `_find_candidates` | Out of `get`, **even with `default=`** (`secret/manager.py:68`); never cached |
 | Any other `OSError` listing `mount_path` (e.g. `PermissionError`) | `SecretError` naming the path and `type(exc).__name__`; chained | `_find_candidates` | Same |
+| Any `OSError` other than `FileNotFoundError`/`NotADirectoryError` checking `<mount_path>/<dir>/<key>` (e.g. an unsearchable Secret directory) | `SecretError` naming the path and `type(exc).__name__`; chained | `_is_regular_file` | Same |
+| A candidate resolves outside `mount_path` | `SecretError` naming the path, never contents | `_find_candidates`, before reading | Same |
 | No candidate | — | returns `None` | `get` returns `default` or raises `SecretNotFoundError` |
 | Exactly one candidate, empty file | — | returns `None` | A miss, as for `env` |
 | Two or more candidates (any sizes) | `SecretError` listing the sorted candidate paths, never contents | `get_secret`, before reading | Out of `get`; never cached |
@@ -537,7 +559,11 @@ which this change leaves untouched. `docs/docs/examples/overview.md` has no entr
   - An empty file is a miss (`None`).
   - **`mount_path` errors**: a missing directory, and a regular file, raise `SecretError` whose
     message names the path and `secretStore`.
-  - An unreadable directory (`chmod 000`, skipped when running as root) raises `SecretError`.
+  - An unreadable directory (`chmod 000`, skipped when running as root) raises `SecretError`;
+    so does an unsearchable Secret directory under it, naming `<dir>/KEY`.
+  - **Containment**: a Secret directory symlinked outside `mount_path`, and a key file (top level
+    or inside a Secret directory) symlinked outside it, raise `SecretError` without the value; a
+    `mount_path` that is itself a symlink to a kubelet-layout directory still resolves.
   - **Invalid UTF-8** raises `SecretError`, with `__cause__` and `__context__` suppressed
     (`from None`), and the message does not contain the bytes.
   - **A file that vanishes between discovery and read** is a miss: monkeypatch `builtins.open` in
@@ -586,7 +612,7 @@ No existing patch target moves.
 
 **Chart**: the `chart-test.yaml` renders (both mount placements, the ws-gateway exclusion and
 every expected failure) and the `kind-smoke` `dev` run above. For the manual `ct install` gate,
-see [Open decision](#open-decision).
+see [Decision: the `ct install` gate](#decision-the-ct-install-gate).
 
 ### Verify (one-off, for this change)
 
@@ -610,9 +636,9 @@ make lint-check-all
 ct lint --config ak-deployment/ak-k8s/ci/ct.yaml
 ```
 
-## Open decision
+## Decision: the `ct install` gate
 
-**The manual `ct install` gate** (`ak-deployment/ak-k8s/README.md:342-351`) installs
+**The manual `ct install` gate** (`ak-deployment/ak-k8s/README.md`, *CI*) installs
 `chart/ci/kind-smoke-values.yaml` with the example images and no OpenAI key. That works today only
 because the runner never reads the key at startup. After this change, `app_agent_runner.py`
 calls `get("OPENAI_API_KEY")` at import with no default. With no env var and no mount,
@@ -624,8 +650,9 @@ calls `get("OPENAI_API_KEY")` at import with no default. With no env var and no 
 - `secretStore` in `kind-smoke-values.yaml` needs `openai-credentials` to pre-exist in the
   namespace ct installs into, and ct creates a fresh one per install.
 
-**Recommended:** leave `kind-smoke-values.yaml` unchanged and update the README's `ct install`
-command to pass a placeholder key, which wins over the absent mount:
+**Decided and implemented** (`ak-deployment/ak-k8s/README.md`, *CI*): leave
+`kind-smoke-values.yaml` unchanged and update the README's `ct install` command to pass a
+placeholder key, which wins over the absent mount:
 `--helm-extra-set-args "--set extraEnv[0].name=OPENAI_API_KEY --set extraEnv[0].value=placeholder"`.
 The gate checks that pods start, not that chat works, so a placeholder is enough. `ct install` is
 not run in any workflow (`.github/workflows/` has no `ct install`), so CI is unaffected either way.
@@ -643,4 +670,9 @@ requirements in `design.md` under *Deployment*.
 - a candidate that vanishes between listing and reading is a miss;
 - `KubernetesSecretProvider` is exported from `agentkernel.secret`;
 - validation runs from a helper included in `configmap-env.yaml`, so it fails every release, not
-  only those that render an agent-executing Deployment.
+  only those that render an agent-executing Deployment;
+- candidates must resolve inside `mount_path` (rule 3, *Containment*), so a symlink cannot turn a
+  lookup into a read elsewhere on the filesystem;
+- the per-Secret check uses `os.stat` rather than `os.path.isfile`, so a permission error on a
+  Secret directory is a `SecretError` as *Error handling* requires, not a miss;
+- `secretName` is quoted and a non-string name fails the render (*Deployment changes*).

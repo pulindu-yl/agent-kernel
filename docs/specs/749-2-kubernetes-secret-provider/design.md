@@ -91,7 +91,8 @@ graph LR
 - **Failure** (`SecretError`, never masked by `get(key, default=…)`, `secret/manager.py:68`):
   - **`mount_path` does not exist or is not a directory.** The deployment is misconfigured; this is not a per-key miss, so a wrong mount fails loudly instead of every `get` silently returning its default. The message names the directory and how to fix it.
   - **The key exists in more than one place.**
-  - Any other filesystem error listing or reading, e.g. a permission error.
+  - Any other filesystem error listing, checking or reading, e.g. a permission error on `mount_path` or on a Secret directory.
+  - **A matching file that resolves outside `mount_path`**, e.g. through a symlinked directory or file. Symlinks are followed (the kubelet's layout is built from them), but never out of the mount.
   - A file that is not valid UTF-8.
 - A listed Secret that does not exist never reaches the provider: Kubernetes keeps the pod from starting, because every volume is non-optional.
 - No secret value appears in a log record, an exception message or a trace, as in phase 1.
@@ -122,7 +123,7 @@ secretStore:
   # - name: slack-credentials
 ```
 
-- Each entry is an object with a required `name`, so a later per-Secret option can be added without breaking values. Names are used as given, not derived from the release name.
+- Each entry is an object with a required string `name`, so a later per-Secret option can be added without breaking values. Names are used as given, not derived from the release name, and are rendered quoted so names such as `true` or `123` stay strings.
 - Any existing Secret in the release namespace can be listed, including one created by the External Secrets Operator; its keys are reachable only if they follow *Secret key compatibility*.
 - **Additive only.** Everything is gated on `secretStore.enabled`; with the defaults `helm template` renders identically to today.
 - When enabled, the agent-executing Deployment mounts **each listed Secret whole, read-only and non-optional** at `/var/run/secrets/agentkernel/<name>`.
@@ -133,7 +134,7 @@ secretStore:
   - The ws-gateway and sandbox-worker tiers never mount them. Per-tier Secret selection is a non-goal.
 - **Invalid `secretStore` values fail `helm template` / `helm install` with a clear message**, in every release, not only when an agent-executing Deployment renders:
   - enabled with an empty `secrets` list;
-  - an entry that is not an object, or has no `name`;
+  - an entry that is not an object, or has no `name`, or a `name` that is not a string;
   - a name listed twice;
   - no agent-executing tier (above).
 - **No RBAC**: no ServiceAccount, Role, RoleBinding or `serviceAccountName`, because the kubelet, not the pod, reads the Secrets.
@@ -181,6 +182,6 @@ secretStore:
 - External Secrets Operator, the Secrets Store CSI driver, Vault, and cloud KMS envelope encryption. These operate below or beside a Kubernetes Secret and stay compatible with this provider.
 - Migrating examples other than `examples/k8s/openai-queue-mode`.
 
-## Open questions
+## Decisions
 
-- **The manual `ct install` gate** (`ak-deployment/ak-k8s/README.md:342-351`) installs the example images with no OpenAI key; once the runner resolves the key at startup, it would crash-loop. Proposed in `spec.md` (*Open decision*): leave `chart/ci/kind-smoke-values.yaml` unchanged and pass a placeholder `OPENAI_API_KEY` on the README's `ct install` command. No workflow runs `ct install`, so CI is unaffected.
+- **The manual `ct install` gate** (`ak-deployment/ak-k8s/README.md`, *CI*) installs the example images with no OpenAI key; once the runner resolves the key at startup, it would crash-loop. Decided (`spec.md`, *Decision: the `ct install` gate*): leave `chart/ci/kind-smoke-values.yaml` unchanged and pass a placeholder `OPENAI_API_KEY` on the README's `ct install` command. No workflow runs `ct install`, so CI is unaffected.

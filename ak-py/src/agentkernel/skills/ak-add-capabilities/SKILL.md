@@ -6,7 +6,7 @@ description: >
   A2A server, AG-UI server, pre/post hooks, multimodal support, conversation thread support,
   scheduled tasks (deferred and recurring chat execution), the sandbox capability
   (isolated code execution), and secret resolution (environment first, then AWS SSM
-  Parameter Store or a custom provider). Session
+  Parameter Store, Kubernetes Secrets mounted into the pod, or a custom provider). Session
   persistence supports Redis, DynamoDB (AWS), Cosmos DB (Azure), and Firestore (GCP).
   Conversation threads support in-memory, Redis, Valkey, DynamoDB (AWS), Firestore (GCP),
   and Cosmos DB (Azure) backends. Generates configuration and code changes needed.
@@ -1451,7 +1451,8 @@ failed — credentials, network, IAM; never masked by `default`), `ValueError` (
 `SecretManager.current().invalidate(key)` / `.clear()` to drop cached values. A custom provider
 subclasses `agentkernel.secret.SecretProvider`, implements `get_secret(key) -> Optional[str]`
 (return `None` on a miss), and can be checked with the `agentkernel.secret.testing.SecretProviderContract`
-pytest suite. See `examples/cli/openai-secret` (env) and `examples/aws-serverless/openai` (aws_ssm).
+pytest suite. See `examples/cli/openai-secret` (env), `examples/aws-serverless/openai` (aws_ssm) and
+`examples/k8s/openai-queue-mode` (kubernetes).
 
 ---
 
