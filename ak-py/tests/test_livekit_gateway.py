@@ -773,6 +773,22 @@ class TestMultiAgentOutbound:
         assert [participant.audio_source.clears for participant in gateway._participants] == [1, 1]
 
     @pytest.mark.asyncio
+    async def test_a_handoff_to_an_agent_still_joining_is_noted_not_warned(self, caplog):
+        """Normal in the first second of a call: no warning is spent on it, so one is left if the join
+        then fails."""
+        gateway = _gateway("supervisor", "billing")
+        gateway._loop = asyncio.get_running_loop()
+        del gateway._by_agent["billing"]
+        gateway._joining.add("billing")
+
+        with caplog.at_level(logging.INFO):
+            await gateway.deliver_chunk(self._change("billing", "supervisor"), {})
+
+        assert "'billing' is still joining the room" in caplog.text
+        assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
+        assert gateway._warned_agents == set()
+
+    @pytest.mark.asyncio
     async def test_an_agent_without_a_participant_speaks_through_the_first(self, caplog):
         gateway = _gateway("supervisor", "billing")
         gateway._loop = asyncio.get_running_loop()

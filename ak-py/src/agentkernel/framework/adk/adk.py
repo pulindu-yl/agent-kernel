@@ -18,10 +18,11 @@ from google.adk.agents.run_config import RunConfig, StreamingMode
 from google.adk.apps import App
 from google.adk.apps.app import ResumabilityConfig
 from google.adk.events import Event, EventActions
+from google.adk.flows.llm_flows.agent_transfer import _build_transfer_instructions
 from google.adk.flows.llm_flows.functions import REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
 from google.adk.runners import Runner
 from google.adk.sessions import BaseSessionService, InMemorySessionService, State
-from google.adk.tools import BaseTool, FunctionTool, ToolContext, transfer_to_agent
+from google.adk.tools import BaseTool, FunctionTool, ToolContext, TransferToAgentTool
 from google.genai import types
 from pydantic import ValidationError
 
@@ -1039,21 +1040,11 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
 
     @staticmethod
     def _transfer_instruction(sdk_agent: Any, targets: list[Any]) -> str:
-        """The transfer instructions ADK adds to ``sdk_agent``'s system instruction, worded as ADK words them."""
-        agents = "\n".join(f"\nAgent name: {target.name}\nAgent description: {target.description}\n" for target in targets)
-        names = ", ".join(f"`{name}`" for name in sorted(target.name for target in targets))
-        instruction = (
-            f"\nYou have a list of other agents to transfer to:\n\n{agents}\n\n"
-            "If you are the best to answer the question according to your description,\nyou can answer it.\n\n"
-            "If another agent is better for answering the question according to its\n"
-            "description, call `transfer_to_agent` function to transfer the question to that\n"
-            "agent. When transferring, do not generate any text other than the function\ncall.\n\n"
-            f"**NOTE**: the only available agents for `transfer_to_agent` function are\n{names}.\n"
-        )
-        parent = getattr(sdk_agent, "parent_agent", None)
-        if parent is not None and not getattr(sdk_agent, "disallow_transfer_to_parent", True):
-            instruction += f"\nIf neither you nor the other agents are best for the question, transfer to your parent agent {parent.name}.\n"
-        return instruction
+        """The transfer instructions ADK adds to ``sdk_agent``'s system instruction, from ADK's own builder.
+
+        So the wording, and which agents get none (one in ``task`` or ``single_turn`` mode), follow ADK.
+        """
+        return _build_transfer_instructions("transfer_to_agent", sdk_agent, targets)
 
     @staticmethod
     def _is_gemini_3_live(model: str) -> bool:
@@ -1124,8 +1115,10 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
                 tools[wrapped.name] = wrapped
             elif warn:
                 self._log.warning(f"Tool {type(tool).__name__} is a toolset, which REALTIME mode does not resolve; it is not offered")
-        if self._transfer_targets(sdk_agent):
-            tools["transfer_to_agent"] = FunctionTool(transfer_to_agent)
+        targets = self._transfer_targets(sdk_agent)
+        if targets:
+            # As ADK builds it: the declaration limits ``agent_name`` to the target names.
+            tools["transfer_to_agent"] = TransferToAgentTool(agent_names=[target.name for target in targets])
         return tools
 
     def _validate_transfers(self, root: Any) -> None:

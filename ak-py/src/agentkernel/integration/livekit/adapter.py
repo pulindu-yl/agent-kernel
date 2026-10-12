@@ -389,18 +389,24 @@ class LiveKitEdgeGateway(StatefulEdgeAdapter):
         agent's words are published as its own, its queued audio plays out (bounded, so the change
         cannot hold up an interrupt behind it for long) and its track is muted, and the new agent's
         track is unmuted: it is heard, and shown as speaking, from here on.
-        An agent without a participant of its own in the room (still joining, or unable to join)
-        speaks through the first one, with a warning, rather than going unheard.
+        An agent without a participant of its own in the room speaks through the first one rather
+        than going unheard: noted while it is still joining, and warned about once when it is not
+        (it could not join, or is not in the team).
         """
         self._speaking_agent = agent
         if len(self._participants) == 1:
             return
         speaker = self._by_agent.get(agent)
         if speaker is None:
-            if agent not in self._warned_agents:
+            fallback = self._participants[0]
+            if agent in self._joining:
+                # Normal in the first second of a call: it takes over once in (_catch_up_speaker). Not a
+                # warning, so one is still left to give if the join then fails.
+                _log.info(f"Agent '{agent}' is still joining the room; it speaks through '{fallback.agent}' until it is in")
+            elif agent not in self._warned_agents:
                 self._warned_agents.add(agent)
-                _log.warning(f"Agent '{agent}' has no participant of its own in the room; it speaks through '{self._participants[0].agent}'")
-            speaker = self._participants[0]
+                _log.warning(f"Agent '{agent}' has no participant of its own in the room; it speaks through '{fallback.agent}'")
+            speaker = fallback
         previous = self._active
         if speaker is previous:
             return

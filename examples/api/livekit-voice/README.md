@@ -47,7 +47,9 @@ export AK_LIVEKIT__API_SECRET="your-livekit-api-secret"
 ```
 
 Each variant lives in its own directory (`openai/in_memory`, `openai/kafka`, `openai/nats`,
-`openai/sqs`, `google/in_memory`, `google/sqs`); run these commands from the variant you picked.
+`openai/sqs`, `openai/handoffs`, `google/in_memory`, `google/sqs`, `google/handoffs`); run these
+commands from the variant you picked. The two `handoffs` variants show multi-agent handoffs, with
+every agent shown as its own participant in the room; see their READMEs.
 
 For the single-process `in_memory` example, start the server from its directory:
 

@@ -1677,6 +1677,28 @@ class TestADKRealtimeTransfers:
         assert instruction.startswith("Route the caller.")
         assert "`billing`, `tech_support`" in instruction
 
+    def test_the_transfer_tool_only_names_the_agents_it_can_reach(self):
+        """As ADK 2.x declares it: agent_name is limited to the targets, so the model cannot name another."""
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        supervisor, _, _ = self._graph()
+
+        [declaration] = GoogleADKRealtimeRunner()._connect_config(supervisor).tools[0].function_declarations
+
+        if declaration.parameters_json_schema:
+            enum = declaration.parameters_json_schema["properties"]["agent_name"]["enum"]
+        else:
+            enum = declaration.parameters.properties["agent_name"].enum
+        assert enum == ["billing", "tech_support"]
+
+    def test_an_agent_in_task_mode_gets_no_transfer_instructions(self):
+        """As ADK: such an agent is called rather than talked with, so it is not told about transfers."""
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        _, billing, tech = self._graph()
+
+        assert GoogleADKRealtimeRunner._transfer_instruction(types.SimpleNamespace(mode="task"), [billing, tech]) == ""
+
     def test_the_team_is_every_agent_reachable_through_transfers(self):
         from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
 
