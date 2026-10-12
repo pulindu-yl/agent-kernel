@@ -339,6 +339,46 @@ def test_kubernetes_unreadable_directory_raises(tmp_path):
         mount.chmod(0o700)
 
 
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory permissions")
+def test_kubernetes_unsearchable_secret_directory_raises(tmp_path):
+    secret = tmp_path / "creds"
+    _write(secret / "KEY")
+    secret.chmod(0)
+    try:
+        with pytest.raises(SecretError, match="PermissionError") as info:
+            KubernetesSecretProvider(str(tmp_path)).get_secret("KEY")
+        assert str(secret / "KEY") in str(info.value)
+    finally:
+        secret.chmod(0o700)
+
+
+def test_kubernetes_secret_directory_linked_outside_mount_raises(tmp_path):
+    _write(tmp_path / "outside" / "KEY", "outside-value")
+    mount = tmp_path / "mount"
+    mount.mkdir()
+    (mount / "creds").symlink_to(tmp_path / "outside")
+    with pytest.raises(SecretError, match="resolves outside") as info:
+        KubernetesSecretProvider(str(mount)).get_secret("KEY")
+    assert "outside-value" not in str(info.value)
+
+
+@pytest.mark.parametrize("rel", ["KEY", "creds/KEY"])
+def test_kubernetes_key_file_linked_outside_mount_raises(tmp_path, rel):
+    _write(tmp_path / "outside" / "KEY", "outside-value")
+    link = tmp_path / "mount" / rel
+    link.parent.mkdir(parents=True)
+    link.symlink_to(tmp_path / "outside" / "KEY")
+    with pytest.raises(SecretError, match="resolves outside") as info:
+        KubernetesSecretProvider(str(tmp_path / "mount")).get_secret("KEY")
+    assert "outside-value" not in str(info.value)
+
+
+def test_kubernetes_mount_path_that_is_a_symlink_resolves(tmp_path):
+    _kubelet_secret(tmp_path / "real" / "creds", "..ts", {"KEY": "linked"})
+    (tmp_path / "mount").symlink_to(tmp_path / "real")
+    assert KubernetesSecretProvider(str(tmp_path / "mount")).get_secret("KEY") == "linked"
+
+
 def test_kubernetes_invalid_utf8_raises_without_chaining_or_leaking(tmp_path):
     path = tmp_path / "a" / "KEY"
     path.parent.mkdir()

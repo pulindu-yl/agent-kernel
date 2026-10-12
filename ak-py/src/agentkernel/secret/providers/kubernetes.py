@@ -1,11 +1,13 @@
 """KubernetesSecretProvider — Kubernetes Secrets mounted into the pod as files.
 
 Each Secret is its own volume at {mount_path}/{secret-name}/, one file per data key. The key
-OPENAI_API_KEY is read from the one file of that name across the mounted Secrets.
+OPENAI_API_KEY is read from the one file of that name across the mounted Secrets. Symlinks are
+followed (the kubelet's own layout is built from them), but never to a file outside mount_path.
 """
 
 import logging
 import os
+import stat
 from typing import Optional
 
 from ...core.config import _SecretConfig
@@ -41,7 +43,8 @@ class KubernetesSecretProvider(SecretProvider):
 
         :raises ValueError: If key is not a single, non-hidden path component.
         :raises SecretError: If mount_path is missing or not a directory, the key exists in more
-                             than one place, or a file cannot be listed, read or decoded.
+                             than one place, a matching file resolves outside mount_path, or a
+                             file cannot be listed, read or decoded.
         """
         if not key or key.startswith(".") or "/" in key or os.sep in key:
             raise ValueError(f"invalid secret key {key!r}: must be a single, non-hidden path component")
@@ -57,6 +60,7 @@ class KubernetesSecretProvider(SecretProvider):
         """List mount_path once and return every path that resolves to a regular file named `key`."""
         candidates: list[str] = []
         try:
+            root = os.path.realpath(self._mount_path)
             with os.scandir(self._mount_path) as entries:
                 for entry in entries:
                     if entry.name.startswith("."):
@@ -65,7 +69,7 @@ class KubernetesSecretProvider(SecretProvider):
                         candidates.append(os.path.join(self._mount_path, key))
                     elif entry.is_dir():
                         path = os.path.join(self._mount_path, entry.name, key)
-                        if os.path.isfile(path):
+                        if self._is_regular_file(path):
                             candidates.append(path)
         except (FileNotFoundError, NotADirectoryError) as exc:
             raise SecretError(
@@ -75,7 +79,23 @@ class KubernetesSecretProvider(SecretProvider):
             ) from exc
         except OSError as exc:
             raise SecretError(f"cannot list Kubernetes secret mount '{self._mount_path}': {type(exc).__name__}") from exc
+        for path in candidates:
+            if os.path.commonpath([root, os.path.realpath(path)]) != root:
+                raise SecretError(f"Kubernetes secret file '{path}' resolves outside '{self._mount_path}'")
         return candidates
+
+    @staticmethod
+    def _is_regular_file(path: str) -> bool:
+        """True when path resolves to a regular file; False when it is absent.
+
+        :raises SecretError: On any other filesystem error, e.g. a Secret directory that cannot be searched.
+        """
+        try:
+            return stat.S_ISREG(os.stat(path).st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError as exc:
+            raise SecretError(f"cannot read Kubernetes secret file '{path}': {type(exc).__name__}") from exc
 
     def _read(self, path: str) -> Optional[str]:
         """Return the file content verbatim; None when it is empty or vanished since discovery."""
