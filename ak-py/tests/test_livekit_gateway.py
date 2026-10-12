@@ -129,6 +129,7 @@ def _gateway(*agents) -> LiveKitEdgeGateway:
     gateway._active = gateway._participants[0]
     gateway._joining = set()
     gateway._warned_agents = set()
+    gateway._speaking_agent = None
     gateway._background_tasks = set()
     gateway._transcript = []
     gateway._interrupted = False
@@ -784,6 +785,28 @@ class TestMultiAgentOutbound:
 
         assert gateway._active is gateway._participants[0]
         assert caplog.text.count("'sales' has no participant of its own") == 1
+
+    @pytest.mark.asyncio
+    async def test_an_agent_handed_to_while_joining_moves_to_its_own_participant_once_in(self, monkeypatch):
+        """The handoff falls back to the first participant while billing joins; once billing is in,
+        its next output goes through its own participant, unmuted, with the first one muted."""
+        monkeypatch.setattr(livekit_adapter, "rtc", _FakeRtc)
+        gateway = _gateway("supervisor", "billing")
+        gateway._loop = asyncio.get_running_loop()
+        supervisor, billing = gateway._participants
+        del gateway._by_agent["billing"]  # still joining
+
+        await gateway.deliver_chunk(self._change("billing", "supervisor"), {})
+        await gateway.deliver_chunk(self._audio(), {})
+        assert gateway._active is supervisor
+
+        gateway._by_agent["billing"] = billing  # the join completes
+        await gateway.deliver_chunk(self._audio(), {})
+        await asyncio.sleep(0.05)
+
+        assert gateway._active is billing
+        assert [len(supervisor.audio_source.frames), len(billing.audio_source.frames)] == [1, 1]
+        assert [supervisor.track.muted, billing.track.muted] == [True, False]
 
     @pytest.mark.asyncio
     async def test_a_single_participant_speaks_for_every_agent(self, monkeypatch):

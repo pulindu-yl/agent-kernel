@@ -1073,6 +1073,20 @@ class TestOpenAIRealtimeHandoffs:
 
         assert team == ["supervisor", "billing", "tech_support"]
 
+    def test_a_statically_disabled_handoff_is_not_part_of_the_team(self):
+        """It is never offered to the model, so no participant is opened for it."""
+        from agents import Agent as SDKAgent
+        from agents import handoff
+
+        from agentkernel.framework.openai.openai import OpenAIRealtimeRunner
+
+        supervisor, billing = self._graph()
+        supervisor.handoffs = [billing, handoff(SDKAgent(name="sales"), is_enabled=False)]
+
+        team = OpenAIRealtimeRunner().team(types.SimpleNamespace(name="supervisor", agent=supervisor))
+
+        assert team == ["supervisor", "billing"]
+
     @pytest.mark.asyncio
     async def test_a_handoff_call_is_dispatched_like_a_tool_call(self):
         supervisor, _ = self._graph()
@@ -1189,6 +1203,28 @@ class TestOpenAIRealtimeHandoffs:
         output, follow_up = runner._connection.sent
         assert output["item"]["output"] == "Error: billing is closed"
         assert follow_up == {"type": "response.create"}
+
+    @pytest.mark.asyncio
+    async def test_an_agent_that_cannot_be_activated_keeps_the_call_where_it_was(self):
+        """Regression: a failure resolving the new agent escaped the tool task, leaving the call with
+        no output and no follow-up response. Now the model is told and the agent stays."""
+
+        def broken(ctx, agent):
+            raise RuntimeError("no instructions today")
+
+        supervisor, billing = self._graph()
+        billing.instructions = broken
+        runner = await self._runner(supervisor)
+
+        await runner._handle_message(self._done(("c1", "transfer_to_billing", "{}")))
+        await self._answer(runner)
+
+        assert runner._active is supervisor
+        assert self._reported(runner) == [("done", {"status": "completed"})]
+        output, follow_up = runner._connection.sent
+        assert output["item"]["output"] == "Error: the handoff to billing failed: no instructions today"
+        assert follow_up == {"type": "response.create"}
+        assert list(runner._handoffs) == ["transfer_to_billing"]
 
     @pytest.mark.asyncio
     async def test_only_the_first_handoff_of_a_response_is_performed(self):

@@ -47,7 +47,7 @@ export AK_LIVEKIT__API_SECRET="..."
 
 ### 2. Run the server
 ```bash
-python server.py
+uv run server.py
 ```
 
 Connect to `room_01` in your LiveKit Sandbox dashboard and speak.

@@ -132,6 +132,9 @@ class LiveKitEdgeGateway(StatefulEdgeAdapter):
         self._joining: set[str] = set()
         # Agents already warned about, once each: they have no participant of their own.
         self._warned_agents: set[str] = set()
+        # The agent the conversation says is speaking. Its participant may still be joining, in which
+        # case another participant speaks for it until the join completes.
+        self._speaking_agent: Optional[str] = None
         # Work running on the gateway's loop (team joins, ACTIVE_ATTRIBUTE updates), cancelled on release.
         self._background_tasks: set[asyncio.Task] = set()
 
@@ -343,6 +346,8 @@ class LiveKitEdgeGateway(StatefulEdgeAdapter):
             return
 
         event = chunk.event
+        if event is not None and event.type != "agent_changed":
+            await self._catch_up_speaker()
         if event is not None:
             if event.type == "audio_delta":
                 audio_bytes = base64.b64decode(event.content)
@@ -387,6 +392,7 @@ class LiveKitEdgeGateway(StatefulEdgeAdapter):
         An agent without a participant of its own in the room (still joining, or unable to join)
         speaks through the first one, with a warning, rather than going unheard.
         """
+        self._speaking_agent = agent
         if len(self._participants) == 1:
             return
         speaker = self._by_agent.get(agent)
@@ -436,6 +442,17 @@ class LiveKitEdgeGateway(StatefulEdgeAdapter):
             track.mute() if muted else track.unmute()
         except Exception as e:
             _log.warning(f"Could not {'mute' if muted else 'unmute'} agent participant {participant.identity}: {e}")
+
+    async def _catch_up_speaker(self) -> None:
+        """Move the speaking agent onto its own participant once that participant is in the room.
+
+        A handoff to an agent still joining falls back to another participant; when the join has
+        completed since, the switch happens here, before the next output, as any change of speaker.
+        """
+        agent = self._speaking_agent
+        speaker = self._by_agent.get(agent) if agent else None
+        if speaker is not None and speaker is not self._active:
+            await self._change_speaker(agent)
 
     def _show_team(self, starting: str, agents: list[str]) -> None:
         """Give every agent of the conversation's team a participant of its own.

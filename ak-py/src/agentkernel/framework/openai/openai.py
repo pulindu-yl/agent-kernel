@@ -727,12 +727,16 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
         """Every agent reachable from ``root`` through handoffs, ``root`` first, nearest first.
 
         A ``Handoff`` made by ``handoff()`` is followed to its agent; a hand-built one names its agent
-        only when invoked, so the agents beyond it are not reached.
+        only when invoked, so the agents beyond it are not reached. A handoff with ``is_enabled=False``
+        is never offered, so its agent is not reached through it; one with an ``is_enabled`` callable
+        is followed, since whether it is enabled is only known at run time.
         """
         reached: list[Agent] = [root]
         seen = {id(root)}
         for agent in reached:
             for item in agent.handoffs or []:
+                if isinstance(item, Handoff) and item.is_enabled is False:
+                    continue
                 if isinstance(item, Handoff):
                     # ``handoff()`` keeps its agent only as this private weak reference.
                     reference = getattr(item, "_agent_ref", None)
@@ -774,27 +778,26 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
         The model may call the agent's offered tools and its enabled handoffs. Its instructions are
         resolved the way the SDK resolves them for a run (a string, or a callable over the run
         context); an agent with none leaves them out, so the caller decides what replaces them.
+        Everything is resolved before anything changes, so an agent whose instructions, tools or
+        handoffs cannot be resolved leaves the active agent as it was.
 
         :param sdk_agent: The SDK agent to activate.
         :return: The ``session`` payload of a ``session.update``.
         """
-        self._active = sdk_agent
-        self._tools = await self._offered_tools(sdk_agent, self._run_context)
-        self._handoffs = await self._offered_handoffs(sdk_agent, self._run_context)
+        tools = await self._offered_tools(sdk_agent, self._run_context)
+        handoffs = await self._offered_handoffs(sdk_agent, self._run_context)
+        instructions = await sdk_agent.get_system_prompt(self._run_context)
+        self._active, self._tools, self._handoffs = sdk_agent, tools, handoffs
         settings = {
             "type": "realtime",
             "tools": [
-                *(
-                    {"type": "function", "name": t.name, "description": t.description, "parameters": t.params_json_schema}
-                    for t in self._tools.values()
-                ),
+                *({"type": "function", "name": t.name, "description": t.description, "parameters": t.params_json_schema} for t in tools.values()),
                 *(
                     {"type": "function", "name": h.tool_name, "description": h.tool_description, "parameters": h.input_json_schema}
-                    for h in self._handoffs.values()
+                    for h in handoffs.values()
                 ),
             ],
         }
-        instructions = await sdk_agent.get_system_prompt(self._run_context)
         if instructions:
             settings["instructions"] = instructions
         return settings
@@ -938,7 +941,14 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
         if self._connection:
             transfer = self._transfers.pop(call_id, None)
             if transfer is not None:
-                await self._switch_to(*transfer)
+                try:
+                    await self._switch_to(*transfer)
+                except Exception as e:
+                    # The new agent could not be activated (its instructions, tools or handoffs failed
+                    # to resolve): the call stays with the current agent, and the model is told, as
+                    # for a handoff whose on_handoff fails.
+                    _log.exception(f"Handoff {transfer[0].tool_name} could not activate agent '{transfer[1].name}'")
+                    result = f"Error: the handoff to {transfer[1].name} failed: {e}"
             await self._connection.send(
                 {"type": "conversation.item.create", "item": {"type": "function_call_output", "call_id": call_id, "output": result}}
             )
