@@ -59,6 +59,8 @@ e2e:
     - type: cli
       path: examples/cli/pydanticai-run-options
     - type: cli
+      path: examples/cli/maf-run-options
+    - type: cli
       path: examples/cli/crewai-run-options
     - type: cli
       path: examples/cli/smolagents

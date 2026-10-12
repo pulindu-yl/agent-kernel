@@ -289,6 +289,9 @@ For per-run context/state carried across turns, see
 [examples/cli/maf_context](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/cli/maf_context)
 — a cart kept in the framework context and mutated by native MAF tools through `FunctionInvocationContext`.
 
+For per-agent native run options, see [examples/cli/maf-run-options](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/cli/maf-run-options)
+(`options` and `function_invocation_kwargs`, with a deterministic `Run stats:` line on every reply).
+
 For REST, see [examples/api/maf](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/api/maf), and
 [examples/api/maf-streaming](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/api/maf-streaming)
 for token streaming over Server-Sent Events.

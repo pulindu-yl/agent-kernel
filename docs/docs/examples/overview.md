@@ -65,6 +65,7 @@ Per-agent native run options demos, one per framework plus a per-run factory var
 - **`langgraph-run-options/`** - LangGraph, a `RunnableConfig` with `callbacks` and `recursion_limit`
 - **`adk-run-options/`** - Google ADK, `plugins` and a `RunConfig` with `max_llm_calls`
 - **`pydanticai-run-options/`** - Pydantic AI, `UsageLimits` and an `event_stream_handler`
+- **`maf-run-options/`** - Microsoft Agent Framework, `options` (`max_tokens`) and `function_invocation_kwargs`, with progress from the native chat and function middleware
 - **`crewai-run-options/`** - CrewAI, a `Crew` `step_callback` and `max_rpm`
 - **`smolagents-run-options/`** - smolagents, `max_steps` (progress via the native `step_callbacks` constructor argument)
 
