@@ -1392,6 +1392,18 @@ helm install ak oci://ghcr.io/yaalalabs/charts/agent-kernel --version 0.9.5 \
   --set 'extraEnv[0].valueFrom.secretKeyRef.key=api-key'
 ```
 
+**Model credentials as mounted Secrets (alternative to `extraEnv`):** create the Secret with the key
+named exactly like the AK key, set `secret.provider.type: kubernetes` in the image's `config.yaml`, and
+list it in the chart instead of the `extraEnv` flags:
+
+```bash
+kubectl create secret generic openai-credentials --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY"
+# then add to the install: --set secretStore.enabled=true --set 'secretStore.secrets[0].name=openai-credentials'
+```
+
+The chart mounts each Secret read-only at `/var/run/secrets/agentkernel/<name>` on the agent-executing
+tier only (agent-runner, or io in the single-process profile). A set environment variable still wins.
+
 The chart version tracks the Agent Kernel release (the pin above is the current one); the
 flavor values files ship inside the chart, so no repository checkout is needed.
 `ak-deployment/ak-k8s/chart` in the repository is for developing the chart itself.

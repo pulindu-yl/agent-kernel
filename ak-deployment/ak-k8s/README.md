@@ -109,8 +109,41 @@ uses):
 | `AK_WEBSOCKET_API__PUSH_AUTH_TOKEN` | the push-token Secret (io-handler and ws-gateway pods) |
 | `AK_POD_IP` | downward API, `status.podIP` (ws-gateway pods) |
 
-Model provider credentials (e.g. `OPENAI_API_KEY`) are yours to inject through `extraEnv`,
-ideally from a Secret.
+Model provider credentials (e.g. `OPENAI_API_KEY`) are yours to provide, either as an environment
+variable through `extraEnv` (ideally from a Secret) or as mounted files through `secretStore`
+(see [Secrets](#secrets)).
+
+## Secrets
+
+`secretStore` mounts Kubernetes Secrets you created into the pod, for the application's
+`secret.provider.type: kubernetes`:
+
+```yaml
+secretStore:
+  enabled: true
+  secrets:
+    - name: openai-credentials
+    - name: slack-credentials
+```
+
+- Each listed Secret becomes a `secret` volume (`ak-secret-<index>`) mounted read-only and whole at
+  `/var/run/secrets/agentkernel/<name>`, one file per data key. The Secrets must exist in the release
+  namespace, or the pod stays `ContainerCreating` (`FailedMount`).
+- **Placement.** Only the tier that executes agents mounts them: `agentRunner` or, in the
+  single-process profile (`agentRunner.enabled: false`, `transport.type: in_memory`), `ioHandler`.
+  `wsGateway` and `sandboxWorker` never do. `secretStore.enabled` with no such tier, an empty list, a
+  duplicate name or an entry without a `name` fails `helm template` / `install`.
+- **No RBAC.** The app reads files; it never calls the Kubernetes API. The chart creates no Role,
+  RoleBinding or ServiceAccount for this.
+- **Key names.** Data keys must be the AK key name (`OPENAI_API_KEY`); other keys are never read.
+- **Security.** Every key of every listed Secret is readable by code in that tier. List only what
+  agents need.
+- **Rotation.** Kubelet refreshes the files after a short delay; no checksum annotation is added, so
+  a Secret change does not roll the pods. Values the app reads once at startup need a rollout restart.
+
+The environment still wins: a set, non-empty `OPENAI_API_KEY` in the container is used before any
+mounted file. See [Secret Resolution](https://github.com/yaalalabs/agent-kernel/tree/develop/docs/docs/advanced/secrets.md) for the
+provider side.
 
 ## Transports
 

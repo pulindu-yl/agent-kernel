@@ -45,7 +45,7 @@ Which capability would you like to add?
 10. **Sandbox** — Isolated code/command execution with pluggable providers, workload profiles, policy, and per-user identity
 11. **AG-UI Server** — Stream any agent to an AG-UI-compliant frontend (text, tool calls, reasoning, shared state)
 12. **Scheduled Tasks** — Deferred and recurring chat execution (a `schedule` block on a chat request, management routes, agent tools)
-13. **Secret Resolution** — Read API keys through `SecretManager` (environment first, then AWS SSM Parameter Store or a custom provider)
+13. **Secret Resolution** — Read API keys through `SecretManager` (environment first, then AWS SSM Parameter Store, Kubernetes Secrets mounted into the pod, or a custom provider)
 14. **Human in the Loop** — Pause a run for a person's approval or answer and resume from their decision (a gated tool or an interrupt, a `resume` block on the next request)
 
 ### Step 3: Generate Changes
@@ -1400,7 +1400,8 @@ back to `os.environ`** — hand it to the SDK explicitly. The capability is alwa
 flag); the default `env` provider costs nothing.
 
 **Ask:** Which provider — `env` (default; the process environment), `aws_ssm` (AWS SSM Parameter
-Store; needs the `aws` extra and `secret.prefix`), or a dotted path to your own `SecretProvider`
+Store; needs the `aws` extra and `secret.prefix`), `kubernetes` (Kubernetes Secrets mounted into the
+pod as files; no extra), or a dotted path to your own `SecretProvider`
 subclass?
 
 **1. Install the extra (aws_ssm only):**
@@ -1414,7 +1415,9 @@ pip install "agentkernel[aws]"
 ```yaml
 secret:
   provider:
-    type: aws_ssm              # env (default) | aws_ssm | my_pkg.secrets.MyProvider
+    type: aws_ssm              # env (default) | aws_ssm | kubernetes | my_pkg.secrets.MyProvider
+    # kubernetes:
+    #   mount_path: /var/run/secrets/agentkernel   # only for Secrets mounted outside the Helm chart
   prefix: myproduct-dev-agents # required by aws_ssm; AWS Terraform injects AK_SECRET__PREFIX when ssm_enabled = true
   cache_ttl: 300               # seconds a provider hit is cached; 0 disables caching (rotation-pickup window)
 ```
@@ -1422,6 +1425,11 @@ secret:
 With `aws_ssm`, the key `OPENAI_API_KEY` is read from the SSM parameter
 `/ak/{prefix}/openai_api_key` (key lowercased, `GetParameter` with decryption). `prefix` must be a single
 path segment. Create the parameters yourself as `SecureString`.
+
+With `kubernetes`, the key is the file `<mount_path>/<secret-name>/OPENAI_API_KEY`, found across every
+mounted Secret (the same key in two Secrets is an error). Data keys must be named exactly like the AK key
+(`OPENAI_API_KEY`). On the Helm chart, set `secretStore.enabled: true` and list the Secrets in
+`secretStore.secrets`; see `examples/k8s/openai-queue-mode`.
 
 **3. Resolve secrets in agent code instead of reading `os.environ`:**
 
