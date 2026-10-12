@@ -23,7 +23,7 @@ from agentkernel.core.util.factory import AKConfigError
 from agentkernel.integration.agui.pipeline import AGUIPipelineRequestHandler
 from agentkernel.integration.agui.run_input import AGUIRunEnvelope, AGUIRunRequest
 from agentkernel.integration.agui.state import AGUIState
-from agentkernel.pipeline.agent_runner import AgentRunner, StreamAgentRunner
+from agentkernel.pipeline.agent_runner import AgentRunner, RealtimeAgentRunner, StreamAgentRunner
 from agentkernel.pipeline.envelope import ATTR_AGUI, ATTR_REQUEST_ID, ATTR_USER_ID, QueueMessage, QueueName
 from agentkernel.pipeline.response_handler import ResponseHandler
 from agentkernel.pipeline.response_store.dynamodb import DynamoDBResponseStore
@@ -136,7 +136,7 @@ def _drain_output(transport, limit=20):
     return messages
 
 
-RUNNER_CLASSES = [AgentRunner, StreamAgentRunner]
+RUNNER_CLASSES = [AgentRunner, StreamAgentRunner, RealtimeAgentRunner]
 
 
 def _run_through_runner(session, chunks, envelope=None, during_run=None, attributes=None, runner_cls=AgentRunner):
