@@ -23,6 +23,7 @@ Agent Kernel's tracing system:
 2. **`Trace`** (`trace/trace.py`) is a factory that creates the appropriate trace instance based on `AKConfig.trace.type`
 3. Each **framework Module** checks for a trace runner at initialization — if tracing is enabled, it uses the traced runner instead of the default
 4. Traced runners **extend the base framework runner** and wrap execution with spans/traces
+5. **`BaseTrace.fetch(query)`** (optional, not abstract) reads spans back from the provider's cloud as provider-neutral `FetchedSpan`s; `Trace.fetch` is the facade users call (`Trace.get().fetch(last=..., session_id=...)`). A provider that only sends traces skips it and raises `NotImplementedError` (step 6)
 
 ## Step-by-Step
 
@@ -37,7 +38,8 @@ ak-py/src/agentkernel/trace/<provider>/
 ├── crewai.py            # Traced CrewAI runner
 ├── adk.py               # Traced Google ADK runner
 ├── smolagents.py        # Traced Smolagents runner
-└── pydanticai.py        # Traced Pydantic AI runner
+├── pydanticai.py        # Traced Pydantic AI runner
+└── fetch.py             # Optional: <Provider>TraceFetcher, reads spans back (step 6)
 ```
 
 ### 2. Implement the Main Trace Class
@@ -175,7 +177,33 @@ from .<provider> import <Provider>
 
 Add the new provider as a recognized option. The `BaseTrace` class (`trace/base.py`) already defines the interface — your implementation just needs to conform to it. No changes to `base.py` are needed unless you're adding a new framework. Note that `init()` and all six framework methods (`openai`, `langgraph`, `crewai`, `adk`, `smolagents`, `pydanticai`) are declared `@abstractmethod` on `BaseTrace`, so every new provider must implement all seven — otherwise the class cannot be instantiated.
 
-### 6. Register with the Trace Factory
+### 6. Implement Fetching (Optional)
+
+`BaseTrace.fetch(query: TraceQuery) -> list[FetchedSpan]` is not abstract: it raises `NotImplementedError("<Class> does not support fetching spans")`, so a send-only provider needs nothing here. To let users read spans back, put the reading code in `trace/<provider>/fetch.py` and have the tracer build it lazily:
+
+```python
+# ak-py/src/agentkernel/trace/<provider>/<provider>.py
+from ..fetch import FetchedSpan, TraceQuery
+
+class <Provider>(BaseTrace):
+    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+        """Fetches spans back from <Provider> through its query API."""
+        from .fetch import <Provider>TraceFetcher
+
+        return <Provider>TraceFetcher(self._client).fetch(query)
+```
+
+The models live in `trace/fetch.py`: `TraceQuery` (window via `start`/`end` or `last`, `kinds`, `session_id`, `trace_ids`, `name`, `limit`; `window()` returns the UTC bounds and `matches(span)` checks every filter), `FetchedSpan`, `SpanKind`, `SpanUsage` (`SpanUsage.of(...)` coerces raw values) and `OTelSpanClassifier` (kind, input/output, usage and session id from OTel attributes). The four built-in fetchers (`langfuse/`, `logfire/`, `openllmetry/`, `cloudwatch/` `fetch.py`) follow these rules:
+
+1. **The fetcher never reads `AKConfig`.** It takes explicit constructor parameters (a client, a token, a base URL, an optional `httpx` transport or boto client); the tracer class builds it.
+2. **No provider SDK import at module scope** in `fetch.py`: import it under `TYPE_CHECKING` or inside the method that uses it, so the fetcher is testable without the extra. Keep the provider package's `__init__.py` empty for the same reason.
+3. **Classify per span, never per provider.** OTel-shaped results go through `OTelSpanClassifier`; a backend that types spans server side (Langfuse observations) maps its types directly.
+4. **Same result contract:** oldest first (`FetchedSpan.oldest_first`), at most `limit` spans with the most recent kept when more match, unique span ids, the provider record in `raw`, and `input`/`output` returned as stored (never parsed or rewritten).
+5. **Re-check filters locally** wherever the server-side filter could be approximate (`query.matches(span)`). A span missing a value for an active filter (start time, session id, name) is rejected, never assumed to match.
+
+Test it by subclassing `TraceFetchContract` (`agentkernel.trace.testing`, imports `pytest`) in `tests/test_trace_fetch_contract.py`: override the `tracer` fixture and `seed(tracer, spans)` over a faithful fake of the backend (see `TestLangfuseFetchContract` and `TestTraceloopFetchContract`). Backends whose query language can't be faked faithfully (Logfire SQL, CloudWatch Logs Insights) get targeted tests in `tests/test_trace_fetch.py` instead.
+
+### 7. Register with the Trace Factory
 
 Update `ak-py/src/agentkernel/trace/trace.py`. The factory shares the house pluggable-backend
 shape from `core/util/factory.py` (`resolve_dotted`, `require_extra`, `AKConfigError` — the same
@@ -232,7 +260,7 @@ A dotted `type` (e.g. `myorg.tracing.CustomTrace`) resolves via `resolve_dotted`
 factory edit at all — only add an `if` branch here for a first-party, in-repo provider you want
 addressable by a short name.
 
-### 7. Add Configuration
+### 8. Add Configuration
 
 The existing `_TraceConfig.type` in `config.py` is a free-form string (no regex pattern) described
 as "a built-in short name (langfuse, openllmetry, logfire, cloudwatch) or a dotted path to a BaseTrace subclass" — do
@@ -248,7 +276,7 @@ trace:
 
 Add provider-specific environment variables as needed (e.g., `PROVIDER_API_KEY`).
 
-### 8. Add Optional Dependencies
+### 9. Add Optional Dependencies
 
 In `ak-py/pyproject.toml`:
 
@@ -260,7 +288,7 @@ In `ak-py/pyproject.toml`:
 ]
 ```
 
-### 9. Add Tests
+### 10. Add Tests
 
 Create `ak-py/tests/test_trace_<provider>.py`, and add a missing-extra test to `tests/test_trace.py` asserting the friendly `agentkernel[<provider>]` `ImportError`. Two existing files show the two styles: `test_trace_logfire.py` injects a fake SDK module into `sys.modules` (the SDK is not a test dependency), and `test_trace_cloudwatch.py` records spans with a real OpenTelemetry SDK `TracerProvider` and `InMemorySpanExporter` while patching `trace.get_tracer_provider` / `set_tracer_provider` (the global provider is settable once per process, so a test must never install one). Cover:
 
@@ -269,7 +297,7 @@ Create `ak-py/tests/test_trace_<provider>.py`, and add a missing-extra test to `
 - Test that errors are recorded in spans
 - Use mocks for the tracing client
 
-### 10. Add Documentation
+### 11. Add Documentation
 
 Add `docs/docs/advanced/tracing-<provider>.md` covering:
 - Provider setup (API keys, dashboard URL)
@@ -300,6 +328,7 @@ This means tracing is **transparent** — users don't change their agent code, t
 
 - [ ] `ak-py/src/agentkernel/trace/<provider>/` directory with `__init__.py` and main class
 - [ ] Traced runners for each framework (OpenAI, LangGraph, CrewAI, ADK, Smolagents, Pydantic AI)
+- [ ] Optional: `fetch` on the main class and `<provider>/fetch.py` (step 6), with a `TraceFetchContract` subclass where the backend can be faked
 - [ ] Registration in `trace/trace.py` factory
 - [ ] Configuration via `type: "<provider>"` in `config.yaml`
 - [ ] Optional dependencies in `pyproject.toml`
