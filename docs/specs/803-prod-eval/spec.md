@@ -1,0 +1,1563 @@
+# #803: Agent evaluation on production traffic — Implementation Spec
+
+This spec details how to build the three phases [design.md](design.md) requires: Phase 1 (fetch) in Agent
+Kernel core, and Phases 2 (evaluate) and 3 (store) in the `aws-serverless/langfuse-trace-evaluation`
+example.
+
+**Phase 1** adds a `fetch(query)` method to `BaseTrace` and a `Trace.fetch(...)` facade.
+It also adds a provider-neutral query/result model in `trace/fetch.py`, plus one fetcher class per
+built-in tracer in `trace/<provider>/fetch.py`. Each fetcher translates the generic `TraceQuery` into
+its provider's read API and returns `FetchedSpan`s. Three small changes complete it: a Logfire scrubbing
+callback, so session ids survive export, `httpx` in two extras, and a shared `CloudWatch.region()`
+lookup that the CloudWatch exporter and fetcher both use.
+
+Where design.md leaves an open question, this spec follows the design's recommendation or its stated
+default, and says so inline.
+
+## Phase 1 design (Agent Kernel core)
+
+### Package layout
+
+```
+ak-py/src/agentkernel/trace/
+├── __init__.py          # + exports FetchedSpan, OTelSpanClassifier, SpanKind, SpanUsage, TraceQuery
+├── base.py              # + BaseTrace.fetch (non-abstract)
+├── trace.py             # + Trace.fetch facade
+├── fetch.py             # NEW: SpanKind, TraceQuery, SpanUsage, FetchedSpan, OTelSpanClassifier
+├── testing.py           # NEW: TraceFetchContract (imports pytest; test code only)
+├── langfuse/
+│   ├── langfuse.py      # + LangFuse.fetch → LangfuseTraceFetcher; + LangFuse.flush_on_lambda
+│   ├── <6 runners>.py   # each run() flushes through LangFuse.flush_on_lambda in a finally
+│   └── fetch.py         # NEW: LangfuseTraceFetcher
+├── logfire/
+│   ├── logfire.py       # + Logfire.fetch → LogfireTraceFetcher; scrubbing callback in init()
+│   └── fetch.py         # NEW: LogfireTraceFetcher
+├── openllmetry/
+│   ├── openllmetry.py   # + OpenLLMetry.fetch → TraceloopTraceFetcher
+│   └── fetch.py         # NEW: TraceloopTraceFetcher
+└── cloudwatch/
+    ├── cloudwatch.py    # + CloudWatch.fetch → CloudWatchTraceFetcher; + CloudWatch.region()
+    └── fetch.py         # NEW: CloudWatchTraceFetcher
+```
+
+The provider packages' `__init__.py` files are empty today and stay empty. So
+`agentkernel.trace.<provider>.fetch` can be imported without the provider SDK.
+
+### Rules
+
+1. **Fetchers never read `AKConfig`.** Each fetcher takes explicit constructor parameters: a client,
+   a token, a base URL, an optional transport. The tracer class builds its fetcher. This is the same
+   rule as the shared DB drivers and transports.
+2. **Fetcher modules import no provider SDK at module scope.**
+   - `langfuse/fetch.py` imports `Langfuse` under `TYPE_CHECKING` only.
+   - `logfire/fetch.py` imports `LogfireQueryClient` inside `fetch()`.
+   - `openllmetry/fetch.py` imports only `httpx`, which the core test environment already has.
+   - `cloudwatch/fetch.py` imports `botocore` and the `CloudWatch` tracer module (which pulls in the
+     OpenTelemetry SDK) inside `_create_client()`, used only when no client is injected.
+   - This keeps the fetchers testable without the extras.
+3. **Classification is per span, never per provider.** Every OTel-shaped result (Logfire, Traceloop and CloudWatch)
+   goes through `OTelSpanClassifier`. Langfuse already types its observations server-side, so its
+   types are mapped directly.
+4. **Same result contract for every tracer.**
+   - Spans come back oldest first, with at most `limit` of them; when more match, the most recent are
+     kept.
+   - Span ids are unique.
+   - `raw` holds the provider record.
+   - `fetch` itself never parses or rewrites `input`/`output`.
+5. **Filters are checked again locally** wherever the server-side filter could be approximate. Langfuse
+   and Traceloop run every span through `TraceQuery.matches` (window, kinds, session, trace ids, name);
+   Logfire re-checks kinds, and CloudWatch window, session and kind (`_matches`). A span whose computed
+   `kind` is not in `query.kinds` is never returned. Both checks are strict: a span that doesn't report
+   a value for an active filter (start time, session id, name) is rejected, never assumed to match.
+6. **Every fetch implementation passes `TraceFetchContract`** where its backend can be faked faithfully
+   (§`trace/testing.py`).
+
+### `trace/fetch.py`
+
+```python
+class SpanKind(str, Enum):
+    AGENT = "agent"; LLM = "llm"; TOOL = "tool"; SPAN = "span"
+
+class TraceQuery(BaseModel):
+    start: Optional[datetime] = None          # inclusive, on span start time
+    end: Optional[datetime] = None            # exclusive; defaults to now
+    last: timedelta = timedelta(hours=1)      # used only when start is None
+    kinds: Optional[list[SpanKind]] = None    # None = all
+    session_id: Optional[str] = None
+    trace_ids: Optional[list[str]] = None
+    name: Optional[str] = None
+    limit: int = Field(default=1000, gt=0)
+
+    def window(self) -> tuple[datetime, datetime]: ...   # UTC-aware; ValueError if start >= end
+    def accepts(self, kind: SpanKind) -> bool: ...       # kinds is None or kind in kinds
+    def matches(self, span: FetchedSpan) -> bool: ...    # start <= start_time < end, session, trace ids, name, kind;
+                                                          # an active filter needs a matching reported value:
+                                                          # a None start_time, session_id or name is rejected
+
+class SpanUsage(BaseModel):                   # one model call's usage, never a roll-up
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None        # input + output when the span reports no total
+    cost: Optional[float] = None              # USD, as the provider/instrumentation reported it
+
+    @classmethod
+    def of(cls, input_tokens=None, output_tokens=None, total_tokens=None, cost=None) -> Optional["SpanUsage"]: ...
+        # coerces numbers / numeric strings; drops non-numeric values and bools; None when nothing is known
+
+class FetchedSpan(BaseModel):
+    provider: str
+    trace_id: str
+    span_id: str
+    parent_span_id: Optional[str] = None
+    name: Optional[str] = None
+    kind: SpanKind = SpanKind.SPAN
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    session_id: Optional[str] = None
+    input: Any = None
+    output: Any = None
+    usage: Optional[SpanUsage] = None         # None when the span records no model call
+    attributes: dict[str, Any] = {}
+    raw: dict[str, Any] = {}
+
+    @staticmethod
+    def oldest_first(spans: Iterable["FetchedSpan"]) -> list["FetchedSpan"]: ...
+        # sort key: start_time, with None sorting first (datetime.min UTC)
+
+class OTelSpanClassifier:
+    @classmethod
+    def classify(cls, attributes: dict, name: str | None = None) -> SpanKind: ...
+    @classmethod
+    def io(cls, attributes: dict) -> tuple[Any, Any]: ...
+    @classmethod
+    def session_id(cls, attributes: dict) -> str | None: ...
+    @classmethod
+    def usage(cls, attributes: dict) -> SpanUsage | None: ...
+```
+
+- Every field gets a `Field(description=...)`. `kinds` accepts plain strings (`["tool"]`) through
+  Pydantic enum coercion.
+- `window()`:
+  - A naive `datetime` gets `tzinfo=UTC`; an aware one is converted to UTC.
+  - `end` defaults to `datetime.now(timezone.utc)`.
+- `OTelSpanClassifier.classify` precedence (first hit wins):
+
+  | # | Attribute | Mapping |
+  |---|---|---|
+  | 1 | `openinference.span.kind` (upper-cased) | `AGENT`→agent, `LLM`→llm, `TOOL`→tool |
+  | 2 | `traceloop.span.kind` (lower-cased) | `agent`→agent, `tool`→tool |
+  | 3 | `gen_ai.operation.name` | `invoke_agent`,`create_agent`→agent; `execute_tool`→tool; `chat`,`text_completion`,`generate_content`→llm |
+  | 4 | `logfire.msg_template`, else `name` | prefix `Function:`→tool, `Agent run:`→agent |
+  | 5 | `"LLM" in logfire.tags` | llm |
+  | 6 | — | span |
+
+  - Values outside a row's mapping fall through to the next row. For example, OpenInference `CHAIN`
+    and Traceloop `workflow` fall through and end as `span`.
+- `OTelSpanClassifier.io`: the first `(input key, output key)` pair where either key is present:
+  1. `gen_ai.tool.call.arguments` / `.result`
+  2. `input.value` / `output.value`
+  3. `gen_ai.input.messages` / `gen_ai.output.messages`
+  4. `langfuse.observation.input` / `.output`
+  5. `traceloop.entity.input` / `.output`
+  6. `input` / `output`
+- `OTelSpanClassifier.session_id`: the first truthy value among `session.id`, `session_id`,
+  `traceloop.association.properties.session_id`. `gen_ai.conversation.id` is deliberately excluded,
+  because it is the framework's conversation id, not AK's session.
+- `OTelSpanClassifier.usage`: `SpanUsage.of(...)` over the first non-`None` value of each key list:
+
+  | Field | Keys, in order |
+  |---|---|
+  | `input_tokens` | `gen_ai.usage.input_tokens`, `llm.token_count.prompt`, `gen_ai.usage.prompt_tokens` |
+  | `output_tokens` | `gen_ai.usage.output_tokens`, `llm.token_count.completion`, `gen_ai.usage.completion_tokens` |
+  | `total_tokens` | `gen_ai.usage.total_tokens`, `llm.token_count.total`, `llm.usage.total_tokens` |
+  | `cost` | `operation.cost` |
+
+  - First column per row: current OTel GenAI names; second: OpenInference; third: the deprecated GenAI
+    names and Traceloop's own total, for older instrumentation.
+  - Not read, because they are roll-ups that would double-count when summed over a trace: Pydantic AI's
+    `gen_ai.aggregated_usage.*` (agent-run span) and the OpenAI Agents `usage` JSON (Logfire turn and
+    workflow spans, which also carry it on each chat span).
+  - Attributes arrive flattened for CloudWatch (`CloudWatchTraceFetcher._flatten`), so nested
+    `llm.token_count` objects resolve to the same keys.
+- Module-level functions: none. All logic is on these five classes.
+
+### `BaseTrace.fetch` and `Trace.fetch`
+
+```python
+# trace/base.py
+class BaseTrace(ABC):
+    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+        raise NotImplementedError(f"{type(self).__name__} does not support fetching spans")
+
+# trace/trace.py
+class Trace(BaseTrace):
+    def fetch(self, query: TraceQuery | None = None, **filters) -> list[FetchedSpan]:
+        if self._instance is None:
+            raise AKConfigError("cannot fetch spans: tracing is disabled (set trace.enabled: true)")
+        if query is not None and filters:
+            raise ValueError("pass either a TraceQuery or keyword filters, not both")
+        return self._instance.fetch(query if query is not None else TraceQuery(**filters))
+```
+
+- `base.py` imports `FetchedSpan`/`TraceQuery` from `.fetch`. There is no import cycle: `fetch.py`
+  imports only stdlib and pydantic.
+- Unknown keyword filters raise Pydantic's `ValidationError`, because `TraceQuery` is built from them.
+- `query` combined with keyword filters raises `ValueError` (design.md §Public API).
+
+### `LangFuse.fetch` → `LangfuseTraceFetcher`
+
+```python
+class LangfuseTraceFetcher:
+    _PAGE_SIZE = 100
+    _FIELDS = "core,basic,time,io,metadata,model,usage,metrics"
+    _EXPAND_METADATA = "attributes"           # metadata values over 200 chars are truncated unless listed"
+    _TYPES = {SpanKind.AGENT: "AGENT", SpanKind.LLM: "GENERATION", SpanKind.TOOL: "TOOL"}
+
+    def __init__(self, client: "Langfuse"): ...
+    def fetch(self, query: TraceQuery) -> list[FetchedSpan]: ...
+    def _types(self, query) -> list[str | None]: ...      # [None] when kinds is None or contains SPAN
+    def _pages(self, query, start, end, langfuse_type, trace_id) -> Iterator[Any]: ...
+    def _to_span(self, observation) -> FetchedSpan: ...
+```
+
+- `LangFuse.fetch(query)` returns `LangfuseTraceFetcher(self._client).fetch(query)`. `self._client` is
+  the client `init()` builds with `get_client()` (`trace/langfuse/langfuse.py:24`).
+- Request matrix: `for type in _types(query)` × `for trace_id in query.trace_ids or [None]`. Each cell
+  runs one cursor loop over `client.api.observations.get_many(...)` with these parameters:
+  - `fields=_FIELDS`, `expand_metadata=_EXPAND_METADATA`, `limit=min(100, query.limit)`, `cursor`
+  - `type`, `trace_id`, `session_id=query.session_id`, `name=query.name`
+  - `from_start_time=start`, `to_start_time=end`
+- Each observation is dropped unless `query.matches(span)`. Each loop stops when the cursor is empty, the
+  page is empty, the cursor repeats the previous one, or that cell has accepted `query.limit` spans.
+  - The repeated-cursor stop matters because local filtering can keep `limit` from ever being reached; a
+    backend that returned the same cursor would otherwise page forever. Langfuse pages newest first, so the newest spans are seen first.
+- Merge: `dict.setdefault(span_id, span)`, then `FetchedSpan.oldest_first(...)[-limit:]`.
+- `_to_span` field mapping:
+
+  | `FetchedSpan` | from the observation |
+  |---|---|
+  | `trace_id`, `span_id` | `trace_id`, `id` |
+  | `parent_span_id` | `parent_observation_id` |
+  | `kind` | `_TYPES` reversed, default `span` |
+  | `session_id`, `input`, `output` | same-named fields, read with `getattr`, default `None` |
+  | `usage` | `_usage`: `SpanUsage.of(usage_details["input"], ["output"], ["total"], cost=total_cost, else cost_details["total"])` |
+  | `attributes` | `metadata["attributes"]` if `metadata` is a dict holding that key, else `metadata`, else `{}` |
+  | `raw` | `observation.model_dump(mode="json", exclude_none=True)` |
+
+### `Logfire.fetch` → `LogfireTraceFetcher`
+
+```python
+class LogfireTraceFetcher:
+    READ_TOKEN_ENV = "LOGFIRE_READ_TOKEN"
+    _MAX_ROWS = 10_000
+    _COLUMNS = "trace_id, span_id, parent_span_id, span_name, message, start_timestamp, end_timestamp, attributes, tags, otel_scope_name"
+    _KIND_SQL: dict[SpanKind, str]            # SQL equivalents of OTelSpanClassifier rows 1–5
+
+    def __init__(self, read_token: str | None = None, base_url: str | None = None): ...
+    def fetch(self, query: TraceQuery) -> list[FetchedSpan]: ...
+    def _sql(self, query, limit: int, before: datetime | None) -> str: ...
+    @staticmethod
+    def _literal(value: str) -> str: ...      # "'" + value.replace("'", "''") + "'"
+    def _to_span(self, row: dict) -> FetchedSpan: ...
+```
+
+- Token: the constructor argument, else `os.getenv("LOGFIRE_READ_TOKEN")`, per design.md
+  §Configuration (credentials come from the environment, as on the send side).
+- Client: `from logfire.experimental.query_client import LogfireQueryClient`. That path exists in
+  every `logfire>=3.0`; `logfire.query_client` is a later alias. Used as a context manager, with
+  `base_url=None` letting the SDK take the region from the token.
+- SQL shape:
+  `SELECT {_COLUMNS} FROM records WHERE kind = 'span' AND … ORDER BY start_timestamp DESC LIMIT {page}`,
+  plus these conditions:
+
+  | Query field | Condition |
+  |---|---|
+  | `kinds` without `span` | `(_KIND_SQL[k1] OR _KIND_SQL[k2] …)` |
+  | `kinds` with `span` | `(NOT COALESCE(<all three _KIND_SQL OR'd>, false) OR <requested non-span kinds>)` |
+  | `name` | `(span_name = 'x' OR message = 'x')` |
+  | `trace_ids` | `trace_id IN ('a', 'b')` |
+  | `session_id` | `trace_id IN (SELECT trace_id FROM records WHERE attributes->>'session_id' = 's')` |
+  | page cursor | `start_timestamp <= '<iso>'` |
+
+  - `_KIND_SQL[TOOL]`: `gen_ai.operation.name = 'execute_tool'` OR `openinference.span.kind = 'TOOL'`
+    OR `span_name LIKE 'Function:%'`.
+  - `_KIND_SQL[LLM]`: `gen_ai.operation.name IN ('chat','text_completion','generate_content')` OR
+    `openinference.span.kind = 'LLM'` OR `array_has(tags, 'LLM')`.
+  - `_KIND_SQL[AGENT]`: `gen_ai.operation.name IN ('invoke_agent','create_agent')` OR
+    `openinference.span.kind = 'AGENT'` OR `span_name LIKE 'Agent run:%'`.
+  - The window is passed as `min_timestamp=start, max_timestamp=end`, never in SQL, so Logfire's
+    timestamp index is used.
+- Paging loop: `page = min(_MAX_ROWS, limit - accepted)`. After each page:
+  1. Drop rows whose span id was already seen.
+  2. Accept the fresh spans that `query.accepts`, setting `span.session_id = span.session_id or query.session_id`.
+  3. Set `before = min(start_time of fresh rows)`.
+  4. Stop when `len(rows) < page`, when no fresh row has a start time, or when `limit` is reached.
+
+  Rows at the boundary timestamp are re-read and skipped. A page made only of already-seen rows ends
+  the loop, so it can't spin forever on a block of identical timestamps.
+- `_to_span`:
+  - `attributes` = `row["attributes"]`, JSON-decoded if it arrives as a string.
+  - Classification uses `{**attributes, "logfire.msg_template": span_name, "logfire.tags": tags or []}`.
+    Logfire stores the template as `span_name` and tags in their own column.
+  - `name` = `message` (the formatted message), else `span_name`.
+  - `usage` = `OTelSpanClassifier.usage(attributes)`.
+  - `raw` = the row as returned.
+
+#### Scrubbing fix (`trace/logfire/logfire.py`)
+
+```python
+logfire.configure(
+    service_name="AgentKernel",
+    send_to_logfire="if-token-present",
+    scrubbing=logfire.ScrubbingOptions(callback=Logfire._keep_session_id),
+)
+
+@staticmethod
+def _keep_session_id(match):            # logfire.ScrubMatch
+    return match.value if match.path == ("attributes", "session_id") else None
+```
+
+- Returning `None` keeps Logfire's redaction for every other match (the `ScrubbingOptions.callback`
+  contract). The once-guard (`trace/logfire/logfire.py:29-31`) is unchanged.
+
+### `OpenLLMetry.fetch` → `TraceloopTraceFetcher`
+
+```python
+class TraceloopTraceFetcher:
+    DEFAULT_BASE_URL = "https://api.traceloop.com"
+    _PATH = "/v2/warehouse/spans"
+    _PAGE_SIZE = 500
+    _TIMEOUT = 60.0
+    _SESSION_ATTRIBUTE = "traceloop.association.properties.session_id"
+    _OPERATIONS = {SpanKind.AGENT: ["invoke_agent", "create_agent"],
+                   SpanKind.LLM: ["chat", "text_completion", "generate_content"],
+                   SpanKind.TOOL: ["execute_tool"]}
+
+    def __init__(self, api_key=None, base_url=None, transport: httpx.BaseTransport | None = None): ...
+    def fetch(self, query: TraceQuery) -> list[FetchedSpan]: ...
+    def _params(self, query, start, end) -> dict: ...
+    def _pages(self, client: httpx.Client, params: dict) -> Iterator[dict]: ...
+    def _to_span(self, item: dict) -> FetchedSpan: ...
+    @staticmethod
+    def _timestamp(value) -> datetime | None: ...
+```
+
+- Credentials:
+  - API key: the argument, else `TRACELOOP_API_KEY`.
+  - Base URL: the argument, else `TRACELOOP_BASE_URL`, else `DEFAULT_BASE_URL`.
+  - These are the variables the SDK itself reads (`traceloop/sdk/__init__.py:120-121` in traceloop-sdk
+    0.62.3).
+  - `transport` exists only so tests can inject an `httpx.MockTransport`.
+- Request: `httpx.Client(base_url=..., headers={"Authorization": f"Bearer {key}"}, timeout=60)`, with
+  these params:
+  - `from_timestamp_sec` / `to_timestamp_sec`: `int(start.timestamp())` / `math.ceil(end.timestamp())`, so
+    the last partial second isn't cut off; the exact end is applied locally
+  - `limit`: `min(500, query.limit)`
+  - `sort_by=timestamp`, `sort_order=desc`
+  - `span_name`: when `name` is set
+  - `filters`: a JSON list of `{id, operator, value}`:
+    - `kinds` without `span` → `gen_ai.operation.name in [ops…]`
+    - `session_id` → `_SESSION_ATTRIBUTE equals …`
+    - `trace_ids` → `trace_id in […]`
+- Pagination: response body `{"spans": {"data": [...], "next_cursor": ...}}`. A body without `spans`
+  is read as the page itself. The loop stops on a missing cursor, empty data, or a cursor equal to the
+  one just sent, and otherwise re-sends the same params with `cursor=...`.
+- Local re-check: drop a span unless `query.matches(span)`. Stop once `limit` spans are accepted; with
+  descending order these are the most recent.
+- `_to_span`:
+  - `attributes` = `span_attributes`, JSON-decoded if it arrives as a string.
+  - `parent_span_id` = `parent_span_id or None` (the API may return `""` for a root span).
+  - `input`/`output` = the item's top-level `input`/`output` when not `None`, else `OTelSpanClassifier.io`.
+  - `end_time` = `start_time + timedelta(milliseconds=duration_ms)` when both are known.
+  - `usage` = `OTelSpanClassifier.usage(attributes)`. Top-level warehouse columns (the API sorts by
+    `total_tokens`) are not read: their names are undocumented.
+- `_timestamp`, because the warehouse format is undocumented:
+  - A non-numeric string → `datetime.fromisoformat` (with `Z` → `+00:00`).
+  - A number → epoch ns if `> 1e17`, µs if `> 1e14`, ms if `> 1e11`, otherwise seconds; always UTC.
+
+### `CloudWatch.fetch` → `CloudWatchTraceFetcher`
+
+```python
+class CloudWatchTraceFetcher:
+    LOG_GROUP = "aws/spans"
+    _MAX_ROWS = 10_000
+    _POLL_INTERVAL = 1.0
+    _END_PADDING = timedelta(minutes=15)
+    _FAILED = {"Failed", "Cancelled", "Timeout", "Unknown"}
+    _KIND_FILTERS: dict[SpanKind, str]        # Logs Insights equivalents of OTelSpanClassifier rows 1 and 3
+
+    def __init__(self, client=None, region: str | None = None, log_group: str = LOG_GROUP, timeout: float = 120.0): ...
+    def fetch(self, query: TraceQuery) -> list[FetchedSpan]: ...
+    def _create_client(self): ...                      # botocore "logs" client, region via CloudWatch.region()
+    def _run(self, client, query_string: str, start: datetime, end: datetime) -> list[dict[str, str]]: ...
+    def _insights(self, query: TraceQuery, limit: int) -> str: ...
+    @staticmethod
+    def _literal(value: str) -> str: ...               # json.dumps(value)
+    @staticmethod
+    def _matches(query, span, start, end) -> bool: ...  # window on start_time, session, kind
+    def _to_span(self, row: dict) -> tuple[datetime | None, FetchedSpan]: ...  # (@timestamp, span)
+    @classmethod
+    def _flatten(cls, attributes: dict, prefix: str = "") -> dict: ...
+    @staticmethod
+    def _nanos(value) -> datetime | None: ...
+    @staticmethod
+    def _stamp(value: str | None) -> datetime | None: ...
+```
+
+```python
+# trace/cloudwatch/cloudwatch.py
+class CloudWatch(BaseTrace):
+    @staticmethod
+    def region(botocore_session: BotocoreSession) -> str | None:
+        return os.environ.get("AWS_REGION") or botocore_session.get_config_variable("region")
+
+    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+        from .fetch import CloudWatchTraceFetcher
+        return CloudWatchTraceFetcher().fetch(query)
+```
+
+- `CloudWatch.region()` is the expression `_exporter()` used inline (`trace/cloudwatch/cloudwatch.py:137`),
+  lifted out unchanged. `_exporter()` keeps its own missing-region and malformed-region errors; botocore
+  validates the region name for the fetcher's client.
+- Client: the injected `client` if given. Otherwise `BotocoreSession().create_client("logs", region_name=...)`,
+  with the region from the argument, else `CloudWatch.region()`. No region → `AKConfigError`.
+  - The constructor arguments exist for callers that manage their own AWS sessions, and for tests.
+- One Logs Insights query (`_run`):
+  1. `client.start_query(logGroupName=log_group, startTime=floor(start), endTime=ceil(end), queryString=...)`,
+     with times in epoch seconds. AWS treats both ends as inclusive. A `ResourceNotFoundException`
+     becomes `AKConfigError` (§Phase 1 error handling); `botocore.exceptions` is imported inside `_run`,
+     keeping rule 2.
+  2. Poll `client.get_query_results(queryId=...)` every `_POLL_INTERVAL` seconds.
+     - `Complete` → rows, each turned into a `{field: value}` dict.
+     - A status in `_FAILED` → `RuntimeError` naming it.
+     - Still running when `timeout` elapses → `client.stop_query(queryId=...)`, then `TimeoutError`.
+- Query string, joined with ` | `:
+
+  | Part | Logs Insights |
+  |---|---|
+  | always | `fields @timestamp, @message` … `sort @timestamp desc` … `limit {page}` |
+  | `kinds` without `span` | `filter <_KIND_FILTERS[k1]> or <_KIND_FILTERS[k2]> …` |
+  | `kinds` with `span` | no kind filter; kinds are checked locally |
+  | `name` | `filter name = "x"` |
+  | `trace_ids` | `filter traceId in ["a", "b"]` |
+  | `session_id` | `filter attributes.session.id = "s"` |
+
+  - `_KIND_FILTERS[TOOL]`: `attributes.gen_ai.operation.name = "execute_tool"` or
+    `attributes.openinference.span.kind = "TOOL"`.
+  - `_KIND_FILTERS[LLM]`: `attributes.gen_ai.operation.name in ["chat", "text_completion", "generate_content"]`
+    or `attributes.openinference.span.kind = "LLM"`.
+  - `_KIND_FILTERS[AGENT]`: `attributes.gen_ai.operation.name in ["invoke_agent", "create_agent"]` or
+    `attributes.openinference.span.kind = "AGENT"`.
+  - Traceloop and Logfire conventions are left out: no CloudWatch runner emits them.
+  - Literals are `json.dumps(str(value))`: double-quoted, with `"` and `\` backslash-escaped.
+  - The session filter needs no trace subquery (Logs Insights has none anyway), because
+    `SessionSpanProcessor` stamps `session.id` onto every span of a run (`trace/cloudwatch/cloudwatch.py:35-44`).
+- Window and paging (`fetch`):
+  - The first query's range is `[start, before]` with `before = max(end, min(end + _END_PADDING, now))`.
+    `@timestamp`'s relation to the span start is not documented, so the range runs past `end`, and
+    `_matches` applies `start <= start_time < end` locally on `startTimeUnixNano`.
+  - `page = min(_MAX_ROWS, limit - accepted)`. After each page:
+    1. Drop rows whose span id was already seen.
+    2. Accept the fresh spans that `_matches`, setting `span.session_id = span.session_id or query.session_id`.
+    3. Set `before = min(@timestamp of fresh rows)`. The next query's `endTime` is `ceil(before)`, so rows
+       in the boundary second are re-read and skipped by span id.
+    4. Stop when `len(rows) < page`, when no fresh row has a `@timestamp`, or when `limit` is reached.
+       A full page with no fresh rows (more than `page` spans in one second) logs a warning and stops.
+  - 10,000-row pages: `StartQuery` now accepts `limit` up to 100,000, but `GetQueryResults` returns at
+    most 10,000 rows per call and needs `nextToken` beyond that, which botocore releases inside the
+    `cloudwatch` extra's `>=1.41.4` range may not model (`research/provider-read-apis.md` §6).
+- `_to_span`:
+  - `raw` = `json.loads(row["@message"])`, the span's OTel JSON.
+  - `attributes` = `_flatten(raw["attributes"])`: nested dicts become dotted keys, flat keys stay as
+    they are, so the classifier sees `openinference.span.kind` either way.
+  - `trace_id`, `span_id`, `name` = `traceId`, `spanId`, `name`; `parent_span_id` = `parentSpanId or None`.
+  - `start_time` / `end_time` = `startTimeUnixNano` / `endTimeUnixNano` (int or numeric string), as UTC.
+  - `kind`, `input`, `output`, `session_id`, `usage` from `OTelSpanClassifier`.
+  - The `@timestamp` cell (`"YYYY-MM-DD HH:MM:SS.mmm"`, UTC) is parsed with `datetime.fromisoformat` and
+    used only for paging.
+
+### `trace/testing.py`: `TraceFetchContract`
+
+```python
+class TraceFetchContract:                          # not prefixed Test: pytest collects only subclasses
+    @pytest.fixture
+    def tracer(self) -> BaseTrace: ...             # subclasses override
+    def seed(self, tracer: BaseTrace, spans: list[FetchedSpan]) -> None: ...   # subclasses override
+    @staticmethod
+    def contract_span(span_id, minute, kind=SpanKind.SPAN, trace_id="t1", session_id="s1", name=None) -> FetchedSpan: ...
+    @staticmethod
+    def window(**filters) -> TraceQuery: ...       # 2026-01-01 11:00–12:00 UTC plus filters
+
+    def test_contract_returns_spans_oldest_first(self, tracer): ...
+    def test_contract_window_is_start_inclusive_end_exclusive(self, tracer): ...
+    def test_contract_limit_keeps_the_most_recent(self, tracer): ...
+    def test_contract_kind_filter(self, tracer): ...           # tool; llm + agent; span = everything else
+    def test_contract_session_filter(self, tracer): ...        # incl. a span with no session id: excluded
+    def test_contract_trace_id_filter(self, tracer): ...
+    def test_contract_name_filter(self, tracer): ...           # incl. a span with no name: excluded
+    def test_contract_empty_backend_returns_nothing(self, tracer): ...
+```
+
+- Same shape as `SecretProviderContract` (`secret/testing.py:15`): public, imports `pytest`, so imported
+  from test code only; the subclass supplies the fixture and the seeding hook.
+- `seed` gets `FetchedSpan`s with ids, name, kind, times and session; a backend with its own vocabulary
+  maps them on the way in (Langfuse types, Traceloop `gen_ai.operation.name`), as the instrumentation would.
+- `tracer` may be any object with `fetch(query)`; the Traceloop subclass passes the fetcher itself,
+  because `OpenLLMetry.fetch` builds its fetcher without a transport.
+- Subclasses (`tests/test_trace_fetch_contract.py`):
+  - `TestInMemoryTraceContract`: `InMemoryTrace(BaseTrace)`, whose `fetch` is
+    `FetchedSpan.oldest_first(s for s in spans if query.matches(s))[-query.limit:]`. This is also the
+    bring-your-own example in the docs.
+  - `TestLangfuseFetchContract`: a `LangFuse` with `_client` replaced by a fake `api.observations.get_many`
+    (single-value filters, both window bounds inclusive, newest first, offset cursor).
+  - `TestTraceloopFetchContract`: `TraceloopTraceFetcher` over an `httpx.MockTransport` fake warehouse
+    (whole-second inclusive bounds, `filters` JSON `in`/`equals`, newest first, offset cursor).
+  - Logfire and CloudWatch don't subclass it: a faithful fake would re-implement SQL and Logs Insights.
+
+### Langfuse flush on AWS Lambda (`trace/langfuse/`)
+
+```python
+class LangFuse(BaseTrace):
+    @staticmethod
+    def flush_on_lambda(client: Langfuse) -> None:
+        if "AWS_LAMBDA_FUNCTION_NAME" not in os.environ:
+            return
+        try:
+            client.flush()
+        except Exception:      # an exporter error must not replace the agent's reply
+            logging.getLogger("ak.trace.langfuse").warning("Flushing Langfuse spans after the run failed", exc_info=True)
+
+# each of the six runners
+async def run(self, agent, session, requests):
+    try:
+        with propagate_attributes(session_id=session.id, tags=["agentkernel"]):
+            with self._client.start_as_current_observation(name="Agent Kernel <Framework>", as_type="span") as span:
+                result = await super().run(agent, session, requests)
+                span.update(input=result.prompt, output=str(result))
+    finally:
+        LangFuse.flush_on_lambda(self._client)
+    return result
+```
+
+- The environment check runs per call (one dict lookup), so a process started outside Lambda never
+  flushes.
+- The runners import `LangFuse` from `.langfuse`; `langfuse.py` imports the runners only lazily inside its
+  framework methods, so there is no import cycle. Existing patch targets
+  (`agentkernel.trace.langfuse.<framework>.propagate_attributes`) are unchanged.
+- The broad `except` is deliberate: the flush runs in a `finally`, so a raise there would replace the
+  agent's reply (or its original exception).
+
+### Consumer changes
+
+- **No framework Module, runner or API surface changes.** Traced runners keep using
+  `Trace.get().<framework>()` exactly as today. `fetch` is a new entry point with no existing callers.
+- Bring-your-own `BaseTrace` subclasses keep working unchanged (`fetch` has a default).
+  `tests/test_trace.py`'s `_FakeTrace` (`tests/test_trace.py:15-40`) does not need to change.
+
+### Config changes
+
+- No `AKConfig` changes. `_TraceConfig` (`core/config.py:468-473`) keeps its `enabled` and `type`
+  fields, defaults and descriptions.
+- New environment variable `LOGFIRE_READ_TOKEN`, read only by `LogfireTraceFetcher`.
+  - It is not an `AK_*` variable, because it is the provider's own credential, like `LOGFIRE_TOKEN` and
+    `TRACELOOP_API_KEY`.
+  - It can't be derived from `LOGFIRE_TOKEN` (a write token cannot read).
+- `TRACELOOP_API_KEY` and `TRACELOOP_BASE_URL` are reused. Langfuse's `LANGFUSE_*` are reused through
+  its client. CloudWatch reuses the standard AWS chain and `AWS_REGION`, as its exporter does.
+- `ak-py/pyproject.toml`: `openllmetry` and `logfire` extras gain `"httpx>=0.27.0"`, the same bound the
+  `api` and messaging extras (`slack`, `whatsapp`, `messenger`, …) already use. `uv.lock` is regenerated.
+  The `cloudwatch` extra (`ak-py/pyproject.toml:37-42`) is unchanged: its `botocore` provides the
+  CloudWatch Logs client.
+- Existing YAML and env vars are unaffected.
+
+### Behavioural changes
+
+1. **Logfire now exports AK's session id unscrubbed.**
+   - Before: the wrapper span's `session_id` attribute reached Logfire as
+     `"[Scrubbed due to 'session']"`.
+   - After: it carries the real session id.
+   - Intentional: without it, Logfire traces can't be filtered by session in Fetch or in the Logfire
+     UI.
+   - Privacy: session ids are **not** guaranteed to be opaque. `BaseChatRequest.session_id` is any client
+     string (`core/model.py:403`), and the session guide suggests deriving it from a user id
+     (`docs/docs/core-concepts/session.md:109`). Langfuse, Traceloop and CloudWatch already export it
+     unscrubbed. So this change makes Logfire match them and adds no new kind of exposure. It is not
+     opt-in, because a config flag for one tracer would leave the other three as they are.
+     §Fetching Spans Back says the session id reaches every tracing provider as given, and tells users
+     to keep personal data out of it (e.g. use a hash or a random id).
+   - Every other scrub match is still redacted.
+2. **`pip install agentkernel[openllmetry]` / `[logfire]` now install `httpx`.** Intentional, because
+   the fetchers need it. In practice it is usually already present transitively, through
+   `langfuse`/`openai`.
+3. **Langfuse runners on AWS Lambda flush after every run.** Before: spans waited for the background
+   exporter, which a frozen Lambda sandbox never runs, so they arrived on the next invocation or were lost.
+   After: each run ends with one export round trip on Lambda. Intentional (design.md §Langfuse flush).
+   Off Lambda nothing changes.
+4. **CloudWatch fetching needs IAM read permissions the send side does not.** `logs:StartQuery`,
+   `logs:GetQueryResults` and `logs:StopQuery` on `aws/spans`; `AWSXrayWriteOnlyAccess` grants none of
+   them. Documented, not enforced.
+
+**Non-changes:**
+- Span export, runner wrapping and instrumentation for all four providers are unchanged, apart from
+  changes 1 and 3. `CloudWatch._exporter()` resolves the region exactly as before, through `CloudWatch.region()`.
+- The `BaseTrace` abstract surface is unchanged: the seven abstract methods stay; `fetch` is concrete.
+- The `Trace.get()`/`Trace._build()` selection logic and `_BUILTIN_TRACERS` are unchanged.
+- No data written before this change is altered. Spans already in Logfire keep their scrubbed session
+  value, so a session filter does not match runs recorded before the upgrade.
+
+## Phase 1 error handling
+
+| Situation | Surfaces as |
+|---|---|
+| `Trace.fetch` with `trace.enabled: false` | `AKConfigError("cannot fetch spans: tracing is disabled …")` |
+| Bring-your-own tracer without `fetch` | `NotImplementedError("<Class> does not support fetching spans")` |
+| Bad filter value (`limit=0`, unknown kind, unknown kwarg) | Pydantic `ValidationError` from `TraceQuery` |
+| `start >= end` | `ValueError` from `TraceQuery.window()`, raised before any network call |
+| Logfire with no read token | `AKConfigError` naming `LOGFIRE_READ_TOKEN`, raised before the SDK import |
+| Traceloop with no API key | `AKConfigError` naming `TRACELOOP_API_KEY`, raised before any request |
+| CloudWatch with no AWS region | `AKConfigError` naming `AWS_REGION`, raised before any request |
+| CloudWatch log group missing (`StartQuery` raises `ClientError` code `ResourceNotFoundException`) | `AKConfigError` naming the log group and saying to enable Transaction Search and make the spans reach X-Ray; chained from the `ClientError`. Any other `ClientError` propagates unchanged |
+| CloudWatch query ends `Failed`/`Cancelled`/`Timeout`/`Unknown` | `RuntimeError` naming the status and log group |
+| CloudWatch query still running at `timeout` | `StopQuery`, then `TimeoutError` |
+| `logfire` extra missing on the fetch path | `ImportError` from the lazy import. Unreachable through `Trace`, since `Trace._build` already wraps the tracer import in `require_extra("logfire", …)` (`trace/trace.py:51-53`) |
+| Provider errors (HTTP 4xx/5xx, rate limits, auth) | Propagated unchanged: Langfuse SDK `ApiError`, Logfire `QueryRequestError`/`QueryExecutionError`, `httpx.HTTPStatusError` from `raise_for_status()`, botocore `ClientError` (e.g. `AccessDeniedException`, `ResourceNotFoundException` when Transaction Search was never enabled, `ThrottlingException`) and `NoCredentialsError`. No retries |
+| Langfuse not yet authenticated | Can't happen through `Trace.get()`: `init()` already raises if `auth_check()` fails (`trace/langfuse/langfuse.py:25-28`) |
+
+- Concurrency: the Logfire and Traceloop fetchers build their own HTTP/query client per `fetch` call
+  and hold no shared mutable state, so concurrent calls are independent. So does the CloudWatch fetcher
+  when it builds its own client; an injected botocore client is shared, and botocore clients are
+  thread-safe. The Langfuse fetcher reuses
+  the tracer's shared SDK client and adds no state of its own. Whether that client is safe to share
+  across threads is the SDK's own guarantee, not checked here.
+- Cost: `fetch` adds no work to the agent hot path. It runs only when called. Each call makes
+  `ceil(matches / page size)` requests per request-matrix cell (Langfuse) or per page (Logfire,
+  Traceloop). A CloudWatch page is one `StartQuery` plus one `GetQueryResults` per second until it
+  completes, and Logs Insights bills by data scanned, so the cost grows with the window.
+
+## Phase 1 testing
+
+**New `ak-py/tests/test_trace_fetch.py`** (no provider SDK needed):
+
+- `TestTraceQuery`:
+  - default window = last hour before `end`
+  - naive → UTC
+  - `start >= end` raises
+  - string kinds coerce
+- `TestOTelSpanClassifier`:
+  - parametrized over the attribute shapes in `research/span-formats.md` §3–§4: OpenInference
+    TOOL/LLM/CHAIN, Traceloop tool/workflow, gen_ai chat/invoke_agent, Logfire `Function:`/`Agent run:`
+    templates, Logfire `LLM` tag, empty attributes
+  - IO precedence
+  - session-id keys
+  - `usage` over the captured shapes: OpenInference tokens (total derived), GenAI tokens with
+    `operation.cost`, numeric strings, and `None` for the two roll-ups and for non-numeric values
+  - `SpanUsage.of` keeps a partial value without inventing a total
+- `TestTraceFetch`:
+  - disabled tracing raises `AKConfigError`
+  - kwargs build a `TraceQuery`
+  - an explicit query is passed through
+  - `query` plus keyword filters raises `ValueError`
+  - the default `BaseTrace.fetch` raises `NotImplementedError`
+- `TestLangfuseFetcher` (a `MagicMock` client):
+  - cursor followed
+  - parameter translation
+  - one request per type × trace id
+  - `span` kind → `type=None` plus local filtering
+  - `limit=1` keeps the newest span and stops after one page
+  - `usage_details` + `total_cost` mapped to `SpanUsage`; an observation without them → `None`
+- `TestLogfireFetcher` (fake `logfire`, `logfire.experimental` and `logfire.experimental.query_client`
+  modules in `sys.modules`):
+  - missing token raises
+  - window passed as `min_timestamp`/`max_timestamp`
+  - kind and session SQL present
+  - backward paging past a patched `_MAX_ROWS = 2`, with boundary dedupe and the `start_timestamp <=`
+    cursor
+  - literal escaping
+  - `NOT COALESCE` for `span`
+  - `gen_ai.usage.*` attributes mapped to `usage`
+- `TestTraceloopFetcher` (`httpx.MockTransport`):
+  - missing key raises
+  - Bearer header, timestamp params and `filters` JSON
+  - cursor followed
+  - LLM and other-session spans dropped locally
+  - `end_time` from `duration_ms`
+  - empty parent → `None`
+  - `_timestamp` over ISO / s / ms / µs / ns
+- `TestCloudWatchFetcher` (a `MagicMock` botocore `logs` client):
+  - missing region raises `AKConfigError`
+  - `start_query` gets `aws/spans`, the window start, an end at or past the window end, and the kind
+    and session filters
+  - nested `openinference` attributes flattened and classified; LLM span dropped locally
+  - nested `llm.token_count` attributes flattened into `usage`
+  - `startTimeUnixNano` as a string, `endTimeUnixNano` as an int; empty parent → `None`
+  - a span started after `end` (but stamped inside the range) is dropped
+  - backward paging past a patched `_MAX_ROWS = 2`: boundary dedupe, next `endTime` = the page's oldest
+    `@timestamp`
+  - `Failed` status → `RuntimeError`; `timeout=0` → `stop_query` then `TimeoutError`
+  - `ResourceNotFoundException` from `start_query` → `AKConfigError` mentioning Transaction Search; an
+    `AccessDeniedException` propagates as `ClientError`
+  - literal escaping, `traceId in [...]`, and no kind filter when `span` is requested
+- `FetchedSpan.oldest_first` with a missing `start_time`.
+- `TraceQuery.matches`: each filter rejects, start inclusive, end exclusive; a span with no
+  `start_time` is rejected; with `session_id`/`name` set, a span reporting `None` for that field is
+  rejected; with the filter unset, `None` is accepted.
+- Langfuse: `expand_metadata="attributes"` is sent; a repeated cursor ends paging (a fake that always
+  returns the same cursor with out-of-window observations makes exactly two calls).
+
+**New `ak-py/tests/test_trace_fetch_contract.py`:** the three `TraceFetchContract` subclasses
+(§`trace/testing.py`).
+
+**New `ak-py/tests/test_trace_langfuse_flush.py`:** `TestLangFuseLambdaFlush`, parametrized over all six
+Langfuse runners (OpenAI, LangGraph, CrewAI, ADK, Smolagents, Pydantic AI), because each one carries its
+own `finally`:
+
+- For each runner: `propagate_attributes` patched in that runner's module (the existing patch target),
+  the parent runner's `run` patched to return a result or to raise, and `LangFuse.flush_on_lambda`
+  spied on.
+  - Success and failure paths both call `flush_on_lambda(client)` exactly once. On failure, the original
+    exception still propagates.
+- A runner whose framework extra is missing is skipped with `pytest.importorskip`, so the suite runs in
+  any environment.
+- `flush_on_lambda` itself, tested once: it flushes when `AWS_LAMBDA_FUNCTION_NAME` is set, doesn't
+  flush when it isn't, and logs a failing flush instead of raising it.
+
+**Changed `ak-py/tests/test_trace_logfire.py`:**
+
+- The `fake_logfire` fixture (`tests/test_trace_logfire.py:23-38`) adds
+  `fake.ScrubbingOptions = MagicMock(side_effect=lambda **kw: kw)`. Without it, `init()` raises
+  `AttributeError` against the fake module.
+- New `test_init_keeps_session_id_from_scrubbing`: the callback returns the value for
+  `("attributes", "session_id")` and `None` for `("attributes", "session_token")`.
+- The existing `configure.assert_called_once()` assertions (`:56`, `:66`) stay valid.
+
+**Run:**
+
+```bash
+cd ak-py && uv run pytest tests/test_trace_fetch.py tests/test_trace_fetch_contract.py tests/test_trace_logfire.py tests/test_trace.py tests/test_trace_langfuse_langgraph.py tests/test_trace_langfuse_flush.py tests/test_trace_cloudwatch.py
+make lint-check-all   # from the repo root
+```
+
+**Before merge, manual live checks** (not CI; they need accounts): run `Trace.get().fetch(kinds=["tool"])`
+against each provider after a real agent run, and tick off `research/provider-read-apis.md` §5 and §6:
+- Langfuse maps our spans to type `TOOL`.
+- Logfire `attributes->>` access works and the session subquery matches.
+- Traceloop accepts the `gen_ai.operation.name` / association-property / `trace_id` filter ids.
+- CloudWatch: the `@message` shape, that the dotted `attributes.*` filters match, and what `@timestamp`
+  is for a span.
+
+## Phases 2–3 design (example)
+
+Phases 2 and 3 add no Agent Kernel core code. Everything below lives in
+`examples/aws-serverless/langfuse-trace-evaluation/` and uses only public AK API: `Trace.get().fetch(...)`,
+`FetchedSpan`, `SpanKind`, `SpanUsage`, `OTelSpanClassifier`, `AKEvaluator`, `AKEvaluationCase`,
+`AKEvaluationResult`, `AKMetricNotSupported`, `AKTestConfig`, `Lambda`, `ServerlessAgentRunner` and
+`ResponseHandler`.
+
+The agent is deployed in queue mode (`queue_mode = true`, `execution_mode = "rest_sync"`), so three Lambdas
+share one API Gateway. The request handler serves the agent's ingress (`POST /api/v1/chat`, enqueued to SQS
+and answered from the response store) and two custom routes: `POST /api/v1/eval` starts grading one
+session's traces in an asynchronous self-invocation, and `GET /api/v1/check` reports whether every request
+of that session has been graded. The agent runner runs the agent and sends its Langfuse traces; the
+response handler stores each reply. Nothing runs on a schedule.
+
+### Example layout
+
+```
+examples/aws-serverless/langfuse-trace-evaluation/
+├── README.md
+├── pyproject.toml           # runtime dependencies; dev group
+├── uv.lock
+├── build.sh                 # test venv: uv sync (or the local ak-py wheel with `local`)
+├── config.yaml              # AKConfig: queue mode (SQS, Redis session and response stores), Langfuse tracing
+├── lambda_request_handler.py   # registers /eval, /check and the internal /grade; handler = Lambda.handler
+├── lambda_agent_runner.py      # the agent and ServerlessAgentRunner.handle
+├── lambda_response_handler.py  # ResponseHandler.handle
+├── simulate_traffic.py      # TrafficSimulator: 3 questions under one session id
+├── evaluator/
+│   ├── __init__.py
+│   ├── api.py               # EvaluationAPI: /eval, /check and the internal /grade
+│   ├── job.py               # TraceEvaluationJob, PrepareSummary, GradeSummary
+│   ├── case.py              # ToolCall, TraceCase, TraceEvaluationCase
+│   ├── opik_evaluator.py    # OpikTraceEvaluator (not opik.py, which would shadow the SDK)
+│   └── store.py             # EvaluationStore, Progress, TraceProgress
+├── tests/
+│   └── test_evaluator.py    # unit tests, no cloud access
+├── lambda_test.py           # weekly integration test, with its EvaluationClient helper
+└── deploy/
+    ├── main.tf  variables.tf  outputs.tf  providers.tf  backend.tf  terraform.tfvars
+    ├── deploy.sh
+    └── Dockerfile.{request_handler,agent_runner}  # images; the response handler is a local zip
+```
+
+### Rules
+
+1. **No AK core changes.** If the example needs something AK lacks, it is raised as a design.md open
+   question, not patched in core inside this change.
+2. **Classes, not scripts; simple entry points.** Each component below is a class. The `lambda_*.py`
+   entry points stay as simple as the siblings': `lambda_request_handler.py` registers one small
+   `@Lambda.register` function per route, each delegating to an `EvaluationAPI` method, and exposes the
+   stock `handler = Lambda.handler`.
+3. **Configuration from the environment only.** `EvaluationAPI.from_env()` and
+   `TraceEvaluationJob.from_env()` are the only places that read environment variables; the other
+   classes take constructor parameters, so the unit tests build them directly.
+4. **Every write is idempotent**, and a trace's `graded` row is written in one `PutItem`, after all its
+   metrics are judged (§`evaluator/store.py`).
+5. **One bad trace or metric never fails the run; any other error fails it** and is reported through the
+   `/eval` response or the Lambda logs (§Phases 2–3 error handling).
+
+### The agent and the wiring (`lambda_*.py`, `config.yaml`)
+
+```python
+# lambda_agent_runner.py
+@function_tool
+def get_order_status(order_id: str) -> str: ...      # fixed table lookup: deterministic tool output
+
+support_agent = Agent(name="support", handoff_description="Order and delivery questions",
+                      tools=[get_order_status], model="gpt-4.1-mini", instructions=...)
+triage_agent = Agent(name="triage", handoffs=[support_agent], model="gpt-4.1-mini", instructions=...)
+OpenAIModule([triage_agent, support_agent])
+handler = ServerlessAgentRunner.handle
+
+# lambda_request_handler.py
+api = EvaluationAPI.from_env()
+
+@Lambda.register("/eval", method="POST")
+def start_evaluation(event, context): return api.start_evaluation(event, context)
+
+@Lambda.register("/check", method="GET")
+def check_progress(event, context): return api.check_progress(event, context)
+
+@Lambda.register("/grade", method="POST")      # internal: /eval invokes it; not exposed by API Gateway
+def grade_traces(event, context): return api.grade_traces(event, context)
+
+handler = Lambda.handler    # /chat (enqueued for the agent runner), /eval, /check and /grade
+
+# lambda_response_handler.py
+handler = ResponseHandler.handle
+```
+
+- The request handler never imports the agent: in queue mode it only enqueues `/chat` requests, so
+  `evaluator/` and Opik live in its image and the OpenAI Agents SDK only in the agent runner's.
+- `/grade` is a route like the others, so the grading invocation needs no custom entry point:
+  `Lambda.handler` dispatches by `path`. It is not in `gateway_endpoints`, so API Gateway never routes to
+  it; only the request handler's own asynchronous invocation reaches it.
+
+- `get_order_status` is the one module-level function: the OpenAI Agents SDK's `@function_tool` turns a
+  function into the tool.
+- `config.yaml` (shared by the three Lambdas): `trace: {enabled: true, type: langfuse}`, and the queue-mode
+  blocks of the `openai` / `scalable-openai` siblings: `execution.mode: rest_sync`, `execution.queues.type:
+  sqs` (URLs injected per Lambda), and Redis `session` and `execution.response_store` on the base
+  deployment's Redis cluster, with their own `ak:lf-trace-eval:` prefixes.
+- `get_order_status` knows `A-1001` (shipped, arriving Friday) and returns `"Order <id> not found"` for any
+  other id, so the traffic includes one tool result the agent must report honestly.
+- The Langfuse runners flush on Lambda themselves (Phase 1), so the agent runner needs no tracing code.
+
+### `simulate_traffic.py`: `TrafficSimulator`
+
+```python
+class TrafficSimulator:
+    QUESTIONS = (
+        "Where is my order A-1001?",               # hand-off + tool call
+        "Can you check order A-9999 for me?",      # tool returns "not found"
+        "Write me a poem about the ocean.",        # off-topic: should decline, no tool
+    )
+
+    def __init__(self, chat_url: str, session_id: str | None = None, transport: httpx.BaseTransport | None = None): ...
+    @property
+    def session_id(self) -> str: ...                 # the given id, or one uuid4 generated in __init__
+    def send_questions(self) -> list[str]: ...       # one POST per question, all under session_id; the replies
+    @classmethod
+    def chat_url_from_env(cls, deploy_dir: Path) -> str: ...   # AK_TEST_ENDPOINT, else terraform output
+    @classmethod
+    def cli(cls, argv: list[str] | None = None) -> int: ...
+
+if __name__ == "__main__":
+    sys.exit(TrafficSimulator.cli())
+```
+
+- `send_questions()`: POST `{"prompt": q, "session_id": self.session_id, "agent": "triage"}` to `chat_url` for each
+  question in order, with the sibling `APITestClient`'s retry (3 tries on 5xx and timeouts, 30 s timeout;
+  `examples/aws-serverless/openai-auth/lambda_test.py:31-62`). Each question is its own request, so each
+  becomes its own trace.
+- It knows nothing about `/eval` or `/check`.
+- `chat_url_from_env(deploy_dir)`: `os.getenv("AK_TEST_ENDPOINT")`, or `terraform -chdir=<deploy_dir> output
+  -raw agent_invoke_url` when the variable is unset. A failing or empty output raises `RuntimeError`.
+- `cli`: flags `--endpoint` (overrides `chat_url_from_env`) and `--session-id` (default: generated). Sends,
+  prints each reply and the session id, and returns `0`. The README shows the `curl` calls to `/eval` and
+  `/check` for that id.
+- `transport` exists for the unit tests (`httpx.MockTransport`).
+
+### `evaluator/case.py`
+
+```python
+class ToolCall(BaseModel):
+    name: str
+    input: str | None = None
+    output: str | None = None
+    failed: bool = False
+
+class TraceCase(BaseModel):
+    trace_id: str
+    session_id: str | None = None
+    root_name: str | None = None
+    started_at: datetime
+    ended_at: datetime | None = None
+    user_input: str = ""
+    output: str = ""
+    tool_calls: list[ToolCall] = []
+    agents: list[str] = []
+    usage: SpanUsage = SpanUsage()            # summed over the trace's spans
+    span_count: int
+    spans_missing_parent: int = 0             # spans whose parent_span_id is not in the trace
+    spans: list[FetchedSpan] = []             # kept for EvaluationStore's spans_gz
+
+    @property
+    def is_finished(self) -> bool: ...        # ended_at is not None and output != "" (the run ended)
+    def is_ready_to_grade(self, now: datetime, settle_time: timedelta) -> bool: ...
+    @property
+    def latency_ms(self) -> int | None: ...
+    @classmethod
+    def from_spans(cls, trace_id: str, spans: list[FetchedSpan]) -> "TraceCase | None": ...
+    def build_transcript(self) -> str: ...
+    def to_evaluation_case(self, threshold: float) -> "TraceEvaluationCase": ...
+
+class TraceEvaluationCase(AKEvaluationCase):
+    transcript: str
+    tool_call_count: int = 0
+```
+
+- `from_spans`:
+  - Root: the single span whose `parent_span_id` is `None`. None, or more than one → `None`, logged. A
+    `None` result means "not a request": the job never counts it (design.md §Trace case).
+  - Tool spans: `span.kind == SpanKind.TOOL`, or `OTelSpanClassifier.classify(span.attributes) == TOOL`
+    (the fallback design.md §Trace case explains). `failed` = `span.raw.get("level") == "ERROR"`.
+  - `spans_missing_parent`: spans whose `parent_span_id` is not `None` and not the `span_id` of any span in
+    `spans`.
+  - Agent spans: `span.kind == SpanKind.AGENT` (or the same fallback), their `name`s, de-duplicated in order.
+  - `usage`: each field is the sum of the non-`None` values across spans, or `None` when no span has
+    one.
+- Text fields (`_as_text`): Langfuse returns `input`/`output` as strings that are often JSON. A string that
+  decodes to a JSON string is unwrapped; any other string is kept; anything else is `json.dumps`-ed.
+- `build_transcript()`:
+  ```
+  User request:
+  <user_input>
+
+  Tool calls:
+  1. get_order_status({"order_id": "A-1001"}) -> "Shipped, arriving Friday" [failed]   # "[failed]" only when failed
+  (none)                                                                                  # when there are no tool calls
+
+  Final answer:
+  <output>
+  ```
+- `to_evaluation_case(threshold)`: `user_input`, `actual=output`, `context=[call.output for call in
+  tool_calls if call.output]` or `None`, `transcript`, `tool_call_count`, `threshold`.
+
+### `evaluator/opik_evaluator.py`
+
+```python
+os.environ.setdefault("OPIK_TRACK_DISABLE", "True")   # before any Opik metric is built, as AK's own evaluator does
+
+class OpikTraceEvaluator(AKEvaluator):
+    THRESHOLD = 0.5
+    MAX_ATTEMPTS = 2
+    METRICS = ("task_completion", "tool_correctness", "answer_relevance", "hallucination")
+
+    def __init__(self, config: AKTestConfig, metric: str): ...   # ValueError for an unknown metric
+    @classmethod
+    def for_all_metrics(cls, config: AKTestConfig) -> list["OpikTraceEvaluator"]: ...
+    @property
+    def metric(self) -> str: ...
+    def applies_to(self, case: TraceEvaluationCase) -> bool: ...  # tool_correctness needs tool_call_count > 0
+    def evaluate_by_score(self, case: AKEvaluationCase) -> AKEvaluationResult: ...  # raises AKMetricNotSupported
+    def evaluate_by_llm(self, case: AKEvaluationCase) -> AKEvaluationResult: ...
+    def _build_judge(self) -> BaseMetric: ...                     # built once, lazily
+    def _run_judge(self, case: TraceEvaluationCase) -> ScoreResult: ...
+```
+
+- Metric table (model `f"{config.llm.provider}/{config.llm.model}"`, `track=False` on every metric):
+
+  | `metric` | Opik class | `_run_judge` call | `higher_is_better` |
+  |---|---|---|---|
+  | `task_completion` | `AgentTaskCompletionJudge(model, track=False)` | `score(output=case.transcript)` | true |
+  | `tool_correctness` | `AgentToolCorrectnessJudge(model, track=False)` | `score(output=case.transcript)` | true |
+  | `answer_relevance` | `AnswerRelevance(model, require_context=False, track=False)` | `score(input=case.user_input, output=case.actual)` | true |
+  | `hallucination` | `Hallucination(model, track=False)` | `score(input=case.user_input, output=case.actual, context=case.context)` | false |
+
+  - The two agent judges take one `output` string only (Opik 2.2 signature `score(self, output: str, **ignored_kwargs)`),
+    so the transcript carries the request, the tool calls and the answer.
+- `evaluate_by_llm(case)`:
+  1. Up to `MAX_ATTEMPTS` calls of `_run_judge`. An exception, or a `ScoreResult` with `scoring_failed` or
+     `value is None`, counts as a failed attempt.
+  2. On success: `score = float(value)`; `passed = score >= case.threshold` (or `score < case.threshold`
+     when `higher_is_better` is false); `reason` = the judge's reason.
+  3. After the last failed attempt: `score=None`, `passed=None`, `reason="<metric> failed after 2 attempts:
+     <error>"`. No exception escapes.
+  4. Always: `metric`, `evaluator="opik"`, `threshold=case.threshold`, `mode="llm"`, `metadata` =
+     `{"higher_is_better": ..., "opik_metric": "<class name>", "attempts": n}`.
+- The broad `except Exception` in step 1 is deliberate: Opik and litellm raise many unrelated types
+  (`MetricComputationError`, `litellm.RateLimitError`, `openai.APIError`, …), and rule 5 needs all of them
+  contained. Each one is logged with the trace id and metric.
+
+### `evaluator/store.py`
+
+```python
+class Progress(StrEnum):
+    PENDING = "pending"          # finished, not ready yet
+    GRADING = "grading"          # ready and queued for the judges
+    GRADED = "graded"            # every metric judged and stored; final
+    FAILED = "failed"            # grading raised; error recorded; retried by the next /eval
+    UNFINISHED = "unfinished"    # root span has no output; final, never graded
+
+class TraceProgress(BaseModel):
+    progress: Progress
+    updated_at: datetime
+
+class SessionProgress(BaseModel):
+    counts: dict[Progress, int] = {}
+    errors: list[dict[str, str]] = []    # {"trace_id", "error"} per failed row
+
+class EvaluationStore:
+    MAX_FIELD_CHARS = 4_096          # characters per input/output/reason field
+    MAX_STORED_TOOL_CALLS = 25       # tool calls stored on the trace row
+    MAX_ITEM_BYTES = 380_000         # DynamoDB's 400 KB item cap minus headroom
+    ROW_TTL = timedelta(days=90)
+
+    def __init__(self, table: Any): ...                             # a boto3 dynamodb Table resource
+    @classmethod
+    def for_table(cls, table_name: str) -> "EvaluationStore": ...  # boto3.resource("dynamodb").Table(name)
+    def read_progress(self, trace_ids: list[str]) -> dict[str, TraceProgress]: ...
+    def write_progress(self, case: TraceCase, progress: Progress, now: datetime) -> None: ...
+    def save_results(self, case: TraceCase, results: list[AKEvaluationResult], now: datetime) -> None: ...
+    def mark_failed(self, trace_ids: list[str], error: str, now: datetime) -> None: ...
+    def count_session_progress(self, session_id: str) -> SessionProgress: ...
+    def _build_trace_row(self, case: TraceCase, progress: Progress, now: datetime) -> dict: ...
+    @staticmethod
+    def _to_decimal(value: float | int | None) -> Decimal | None: ...  # Decimal(str(value))
+    @classmethod
+    def _truncate(cls, text: str | None) -> str | None: ...
+    @classmethod
+    def _item_bytes(cls, row: dict) -> int: ...                     # DynamoDB-sized bytes of a whole item
+```
+
+- `read_progress`: `table.meta.client.batch_get_item` with `ConsistentRead=True`, in chunks of 100 keys
+  `{"trace_id": id}`, projecting
+  `trace_id`, `progress` and `updated_at`; traces with no row are absent from the result.
+  `UnprocessedKeys` are retried up to 3 times with 0.5 s, 1 s, 2 s waits, then raise `RuntimeError` (an
+  infrastructure error under rule 5).
+- `_build_trace_row(case, progress, now)`: the attributes every row has: `trace_id`, `session_id`, `progress`,
+  `updated_at` (ISO 8601 UTC), `expires_at` (epoch seconds, `updated_at + ROW_TTL`), and the trace summary
+  listed under `save_results`, without metrics or spans.
+- `write_progress`: `table.put_item` of `_build_trace_row(case, progress, now)` with
+  `ConditionExpression="attribute_not_exists(trace_id) OR progress <> :graded"`. A
+  `ConditionalCheckFailedException` (the row turned `graded` meanwhile) is swallowed: a graded trace is
+  never downgraded.
+- `save_results`: one `table.put_item` of the whole row with `progress = graded`, unconditional. A single
+  `PutItem` is atomic, so the row turns `graded` with every metric column in it at once.
+  - Attributes: everything in `_build_trace_row` (`session_id` is omitted when `None`, so the sparse
+    `session_id-index` skips it), plus `evaluated_at` (= `updated_at`).
+  - The summary (on every row): `provider="langfuse"`, `root_name`, `started_at`, `latency_ms`, `input`,
+    `output`, `tool_calls` (list of maps, each field cut), `tool_call_count`, `tool_error_count`,
+    `agents`, `span_count`, `input_tokens`, `output_tokens`, `total_tokens`, `cost`.
+  - Only on `graded` rows: `passed` (`True` when every scored result passed, `False` when one failed,
+    omitted when none scored), `metric_errors` (count of `score=None` results), and `spans_gz` or
+    `spans_truncated`.
+  - One attribute per result, named by `result.metric` (`task_completion`, `tool_correctness`,
+    `answer_relevance`, `hallucination`). Its value is a map: `evaluator`, `score`, `threshold`, `passed`,
+    `reason` (cut with `_truncate`), `higher_is_better`, `attempts`.
+  - `None` values are omitted rather than written (boto3 would store them as DynamoDB `NULL`), so a
+    missing `score` reads the same as an unscored one.
+  - Size budget for the trace row. A per-field limit alone can't keep an item under 400 KB: strings
+    are cut by characters (up to 4 bytes each in UTF-8), and the number of tool calls has no bound.
+    1. Text fields, including each metric's `reason`, are cut with `_truncate`. `tool_calls` keeps the first
+       `MAX_STORED_TOOL_CALLS` calls; when it drops any, it sets `tool_calls_truncated=True`.
+       `tool_call_count` and `tool_error_count` still count every call.
+    2. `_item_bytes(row)` measures the whole item without spans: the UTF-8 bytes of each attribute name
+       and string value, binary lengths, and 21 bytes per number (DynamoDB's documented upper bound),
+       recursing into lists and maps.
+    3. If it is still over `MAX_ITEM_BYTES` (many long tool calls), tool calls are dropped from the end, then
+       `input` and `output` are cut by halves, until it fits. Metric attributes are never dropped: four
+       cut reasons stay under 70 KB even at 4 bytes per character.
+    4. `spans_gz` = `gzip.compress(json.dumps([span.model_dump(mode="json") for span in case.spans]))`.
+       It is attached as Binary only when the item size plus `len("spans_gz") + len(spans_gz)` is ≤
+       `MAX_ITEM_BYTES`. Otherwise it is omitted and `spans_truncated=True`.
+  - Without the budget, an oversized trace would make `put_item` raise `ValidationException` and fail the
+    run.
+  - `_truncate`: the first `MAX_FIELD_CHARS` characters plus `"…[truncated]"` when longer.
+- `mark_failed(trace_ids, error, now)`: per id, `table.update_item` setting `progress = failed`, `error` (cut
+  with `_truncate`) and `updated_at`, with `ConditionExpression="progress = :grading"`; a
+  `ConditionalCheckFailedException` is swallowed (the row moved on meanwhile).
+- `count_session_progress(session_id)`: `table.query` on `session_id-index` with `session_id = :s`, projecting `trace_id`,
+  `progress` and `error`, following `LastEvaluatedKey`: counts per `Progress` and the errors of `failed`
+  rows. Index reads are eventually consistent, so only `/check` uses it. A row with an unknown `progress` is
+  logged and skipped.
+
+### `evaluator/job.py`
+
+```python
+class PrepareSummary(BaseModel):
+    session_id: str
+    spans_fetched: int = 0
+    found: int = 0               # traces with exactly one root span
+    no_root: int = 0             # traces with no root span (or several): no row
+    already_graded: int = 0      # row already graded
+    grading: int = 0             # marked grading now
+    pending: int = 0
+    unfinished: int = 0
+    grading_ids: list[str] = []  # sent to grade in the invoke payload
+
+class GradeSummary(BaseModel):
+    session_id: str
+    graded: int = 0
+    failed: int = 0
+    metric_errors: int = 0
+
+class TraceEvaluationJob:
+    FETCH_WINDOW = timedelta(hours=24)
+    FETCH_LIMIT = 5_000
+    SETTLE_TIME = timedelta(minutes=2)
+
+    def __init__(self, trace: Trace, store: EvaluationStore,
+                 evaluator_factory: Callable[[], list[OpikTraceEvaluator]],
+                 clock: Callable[[], datetime] = ...): ...         # evaluators: built on first grade
+    @classmethod
+    def from_env(cls) -> "TraceEvaluationJob": ...
+    def prepare_traces(self, session_id: str) -> PrepareSummary: ...
+    def grade_traces(self, session_id: str, trace_ids: list[str]) -> GradeSummary: ...
+    def _fetch_session_spans(self, session_id: str) -> list[FetchedSpan]: ...
+    @staticmethod
+    def _build_cases(spans: list[FetchedSpan]) -> tuple[list[TraceCase], int]: ...   # cases, no_root count
+    def _next_progress(self, case: TraceCase, current: TraceProgress | None, now: datetime) -> Progress | None: ...
+    def _run_evaluators(self, case: TraceCase) -> list[AKEvaluationResult]: ...
+```
+
+- `from_env()`: `Trace.get()` (reads `AK_TRACE__*`; `LangFuse.init()` checks the Langfuse keys),
+  `EvaluationStore.for_table(os.environ["RESULTS_TABLE"])`, and as `evaluator_factory` a factory calling
+  `OpikTraceEvaluator.for_all_metrics(AKTestConfig.get())` (reads `AK_TEST__LLM__*`). The job calls the factory once,
+  on the first `grade_traces`, and keeps the list; `prepare_traces` never calls it, so `/eval` doesn't load Opik or
+  litellm.
+- `_build_cases(spans)`: group by `trace_id`; `TraceCase.from_spans`; a `None` counts as `no_root`; the rest
+  oldest first by `started_at`.
+- `_next_progress(case, current, now)`: the design's `prepare_traces` table (design.md §Evaluation run). `None` means
+  "leave the row as it is":
+  - `current` is `graded` or `unfinished` → `None`;
+  - otherwise (no row, `pending`, `failed` or `grading`): not `case.is_finished` →
+    `UNFINISHED`; not `case.is_ready_to_grade(now, SETTLE_TIME)` → `PENDING`; else `GRADING`.
+- `prepare_traces(session_id)`: `now = clock()`; `cases, no_root = _build_cases(_fetch_session_spans(session_id))`;
+  `current = store.read_progress([c.trace_id for c in cases])`; for each case, `new = _next_progress(...)`, and
+  `store.write_progress(case, new, now)` when `new` is not `None`. Counts each case under its resulting
+  `progress` (`already_graded` for `graded`) and lists the `grading` ones in `grading_ids`, logs the
+  summary and returns it. Exceptions propagate.
+- `grade_traces(session_id, trace_ids)`:
+  1. `ids` = the `trace_ids` whose row `store.read_progress(trace_ids)` reports as `grading` (a consistent
+     read: the rows were written moments ago); none → return an empty summary.
+  2. `cases, _ = _build_cases(_fetch_session_spans(session_id))`. An exception here → `store.mark_failed(ids, error, clock())`,
+     where `error = f"{type(e).__name__}: {e}"`; return the summary with `failed = len(ids)`.
+  3. An id with no case in the fetch → `store.mark_failed([id], "trace not found in the fetch", clock())`.
+  4. For each remaining case, oldest first, inside its own `try`: `results = _run_evaluators(case)`;
+     `store.save_results(case, results, clock())`; `graded += 1`; `metric_errors +=` the results with
+     `score is None`. An exception → logged with the trace id, `store.mark_failed([case.trace_id], error,
+     clock())`, `failed += 1`, and the loop goes on.
+  5. Logs the summary and returns it.
+  - Nothing is re-raised except an exception from `store.mark_failed` itself, which leaves those rows
+    `grading` for the next `/eval` (AWS's automatic retry is off, §Deployment).
+- `_fetch_session_spans(session_id)`: `trace.fetch(session_id=session_id, last=FETCH_WINDOW, limit=FETCH_LIMIT)`.
+  `len(spans) == FETCH_LIMIT` → `RuntimeError("session <id> has at least 5000 spans; refusing to grade a
+  truncated session")`, because `fetch` keeps the newest `limit` spans and older requests would be silently
+  missing.
+- `_run_evaluators(case)`: `evaluation_case = case.to_evaluation_case(OpikTraceEvaluator.THRESHOLD)`; one
+  `evaluate_by_llm` per evaluator that `applies_to` it.
+- Overlap: `/eval` called while a `grade_traces` invocation is still running queues its `grading` rows again,
+  so those traces are judged twice. Writes go to the same keys, `save_results` is a whole-row put and `mark_failed` only
+  touches rows still `grading`, so the table stays consistent; only judge cost is duplicated.
+
+### `evaluator/api.py`
+
+```python
+class EvaluationAPI:
+    GRADE_ROUTE = "grade"
+
+    def __init__(self, store: EvaluationStore, lambda_client: Any,
+                 job_factory: Callable[[], TraceEvaluationJob]): ...
+    @classmethod
+    def from_env(cls) -> "EvaluationAPI": ...
+    def start_evaluation(self, event: dict, context: Any) -> tuple[int, dict]: ...  # POST /eval
+    def check_progress(self, event: dict, context: Any) -> tuple[int, dict]: ...    # GET /check
+    def grade_traces(self, event: dict, context: Any) -> tuple[int, dict]: ...      # POST /grade (internal)
+    def _get_job(self) -> TraceEvaluationJob: ...                                   # built once per sandbox, on first use
+```
+
+- `from_env()`: `EvaluationStore.for_table(os.environ["RESULTS_TABLE"])`, `boto3.client("lambda")`, and
+  `TraceEvaluationJob.from_env` as the factory. Nothing heavy is built at import: `Trace.get()` and the
+  Opik metrics are created on first use, so the request handler's `/chat` cold starts don't pay for them.
+- `start_evaluation(event, context)`:
+  1. `body = json.loads(event.get("body") or "{}")`, as `schedule-openai/lambda_request_handler.py:93` reads
+     it; invalid JSON or a missing/empty `session_id` string → `(400, {"error": ...})`.
+  2. `summary = self._get_job().prepare_traces(session_id)`.
+  3. When `summary.grading_ids`: `lambda_client.invoke(FunctionName=context.function_name,
+     InvocationType="Event", Payload=...)`, the payload an API Gateway-shaped `POST /grade` request:
+     `{"httpMethod": "POST", "path": <this event's path with "eval" replaced by "grade">, "body":
+     json.dumps({"session_id": session_id, "trace_ids": summary.grading_ids})}`, so `Lambda.handler`'s
+     router sends it to `grade_traces`.
+  4. `(202, summary.model_dump(mode="json"))`.
+  - An exception in 2 or 3 propagates; `Lambda.handler` turns it into
+    `500 {"error": "Custom handler error: <message>"}` (`deployment/aws/serverless/aklambda.py:84-90`).
+  - Building the job on the first `/eval` (Opik metrics, `Trace.get()`) adds a few seconds to that
+    request's cold path, still well inside API Gateway's 29 s.
+- `check_progress(event, context)`:
+  1. `params = event.get("queryStringParameters") or {}`; missing `session_id`, or `expected` that isn't
+     a positive integer → `(400, {"error": ...})`.
+  2. `progress = store.count_session_progress(session_id)`.
+  3. `(200, {"session_id", "expected", "graded", "grading", "pending", "failed", "unfinished",
+     "errors": progress.errors[:10], "complete": graded >= expected})`, each count `0` when absent.
+     `>=`, not `==`: a retried chat request can leave one trace more than the requests counted.
+- `grade_traces(event, context)`: `body = json.loads(event["body"])` →
+  `(200, self._get_job().grade_traces(body["session_id"], body["trace_ids"]).model_dump(mode="json"))`. The
+  invocation is asynchronous, so the response only reaches the Lambda logs.
+
+### Deployment (`deploy/`)
+
+```hcl
+module "serverless_agents" {                       # queue mode, like aws-serverless/openai
+  source  = "yaalalabs/ak-serverless/aws"
+  version = "0.9.4"                                # the siblings' pin
+  providers            = { aws = aws, docker = docker }
+  prefix               = var.prefix
+  region               = var.region
+  is_production        = var.is_production
+  vpc_id               = var.vpc_id
+  private_subnet_ids   = var.private_subnet_ids
+  product_display_name = "AK Langfuse Trace Evaluation Example"
+  queue_mode           = true
+  execution_mode       = "rest_sync"
+  create_redis_cluster        = false              # the base deployment's Redis (config.yaml)
+  create_redis_response_store = false
+  gateway_endpoints = [
+    { path = "eval", method = "POST" },
+    { path = "check", method = "GET" },
+  ]
+  request_handler = {
+    function_name     = "trace-eval-rqh"
+    handler_path      = "lambda_request_handler.handler"
+    package_path      = "../dist_request_handler"
+    package_type      = "Image"
+    timeout           = 600                        # 10 minutes for the grading invocation; default 45 s
+    memory_size       = 1024                       # default 128 MB
+    security_group_id = var.request_handler_security_group_id
+    environment_variables = {
+      OPENAI_API_KEY         = var.openai_api_key  # the judges
+      LANGFUSE_PUBLIC_KEY    = var.langfuse_public_key
+      LANGFUSE_SECRET_KEY    = var.langfuse_secret_key
+      LANGFUSE_BASE_URL      = var.langfuse_base_url
+      AK_TEST__LLM__PROVIDER = "openai"
+      AK_TEST__LLM__MODEL    = "gpt-4.1-mini"
+      OPIK_TRACK_DISABLE     = "true"
+      RESULTS_TABLE          = aws_dynamodb_table.results.name
+    }
+  }
+  agent_runner = {
+    function_name     = "trace-eval-ar"
+    handler_path      = "lambda_agent_runner.handler"
+    package_path      = "../dist_agent_runner"
+    package_type      = "Image"
+    memory_size       = 1024
+    security_group_id = var.agent_runner_security_group_id
+    environment_variables = {
+      OPENAI_API_KEY      = var.openai_api_key
+      LANGFUSE_PUBLIC_KEY = var.langfuse_public_key
+      LANGFUSE_SECRET_KEY = var.langfuse_secret_key
+      LANGFUSE_BASE_URL   = var.langfuse_base_url
+    }
+  }
+  response_handler = {
+    function_name     = "trace-eval-rsh"
+    handler_path      = "lambda_response_handler.handler"
+    package_type      = "LocalZip"                 # 51 MB unzipped, inside the 250 MB zip limit
+    package_path      = "../dist_response_handler.zip"
+    memory_size       = 256
+    security_group_id = var.response_handler_security_group_id
+  }
+  queue_config = { ... }                           # the openai sibling's: visibility 60 s, 3 receives, no DLQ
+}
+
+resource "aws_dynamodb_table" "results" {
+  name         = "${var.prefix}-trace-evaluations"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "trace_id"
+  attribute {
+    name = "trace_id"
+    type = "S"
+  }
+  attribute {
+    name = "session_id"
+    type = "S"
+  }
+  global_secondary_index {
+    name            = "session_id-index"
+    hash_key        = "session_id"
+    projection_type = "ALL"
+  }
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+}
+
+resource "aws_iam_role_policy" "evaluation" {
+  name = "${var.prefix}-trace-evaluation"
+  role = module.serverless_agents.request_handler_lambda_role_name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:BatchGetItem", "dynamodb:Query"]
+        Resource = [aws_dynamodb_table.results.arn, "${aws_dynamodb_table.results.arn}/index/*"]
+      },
+    ]
+  })
+}
+
+resource "aws_lambda_function_event_invoke_config" "grading" {
+  function_name          = module.serverless_agents.request_handler_lambda_function_name
+  maximum_retry_attempts = 0                       # the next /eval re-queues a killed grading
+}
+```
+
+- The module creates the roles and the functions; the example only adds a policy to the request handler's role
+  (`ak-deployment/ak-aws/serverless/outputs.tf:1-20`). There is no dependency cycle: the table doesn't
+  depend on the module, the module reads only the table name, and the policy depends on both.
+- The self-invoke needs no statement here: the module attaches the AWS-managed `AWSLambdaRole` policy
+  (`lambda:InvokeFunction` on `*`) to the request handler's role (`modules/request-handler/main.tf:17-20`).
+- `aws_lambda_function_event_invoke_config.grading`: `function_name =
+  module.serverless_agents.request_handler_lambda_function_name`, `maximum_retry_attempts = 0`. AWS
+  would otherwise retry a killed grading invocation up to twice, overlapping with the next `/eval`, which
+  already re-queues leftover `grading` rows (design.md §`grade_traces`).
+- Network: the three Lambdas run in the base VPC like the siblings, with the base deployment's three
+  security groups, and reach Langfuse, OpenAI, Redis, SQS, DynamoDB and the Lambda API through the same
+  egress path the sibling agents use.
+- `variables.tf`: `region`, `prefix`, `is_production` (default `false`), `openai_api_key`,
+  `langfuse_public_key`, `langfuse_secret_key` (both `sensitive = true`), `langfuse_base_url` (default
+  `"https://cloud.langfuse.com"`), `vpc_id`, `private_subnet_ids`, and `request_handler_security_group_id`,
+  `agent_runner_security_group_id`, `response_handler_security_group_id` (each default `null`). The last
+  five take the names the weekly pipeline injects (`run_single_test.py` `deploy_aws_resources`).
+- `outputs.tf`: `agent_invoke_url` (`module.serverless_agents.agent_invoke_url`, the name
+  `run_single_test.py` `test_aws_deployment` reads), `results_table_name`.
+- `providers.tf`: the siblings' file. No `backend.tf`: like the siblings, the pipeline injects it and
+  `.gitignore` excludes it.
+- `terraform.tfvars`: `region = "ap-southeast-2"`, `prefix = "ak-lf-trace-eval-dev-examples"`.
+- Packaging: the request handler (292 MB of dependencies with Opik) and the agent runner (OpenAI Agents
+  SDK) are container images, being over Lambda's 250 MB unzipped zip limit; the response handler (51 MB)
+  is a `LocalZip`, as in `schedule-openai`.
+- `deploy.sh [local]`: one `create_<tier>_deployment_package` function per Lambda, like
+  `aws-serverless/openai/deploy/deploy.sh`. Each one `uv export --extra <tier> --no-dev`s and installs the
+  tier's dependencies; with `local` it then force-reinstalls the `agentkernel` wheel from
+  `../../../ak-py/dist` with `--no-deps --no-index`, because the siblings' unpinned local install resolves
+  to the newer PyPI release, which lacks Phase 1. It copies the tier's `lambda_*.py` and `config.yaml` (plus
+  `evaluator/` for the request handler), then adds the Dockerfile (images) or zips the directory
+  (`dist_response_handler.zip`), then `terraform init` and `terraform apply`. `--no-dev` keeps the `dev`
+  group (deepeval, litellm, moto) out of the packages.
+
+### `pyproject.toml`
+
+```toml
+[project]
+dependencies = []
+
+[project.optional-dependencies]                    # one set per Lambda, like the queue-mode siblings
+request_handler = ["agentkernel[aws,redis,langfuse,opik]>=0.9.4", "boto3>=1.40.0", "langfuse>=4.7.0"]
+agent_runner = ["agentkernel[aws,openai,redis,langfuse]>=0.9.4", "langfuse>=4.7.0"]
+response_handler = ["agentkernel[aws,redis]>=0.9.4"]
+
+[dependency-groups]
+dev = ["agentkernel[test]>=0.9.4", "httpx>=0.27.0", "moto[dynamodb]>=5.0.0", "black==26.5.1", "isort>=5.0.0"]
+```
+
+- The request handler carries Opik and the evaluator; only the agent runner needs the OpenAI Agents SDK.
+  `boto3` is pinned because container images don't include the Lambda runtime's copy.
+- `langfuse>=4.7.0` raises the `langfuse` extra's `>=4.2.0` floor: older SDKs use Langfuse's slow
+  ingestion path (up to 15 minutes), which the job's 2-minute `SETTLE_TIME` assumes away (design.md
+  §Evaluation run).
+- The minimum `agentkernel` version is the first release that contains Phase 1 (`fetch` and `usage`),
+  set when that release is cut; until then CI uses the local wheel (`./deploy.sh local`, `./build.sh local`,
+  which syncs `--all-extras` so the unit tests have every tier's dependencies).
+
+### Consumer changes
+
+- **AK core:** none (rule 1).
+- **`.github/integration-test-config.yaml`:** a new weekly entry under `# AWS Serverless`:
+  `type: aws-serverless`, `path: examples/aws-serverless/langfuse-trace-evaluation`, `deploy_dir: deploy`.
+- **`.github/workflows/integration-test-weekly.yaml`, job `run-tests`, Deploy and Destroy:** the example's
+  path joins `scalable-openai` and `schedule-openai` in the condition that passes the base deployment's
+  agent runner and response handler security groups.
+- **`.github/workflows/integration-test-weekly.yaml`, job `run-tests`:** the Deploy, Test and Destroy steps
+  gain `TF_VAR_langfuse_public_key: ${{ secrets.LANGFUSE_PUBLIC_KEY }}`,
+  `TF_VAR_langfuse_secret_key: ${{ secrets.LANGFUSE_SECRET_KEY }}` and
+  `TF_VAR_langfuse_base_url: ${{ vars.LANGFUSE_BASE_URL }}`. Destroy needs them because the variables
+  have no defaults. No other step, job or script changes: the example fits the existing
+  deploy → test → destroy contract (`deploy/deploy.sh`, `agent_invoke_url`, `pytest` in the example root).
+- **Repository settings:** secrets `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and variable
+  `LANGFUSE_BASE_URL` for a CI Langfuse project (design.md open question).
+
+### Config changes
+
+- No `AKConfig` changes. The example sets existing fields: `trace.enabled` / `trace.type` in
+  `config.yaml`, and `AK_TEST__LLM__PROVIDER` / `AK_TEST__LLM__MODEL` for the judge model.
+- Example-only environment variable: `RESULTS_TABLE`.
+
+### Behavioural changes
+
+- None in AK from Phases 2–3 (the Langfuse flush is Phase 1 behavioural change 3). The weekly
+  integration run gains one queue-mode deployment (three Lambdas behind one API Gateway, two SQS queues,
+  two ECR repositories, one DynamoDB table) and its judge calls: three or four `gpt-4.1-mini` calls per test trace, on the existing
+  CI OpenAI key.
+
+## Phases 2–3 error handling
+
+| Situation | What happens |
+|---|---|
+| `/eval` with a missing or empty `session_id`, or invalid JSON | `400`; nothing written or invoked |
+| `/check` with a missing `session_id`, or `expected` not a positive integer | `400` |
+| `/check` before any `/eval` for the session | `200`, every count `0`, `complete = false` |
+| Langfuse keys missing or wrong | `LangFuse.init()` raises in `prepare_traces` (`trace/langfuse/langfuse.py:25-28`) → `/eval` returns `500` with the error |
+| Langfuse fetch fails (HTTP error, rate limit) in `prepare_traces` | Propagates from `fetch` (Phase 1 does no retries) → `/eval` returns `500` with the error |
+| The session has `FETCH_LIMIT` spans or more | `RuntimeError` from `_fetch_session_spans` → `/eval` returns `500` with the error |
+| DynamoDB or IAM error in `prepare_traces` (`read_progress`, `write_progress`, or the self-invoke) | `/eval` returns `500` with the error; rows marked before it stay, and the next `/eval` continues from them |
+| A trace has no root span, or several | `no_root`: logged, not a request, no row |
+| A root span without output | `unfinished` row: never graded; `/check` reports it and `graded < expected` |
+| A finished trace whose root span ended less than `SETTLE_TIME` ago, or with `spans_missing_parent > 0` | `pending` row; a later `/eval` moves it to `grading` |
+| A trace not readable at all yet | No row; a later `/eval` finds it |
+| A judge call fails twice | That metric's column is stored with `score`/`passed` omitted and the error in `reason`; `metric_errors` counts it; the row still turns `graded` |
+| Fetch error in `grade_traces` | Every `grading` row of the session → `failed` with the error; the next `/eval` retries them |
+| Any other error while grading one trace (DynamoDB, unexpected exception) | That row → `failed` with the error; the other traces are still graded; the next `/eval` retries it |
+| `failed` rows at the end of the weekly test | The test fails with the counts and the rows' `errors` from `/check` |
+| The Lambda times out (10 minutes) or runs out of memory, or the `failed` write itself fails | Rows stay `grading` (no automatic retry); the next `/eval` (the test's next round) queues them again |
+
+- Concurrency: each invocation is single-threaded, so the job, store and evaluators hold no locks.
+  Sessions are independent. Overlap within a session is covered in §`evaluator/job.py`.
+- Cost per `/eval`: one Langfuse fetch of ~`ceil(spans / 100)` requests, one `BatchGetItem` per 100
+  traces and one put per trace whose `progress` changes. Per `grade_traces`: the same fetch and `BatchGetItem`,
+  then per graded trace three or four judge calls (one more per failed attempt) and one put. `/check`: one
+  `Query` per call.
+
+## Phases 2–3 testing
+
+**Unit tests, `tests/test_evaluator.py`** (no network; run by the weekly pipeline's `pytest` too):
+
+- Span fixtures: a `FetchedSpan` factory shaped like the Langfuse OpenAI Agents tree in
+  `research/span-formats.md` §3 (root `Agent Kernel OpenAI`, `triage` and `support` agents, a
+  `get_order_status` tool, two generations with `usage`).
+- `TestTraceCase`:
+  - root input/output, JSON-string unwrapping, tool calls in order, `failed` from `raw.level`, agents,
+    summed usage (and `None` when no span has usage), latency;
+  - the tool fallback through `OTelSpanClassifier` for a span typed `span`;
+  - no root span and two root spans → `None`; root span without `end_time` → not `is_finished`;
+  - `spans_missing_parent` counts a span whose parent is absent; `is_ready_to_grade` false just before `settle_time` has passed,
+    true just after, and false with `spans_missing_parent > 0`;
+  - the transcript with and without tool calls.
+- `TestOpikTraceEvaluator` (each Opik class monkeypatched in `evaluator.opik_evaluator` with a fake whose
+  `score` records its kwargs and returns a `ScoreResult`):
+  - each metric's call arguments and model string `openai/gpt-4.1-mini`;
+  - pass rules, including `hallucination`'s inverted one;
+  - `applies_to` for `tool_correctness`;
+  - first attempt raises, second succeeds → scored, `attempts == 2`; both fail → `score None`, reason
+    names the error; `scoring_failed` counts as a failure;
+  - `evaluate_by_score` raises `AKMetricNotSupported`; an unknown metric name raises `ValueError`.
+- `TestEvaluationStore` (`moto.mock_aws`, table created with the `main.tf` schema):
+  - `save_results` writes one trace row with the documented attributes and one map column per metric (no
+    `tool_correctness` column for a trace without tool calls), `Decimal` numbers, omitted `None`s,
+    `expires_at`;
+  - `write_progress` writes the summary with the given `progress` and no metric columns, updates a `pending` row
+    to `grading`, and never overwrites a `graded` row;
+  - a store whose `put_item` raises in `save_results` leaves the row as it was (still `grading`);
+  - `_truncate` on long fields; `spans_gz` round-trips; spans that would push the item past `MAX_ITEM_BYTES` →
+    `spans_truncated`;
+  - size budget: 100 tool calls with 4,096-char multi-byte (4-byte UTF-8) inputs/outputs → the item is
+    written (moto enforces 400 KB), `tool_calls_truncated` is set, and `tool_call_count` is 100;
+    `_item_bytes` against a hand-computed item;
+  - `read_progress()` across more than 100 ids, absent for a trace with no row;
+  - `count_session_progress()` counts per `progress` for one session only, lists `failed` errors and `grading` ids, and
+    is empty for a session with no rows;
+  - `mark_failed` sets `failed` and `error` on a `grading` row and leaves a `graded` row untouched.
+- `TestTraceEvaluationJob` (fake `Trace` returning fixed spans, fake evaluators, the moto store, a fixed
+  clock):
+  - the fetch call (`session_id`, `last=24h`, `limit=5000`);
+  - `prepare_traces`, one case per row of the design's table: no row + ready → `grading`; no row + inside `SETTLE_TIME`
+    → `pending`; no row + no output → `unfinished`; `pending` + now ready → `grading`; leftover `grading` →
+    `grading` again with a new `updated_at`; `failed` + ready → `grading`; `graded` and `unfinished` → left
+    as is; with the matching `PrepareSummary` counts;
+  - a trace with no root span → `no_root`, no row;
+  - `grade_traces` judges only the payload's traces whose row is still `grading`, turns them `graded`, and
+    leaves other rows alone; `prepare_traces` never calls `evaluator_factory`, and `grade_traces` calls it once
+    across two calls;
+  - `metric_errors` counts `score=None` results;
+  - `prepare_traces` raises on a fetch error and on a `FETCH_LIMIT`-sized result;
+  - `grade_traces`: a fetch error marks every `grading` row `failed` with the error; an exception on one trace
+    marks only that row `failed` and the next trace is still graded; a `grading` id missing from the
+    fetch → `failed`; nothing is raised; an exception from `mark_failed` itself is re-raised.
+- `TestEvaluationAPI` (moto store, a fake Lambda client recording `invoke` calls, a fake job factory):
+  - `start_evaluation`: `202` with the `prepare_traces` counts; one `invoke` with `FunctionName=context.function_name`,
+    `InvocationType="Event"` and a `POST /api/v1/grade` request (with `trace_ids` in its body) when a trace
+    is `grading`, none otherwise; invalid JSON
+    and a missing `session_id` → `400`, no `prepare_traces`, no invoke; an exception from `prepare_traces` propagates;
+  - `check_progress`: a session with no rows (all `0`, `complete` false), a mixed one with the right counts and
+    the `failed` rows' `errors`, and `complete` true exactly when `graded >= expected`; bad `expected` → `400`;
+  - `grade_traces`: calls the job's `grade_traces` with the body's ids, `200` with its summary; the job is built once
+    across two calls.
+- `TestTrafficSimulator` (`httpx.MockTransport`):
+  - `send_questions` posts the 3 questions in order, all with the given `session_id`;
+  - without a `session_id`, all 3 requests carry the same generated id, which `session_id` returns;
+  - 5xx then 200 is retried;
+  - `chat_url_from_env`: `AK_TEST_ENDPOINT` wins; otherwise the `terraform output` (subprocess
+    monkeypatched); an empty output raises.
+
+**Weekly integration test, `lambda_test.py`** (`AK_TEST_ENDPOINT` from the pipeline,
+`.github/scripts/run_single_test.py:350-370`). Only HTTP calls, so it needs no AWS credentials:
+
+```python
+INITIAL_WAIT = 150     # s: the job's SETTLE_TIME (2 minutes) plus 30 s
+ROUNDS = 3             # /eval calls, the first one included
+ROUND_INTERVAL = 30    # s between rounds
+POLL_INTERVAL = 10     # s between /check calls
+POLL_TIMEOUT = 180     # s per round
+
+class EvaluationClient:                      # test helper, like APITestClient in openai-auth/lambda_test.py:15
+    def __init__(self, chat_url: str): ...   # eval_url / check_url: the trailing "/chat" replaced
+    async def start_evaluation(self, session_id: str) -> tuple[int, dict]: ...   # POST /eval; status code and body
+    async def wait_until_graded(self, session_id: str, expected: int, timeout: float = POLL_TIMEOUT,
+                                poll_interval: float = POLL_INTERVAL) -> dict: ...   # polls GET /check (see below)
+```
+
+- Session-scoped fixtures: `chat_url = os.getenv("AK_TEST_ENDPOINT")` (as
+  `openai-auth/lambda_test.py:82-84`), `simulator = TrafficSimulator(chat_url, session_id=str(uuid4()))`,
+  `client = EvaluationClient(chat_url)`.
+- `EvaluationClient.__init__` raises `ValueError` when `chat_url` doesn't end in `/chat`.
+- `wait_until_graded` returns as soon as `complete` is true or `grading == 0`; at the timeout it returns the last
+  response.
+- `test_every_request_is_graded`:
+  1. `replies = simulator.send_questions()` (run in a thread, since `send_questions` is synchronous); 3 non-empty replies.
+  2. `await asyncio.sleep(INITIAL_WAIT)` (design.md §Evaluation run).
+  3. Up to `ROUNDS` grading rounds:
+     ```python
+     for _ in range(ROUNDS):
+         code, body = await client.start_evaluation(simulator.session_id)
+         assert code == 202, f"/eval failed: {body.get('error')}"
+         result = await client.wait_until_graded(simulator.session_id, expected=3)
+         if result["complete"]:
+             break
+         # not all graded: the next /eval queues pending, failed and leftover grading traces
+         await asyncio.sleep(ROUND_INTERVAL)
+     ```
+  4. Assert `result["complete"]`, with the message `"<graded> of 3 requests graded after <ROUNDS> rounds
+     (<pending> pending, <failed> failed, <grading> still grading, <unfinished> unfinished): <errors>"`.
+  - Judge outcomes are not asserted, only that every request was graded and stored.
+
+**Run:**
+
+```bash
+cd examples/aws-serverless/langfuse-trace-evaluation
+./build.sh local && uv run pytest tests/                    # unit tests
+cd deploy && ./deploy.sh local && cd ..
+uv run python simulate_traffic.py                          # 3 questions; prints the session id
+AK_TEST_ENDPOINT=$(terraform -chdir=deploy output -raw agent_invoke_url) uv run pytest lambda_test.py
+```

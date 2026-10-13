@@ -285,6 +285,8 @@ tokens = sum(span.usage.total_tokens or 0 for span in spans if span.usage)  # sp
 - CloudWatch reads `aws/spans` through Logs Insights, so the identity needs `logs:StartQuery`,
   `logs:GetQueryResults` and `logs:StopQuery` (`AWSXrayWriteOnlyAccess` does not grant them).
 - Full filter list and provider limits: [Traceability guide](https://kernel.yaala.ai/docs/advanced/traceability#fetching-spans-back).
+- End-to-end example (fetch a session's traces, grade them with Opik judges, store the scores in DynamoDB):
+  [`examples/aws-serverless/langfuse-trace-evaluation`](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/aws-serverless/langfuse-trace-evaluation).
 
 ---
 
