@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import contextvars
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, List, Self
 
 from .base import Agent, AgentRequest, Session
@@ -114,6 +116,22 @@ class ToolContext:
         if self._token is not None:
             ToolContext._context.reset(self._token)
             self._token = None
+
+    @contextmanager
+    def activated(self) -> Iterator[Self]:
+        """
+        Make this the current ToolContext for the duration of a ``with`` block.
+
+        Unlike :meth:`set` and :meth:`reset`, which keep the reset token on this instance, the token
+        stays with the caller. One ToolContext can then be active in several tasks at once, as it is
+        when a model makes parallel tool calls that the framework runs concurrently: with the token on
+        the instance, one call would reset with another call's token.
+        """
+        token = ToolContext._context.set(self)
+        try:
+            yield self
+        finally:
+            ToolContext._context.reset(token)
 
     def __enter__(self) -> Self:
         """

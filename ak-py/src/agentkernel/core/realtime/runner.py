@@ -34,6 +34,10 @@ class RealtimeRunner(Runner):
 
     input_sample_rate: int = EDGE_SAMPLE_RATE
     output_sample_rate: int = EDGE_SAMPLE_RATE
+    # True when the adapter reports ``speech_stopped`` after every ``speech_started`` and
+    # ``interrupt`` (a model with server voice activity detection that signals the end of speech).
+    # The pool then counts the user as speaking until it arrives.
+    reports_speech_stopped: bool = False
 
     async def run(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AgentReply:
         """Not supported for realtime runners."""
@@ -97,6 +101,11 @@ class RealtimeRunner(Runner):
             - ``interrupt``: ``{}``, the user spoke while the model was responding
             - ``speech_started``: ``{}``, the user spoke outside a response; the pool treats it as a
               barge-in only while it still holds audio the user has not heard
+            - ``speech_heard``: ``{}``, the user is still speaking (for example, more of their words
+              were transcribed); report it as often as the model says so, so the pool knows a long
+              answer is still going on
+            - ``speech_stopped``: ``{}``, the user stopped speaking; report it only with
+              :attr:`reports_speech_stopped` set
             - ``agent_changed``: ``{"agent": str, "previous_agent": str}``, a framework-native
               handoff moved the conversation to another agent; report it after the previous
               agent's last output and before the new agent's first. The pool announces the agent

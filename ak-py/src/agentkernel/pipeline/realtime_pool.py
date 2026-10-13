@@ -76,11 +76,105 @@ class RealtimeConnection:
         # once.
         self._disconnecting = False
         self.last_activity_at: float = time.time()
+        # Turn state, for code that talks into the call (possibly from another thread) to tell a
+        # quiet call from a busy one; ``last_activity_at`` cannot, as every caller audio frame moves it.
+        self._tools_in_flight = 0
+        self._last_model_output_at: Optional[float] = None
+        self._last_model_generated_at: Optional[float] = None
+        self._last_agent_change_at: Optional[float] = None
+        self._last_tool_result_at: Optional[float] = None
+        self._last_caller_speech_at: Optional[float] = None
+        self._last_edge_text_at: Optional[float] = None
+        self._caller_speaking = False
 
         if not getattr(self.agent, "realtime_runner_cls", None):
             raise ValueError(f"Agent {self.agent.name} has no realtime_runner_cls configured")
 
         self.adapter: "BaseRealtimeRunner" = self.agent.realtime_runner_cls()
+
+    @property
+    def is_responding(self) -> bool:
+        """Whether the model is mid-response: output not yet emitted to the edge, or a tool call still running.
+
+        A tool call counts until its result is sent, which for a handoff on ADK includes opening the
+        next agent's socket. The model generating before its first output is not visible here, so
+        code deciding the call is quiet also checks that the model has answered whatever it was
+        last given (``last_caller_speech_at``, ``last_edge_text_at``, ``last_tool_result_at``,
+        compared with ``last_model_output_at``). Safe to read from any thread.
+        """
+        return self._audio_queue.qsize() > 0 or self._tools_in_flight > 0
+
+    @property
+    def last_model_output_at(self) -> Optional[float]:
+        """Epoch seconds when the model's audio or transcript last left for the edge; ``None`` before that.
+
+        Only output counts. Control events do not (an ``interrupt`` is the caller's doing, and a
+        ``done`` or ``agent_changed`` follows output that already counted), and neither does a
+        finished tool call: its result is input the model has still to answer, see
+        :attr:`last_tool_result_at`.
+        """
+        return self._last_model_output_at
+
+    @property
+    def last_model_generated_at(self) -> Optional[float]:
+        """Epoch seconds when the adapter last reported model audio or transcript; ``None`` before that.
+
+        The model's own time, not the caller's: output is generated faster than it is spoken and
+        paced to the edge, so this runs ahead of :attr:`last_model_output_at`. Compared with
+        :attr:`last_agent_change_at` it tells whether the agent now answering has said anything
+        yet, at the moment it calls a tool (a handoff, say), while its words may still be queued.
+        """
+        return self._last_model_generated_at
+
+    @property
+    def last_agent_change_at(self) -> Optional[float]:
+        """Epoch seconds when the adapter last reported a handoff to another agent (``agent_changed``); ``None`` before that.
+
+        In the model's own time, like :attr:`last_model_generated_at`: what is generated after it
+        is the new agent's.
+        """
+        return self._last_agent_change_at
+
+    @property
+    def last_tool_result_at(self) -> Optional[float]:
+        """Epoch seconds when a tool call's result was last sent to the model; ``None`` before that.
+
+        A result makes the model respond, so until ``last_model_output_at`` is later than this, a
+        reply is still owed. For a handoff on ADK the result seeds the next agent's socket, so this
+        marks the new agent's turn to speak.
+        """
+        return self._last_tool_result_at
+
+    @property
+    def last_edge_text_at(self) -> Optional[float]:
+        """Epoch seconds when text from the edge last reached the model; ``None`` before that.
+
+        Text the caller typed, or a prompt the edge sends on their behalf (such as the LiveKit
+        gateway's greeting when a microphone connects); not text an application sends itself with
+        :meth:`send_text`. Like the caller's speech, it is input the model has still to answer
+        until ``last_model_output_at`` is later.
+        """
+        return self._last_edge_text_at
+
+    @property
+    def last_caller_speech_at(self) -> Optional[float]:
+        """Epoch seconds when the caller was last heard speaking; ``None`` before that.
+
+        It moves when the caller starts speaking (``speech_started`` or ``interrupt``), each time the
+        adapter hears them still speaking (``speech_heard``), and when they stop (``speech_stopped``),
+        so a long answer keeps it current on an adapter that reports any of the last two.
+        """
+        return self._last_caller_speech_at
+
+    @property
+    def is_caller_speaking(self) -> bool:
+        """Whether the caller is speaking now, from the start of their speech until the adapter reports it stopped.
+
+        Known only on an adapter that reports the end of speech (``reports_speech_stopped``, such as
+        OpenAI's server voice activity detection); always ``False`` on one that cannot (Gemini Live),
+        where ``last_caller_speech_at`` moving shows the caller still talking. Safe to read from any thread.
+        """
+        return self._caller_speaking
 
     def update_delivery_context(self, request_id: Optional[str], user_id: Optional[str], integration: Optional[str], reply_context: dict) -> None:
         """Called before pushing audio to ensure callbacks route output to the right place."""
@@ -114,9 +208,23 @@ class RealtimeConnection:
         ``interrupt`` is a barge-in the adapter saw while the model was responding. ``speech_started``
         is the user starting to speak outside a response: the model has finished generating, but
         paced audio may still be queued here, so it is a barge-in only while that audio remains;
-        otherwise it is the ordinary start of the user's turn and is ignored.
+        otherwise it is the ordinary start of the user's turn. Either way it, and ``interrupt``, mark
+        when the caller last spoke, as do ``speech_heard`` (still speaking) and ``speech_stopped``.
+        Audio and transcript mark when the model last generated output, and ``agent_changed`` when
+        the conversation last moved to another agent, both as the adapter reports them.
         """
         self.last_activity_at = time.time()
+        if event_type in ("interrupt", "speech_started", "speech_heard", "speech_stopped"):
+            self._last_caller_speech_at = self.last_activity_at
+        if event_type in ("interrupt", "speech_started"):
+            self._caller_speaking = self.adapter.reports_speech_stopped
+        elif event_type in ("speech_stopped", "audio_delta"):
+            # The model answering also ends the caller's speech, should a stop never arrive.
+            self._caller_speaking = False
+        if event_type in ("audio_delta", "transcript_delta"):
+            self._last_model_generated_at = self.last_activity_at
+        elif event_type == "agent_changed":
+            self._last_agent_change_at = self.last_activity_at
         if event_type == "audio_delta":
             self._queued_audio += 1
             await self._audio_queue.put(("audio_delta", data))
@@ -184,6 +292,8 @@ class RealtimeConnection:
         while True:
             try:
                 event_type, data = await self._audio_queue.get()
+                if event_type in ("audio_delta", "transcript_delta"):
+                    self._last_model_output_at = time.time()
                 if event_type == "transcript_delta":
                     message_id = data.get("message_id") or ""
                     await self._emit(StreamChunk(event=TextDelta(message_id=message_id, content=data["delta"]), delta=data["delta"]))
@@ -232,24 +342,32 @@ class RealtimeConnection:
         ``ToolContext`` lifecycle, so a tool function can read ``ToolContext.get()`` while it
         runs. System tools (sandbox, knowledge base, schedule, ...) are attached to the native
         agent at wrap time, so they resolve here alongside user-defined tools.
+
+        The call counts toward ``is_responding`` until its result is sent, which then marks
+        ``last_tool_result_at``: the model owes a reply to it.
         """
         _log.info(f"Executing tool {name} for session {self.session_id}")
-        # The adapter activates this context in its framework's own way (OpenAI sets the
-        # contextvar around ``on_invoke_tool``; ADK enters the cache the wrapper fetches from).
-        ctx = ToolContext(self.runtime, self.agent, self.session, [])
+        self._tools_in_flight += 1
         try:
-            # Enter the same execution scopes a unary run does, so a tool that reads
-            # Session.current()/Agent.current(), the volatile cache, or holds the session lock
-            # sees them exactly as it would on the normal path.
-            async with self.session:
-                with self.agent._activate():
-                    result_str = await self.adapter.execute_tool(name, arguments, ctx, call_id)
-        except Exception as e:
-            _log.exception(f"Tool execution {name} failed")
-            result_str = f"Error: {e}"
+            # The adapter activates this context in its framework's own way (OpenAI sets the
+            # contextvar around ``on_invoke_tool``; ADK enters the cache the wrapper fetches from).
+            ctx = ToolContext(self.runtime, self.agent, self.session, [])
+            try:
+                # Enter the same execution scopes a unary run does, so a tool that reads
+                # Session.current()/Agent.current(), the volatile cache, or holds the session lock
+                # sees them exactly as it would on the normal path.
+                async with self.session:
+                    with self.agent._activate():
+                        result_str = await self.adapter.execute_tool(name, arguments, ctx, call_id)
+            except Exception as e:
+                _log.exception(f"Tool execution {name} failed")
+                result_str = f"Error: {e}"
 
-        _log.info(f"Tool {name} result: {result_str[:200]}")
-        await self.adapter.send_tool_result(call_id, result_str)
+            _log.info(f"Tool {name} result: {result_str[:200]}")
+            await self.adapter.send_tool_result(call_id, result_str)
+        finally:
+            self._last_tool_result_at = time.time()
+            self._tools_in_flight -= 1
 
     async def _emit(self, chunk: StreamChunk) -> None:
         """Send a realtime output chunk to the output queue with the current delivery context."""
@@ -272,9 +390,17 @@ class RealtimeConnection:
         converted = base64.b64encode(pcm16).decode("utf-8")
         self._dispatch_send(self.adapter.append_audio(converted), "append_audio")
 
-    def send_text(self, text: str) -> None:
-        """Thread-safe: schedule text send on the pool's event loop."""
+    def send_text(self, text: str, *, from_edge: bool = False) -> None:
+        """Thread-safe: schedule text send on the pool's event loop.
+
+        :param text: The text to put into the conversation; the model responds to it.
+        :param from_edge: The text came from the edge (the caller typed it, or the edge sent it for
+            them); it then marks :attr:`last_edge_text_at`. Leave it unset for text the application
+            sends itself, such as a background job reporting back.
+        """
         self.last_activity_at = time.time()
+        if from_edge:
+            self._last_edge_text_at = self.last_activity_at
         self._dispatch_send(self.adapter.send_text(text), "send_text")
 
     def _dispatch_send(self, coro, action: str) -> None:
@@ -555,7 +681,7 @@ class RealtimeConnectionPool:
             if getattr(request, "type", None) == "voice":
                 conn.append_audio(request.audio_data)
             elif getattr(request, "type", None) == "text":
-                conn.send_text(request.prompt)
+                conn.send_text(request.prompt, from_edge=True)
 
     @staticmethod
     def send_permanent_failure(

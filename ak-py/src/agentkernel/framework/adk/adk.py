@@ -19,6 +19,7 @@ from google.adk.apps import App
 from google.adk.apps.app import ResumabilityConfig
 from google.adk.events import Event, EventActions
 from google.adk.flows.llm_flows.agent_transfer import _build_transfer_instructions
+from google.adk.flows.llm_flows.contents import _present_other_agent_message
 from google.adk.flows.llm_flows.functions import REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
 from google.adk.runners import Runner
 from google.adk.sessions import BaseSessionService, InMemorySessionService, State
@@ -932,8 +933,21 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
     call that leaves ``tool_context.actions.transfer_to_agent`` set moves the conversation to that
     agent. A Live session's instructions and tools are fixed when it opens, so, as ADK does, the
     runner then closes the socket and opens one configured for the new agent, seeded with the
-    conversation so far: what was said, as text, and every tool call with its result. The caller hears a short gap while it connects; each agent speaks
-    with its own model and, when its ``generate_content_config`` sets one, its own voice.
+    conversation so far: what was said, as text, and every tool call with its result. Each agent's
+    turns are presented as ADK presents them (``[billing] said: ...``, on the user's side), so the
+    new agent can tell what a teammate said, or asked it, from what it said itself. The caller hears
+    a short gap while it connects; each agent speaks with its own model and, when its
+    ``generate_content_config`` sets one, its own voice.
+
+    A tool call runs between the calling agent's ``before_tool_callback``, ``on_tool_error_callback``
+    and ``after_tool_callback``, as on an ADK run, ``transfer_to_agent`` included: a before-callback
+    that answers in the tool's place stops a transfer. ADK plugins do not run, since a Live socket
+    has no ADK ``Runner`` to hold them.
+
+    The caller starting a turn is reported as ``speech_started``, on the first transcription of
+    their speech while the model is silent, and each later transcription as ``speech_heard``, so
+    the pool can tell a quiet call from a busy one, and a long answer from silence. Gemini Live
+    does not signal the end of the caller's speech, so ``speech_stopped`` is not reported.
     """
 
     input_sample_rate = 16000
@@ -952,6 +966,13 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         calls: list[Any]
         results: dict[str, str] = field(default_factory=dict)
 
+    @dataclass
+    class _Said:
+        """One entry of the conversation history, and who it came from: ``"user"`` for the caller, else an agent's name."""
+
+        author: str
+        content: types.Content
+
     def __init__(self):
         super().__init__(FRAMEWORK)
         self._log = logging.getLogger("ak.adk.realtime")
@@ -969,6 +990,9 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         # Per-turn barge-in state; reset at each turn_complete.
         self._interrupted_this_turn = False
         self._model_speaking = False
+        # Whether the caller's current turn has been reported (``speech_started`` or ``interrupt``);
+        # reset when the model answers, so the caller's next turn is reported once.
+        self._caller_turn_reported = False
         # Each dispatched call's batch, the calls of its tool_call message. Holds only the open
         # socket's calls: a result for a call a transfer has closed the socket of is dropped.
         self._batches: dict[str, GoogleADKRealtimeRunner._ToolBatch] = {}
@@ -983,9 +1007,9 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         # tool_call message has a result.
         self._transfers: dict[str, Any] = {}
         # The conversation so far, to seed the socket a transfer opens: what was said, as text, and
-        # every tool call with its result, as ADK's session records them (audio aside). And the
-        # current turn's transcribed words, not yet added to it.
-        self._history: list[types.Content] = []
+        # every tool call with its result, each with who said or made it, as ADK's session records
+        # them as events (audio aside). And the current turn's transcribed words, not yet added to it.
+        self._history: list[GoogleADKRealtimeRunner._Said] = []
         self._user_words: list[str] = []
         self._model_words: list[str] = []
 
@@ -1178,21 +1202,23 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
     async def _open_socket(self, sdk_agent: Any) -> None:
         """Open a Live socket configured for ``sdk_agent`` and make it the agent answering.
 
-        After a transfer the socket is seeded with the conversation so far, as ADK's
-        ``send_history`` seeds it: completed when it ends with the user's side (a transfer's
-        function response), so the new agent answers; on Gemini 3.x, which waits for fresh input
-        after replayed history, followed by the placeholder input ADK sends.
+        After a transfer the socket is seeded with the conversation so far, presented as ADK presents
+        it to a Live socket (:meth:`_presented_history`), as ADK's ``send_history`` seeds it:
+        completed when it ends with the user's side (it always does, as every agent turn is presented
+        on that side), so the new agent answers; on Gemini 3.x, which waits for fresh input after
+        replayed history, followed by the placeholder input ADK sends.
         """
         model = self._live_model(sdk_agent)
-        seeded = bool(self._history)
+        turns = self._presented_history()
+        seeded = bool(turns)
         self._log.info(f"Connecting to Gemini Live (agent={sdk_agent.name}, model={model})")
         cm = self._client.aio.live.connect(model=model, config=self._connect_config(sdk_agent, seeded=seeded))
         connection = await cm.__aenter__()
         self._cm = cm
         self._active = sdk_agent
         if seeded:
-            turn_complete = self._history[-1].role == "user"
-            await connection.send_client_content(turns=list(self._history), turn_complete=turn_complete)
+            turn_complete = turns[-1].role == "user"
+            await connection.send_client_content(turns=turns, turn_complete=turn_complete)
             if turn_complete and self._is_gemini_3_live(model):
                 await connection.send_realtime_input(text=".")
         self._connection = connection
@@ -1241,18 +1267,29 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             # signal a beat earlier, so the edge can stop playback as soon as the user starts
             # talking over the model. Only fires while the model is actually speaking, and only
             # once per turn.
+            interim = getattr(server_content, "interim_input_transcription", None)
             if getattr(server_content, "interrupted", False) and not self._interrupted_this_turn:
                 self._interrupted_this_turn = True
                 self._model_speaking = False
+                self._caller_turn_reported = True
                 self._log.info("Gemini barge-in (server interruption); stopping playback")
                 await self._callback("interrupt", {})
             elif self._model_speaking and not self._interrupted_this_turn:
-                interim = getattr(server_content, "interim_input_transcription", None)
                 if interim is not None and interim.text:
                     self._interrupted_this_turn = True
                     self._model_speaking = False
+                    self._caller_turn_reported = True
                     self._log.info("Gemini barge-in (user speaking); stopping playback")
                     await self._callback("interrupt", {})
+            elif not self._model_speaking and not self._caller_turn_reported and self._transcribed(interim, server_content):
+                # The caller starting a turn while the model is silent; the pool decides whether
+                # audio it is still pacing makes it a barge-in.
+                self._caller_turn_reported = True
+                await self._callback("speech_started", {})
+            elif not self._model_speaking and self._transcribed(interim, server_content):
+                # More of the caller's words: they are still speaking, so a long answer is not
+                # taken for silence.
+                await self._callback("speech_heard", {})
 
             input_transcription = getattr(server_content, "input_transcription", None)
             if input_transcription is not None and input_transcription.text:
@@ -1260,6 +1297,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
 
             output_transcription = getattr(server_content, "output_transcription", None)
             if output_transcription is not None and output_transcription.text:
+                self._caller_turn_reported = False
                 self._model_words.append(output_transcription.text)
                 await self._callback("transcript_delta", {"delta": output_transcription.text, "message_id": ""})
 
@@ -1269,12 +1307,14 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
                     inline = getattr(part, "inline_data", None)
                     if inline is not None and inline.data:
                         self._model_speaking = True
+                        self._caller_turn_reported = False
                         audio_b64 = base64.b64encode(inline.data).decode("utf-8")
                         await self._callback("audio_delta", {"delta": audio_b64, "message_id": ""})
 
             if getattr(server_content, "turn_complete", False):
                 self._interrupted_this_turn = False
                 self._model_speaking = False
+                self._caller_turn_reported = False
                 self._end_turn()
                 await self._callback("done", {"status": "completed"})
 
@@ -1287,13 +1327,48 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             for call in batch.calls:
                 await self._callback("tool_call", {"call_id": call.id, "name": call.name, "arguments": json.dumps(call.args or {})})
 
+    @staticmethod
+    def _transcribed(interim: Any, server_content: Any) -> bool:
+        """Whether a server message carries the caller's words, interim or final."""
+        final = getattr(server_content, "input_transcription", None)
+        return any(transcription is not None and transcription.text for transcription in (interim, final))
+
     def _end_turn(self) -> None:
-        """Add the turn's transcribed words to the history a transfer replays: the user's, then the agent's."""
-        for role, words in (("user", self._user_words), ("model", self._model_words)):
+        """Add the turn's transcribed words to the history a transfer replays: the user's, then the agent's.
+
+        The caller's words are also logged, as Gemini transcribed them, so a log shows both sides of
+        the call (the edge logs the agent's).
+        """
+        for author, role, words in (("user", "user", self._user_words), (self._speaker(), "model", self._model_words)):
             text = "".join(words).strip()
             if text:
-                self._history.append(types.Content(role=role, parts=[types.Part(text=text)]))
+                if author == "user":
+                    self._log.info(f"Caller said: {text}")
+                self._history.append(self._Said(author, types.Content(role=role, parts=[types.Part(text=text)])))
             words.clear()
+
+    def _speaker(self) -> str:
+        """The name of the agent answering, which the turn being recorded is the work of."""
+        return getattr(self._active, "name", None) or "agent"
+
+    def _presented_history(self) -> list[types.Content]:
+        """The conversation as ADK sends it to a Live socket after a transfer.
+
+        The caller's words go as they are. Every agent's turn, the new agent's own included, goes as
+        user-side context naming who said it or called what (``[architect] said: ...``), fenced as
+        data, through ADK's own presenter: so an agent can tell a teammate's words, and a question
+        put to it, from its own, and the Live API does not take replayed turns for the model's
+        current answer.
+        """
+        turns = []
+        for said in self._history:
+            if said.author == "user":
+                turns.append(said.content)
+                continue
+            presented = _present_other_agent_message(Event(author=said.author, content=said.content))
+            if presented is not None and presented.content is not None:
+                turns.append(presented.content)
+        return turns
 
     async def append_audio(self, base64_audio: str) -> None:
         if self._connection:
@@ -1304,7 +1379,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
     async def send_text(self, text: str) -> None:
         if self._connection:
             self._end_turn()
-            self._history.append(types.Content(role="user", parts=[types.Part(text=text)]))
+            self._history.append(self._Said("user", types.Content(role="user", parts=[types.Part(text=text)])))
             await self._connection.send_client_content(turns=types.Content(role="user", parts=[types.Part(text=text)]), turn_complete=True)
 
     async def send_tool_result(self, call_id: str, result: str) -> None:
@@ -1344,9 +1419,10 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         after them follow when the turn ends.
         """
         self._end_turn()
+        author = self._speaker()
         calls = [types.Part(function_call=types.FunctionCall(id=call.id, name=call.name, args=call.args or {})) for call in batch.calls]
-        self._history.append(types.Content(role="model", parts=calls))
-        self._history.append(types.Content(role="user", parts=[types.Part(function_response=response) for response in responses]))
+        self._history.append(self._Said(author, types.Content(role="model", parts=calls)))
+        self._history.append(self._Said(author, types.Content(role="user", parts=[types.Part(function_response=response) for response in responses])))
 
     @staticmethod
     def _responses(batch: GoogleADKRealtimeRunner._ToolBatch) -> list[types.FunctionResponse]:
@@ -1374,6 +1450,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         self._record_tool_turn(batch, self._responses(batch))
         self._interrupted_this_turn = False
         self._model_speaking = False
+        self._caller_turn_reported = False
         self._log.info(f"Transferring from '{previous.name}' to '{target.name}'")
         await self._callback("done", {"status": "transferred"})
         await self._callback("agent_changed", {"agent": target.name, "previous_agent": previous.name})
@@ -1402,11 +1479,11 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         ``ToolContext`` is built here instead, from this connection's own ADK session, carrying
         the active Agent Kernel context id in its state the same way a normal ADK run does.
 
-        The tool runs as the agent that made the call. A call that leaves
-        ``tool_context.actions.transfer_to_agent`` set (ADK's ``transfer_to_agent``, or any tool
-        that sets the action, as ADK allows) asks for a transfer, performed once every call of its
-        tool_call message has a result; the target is looked up across the agent tree, as ADK looks
-        it up.
+        The tool runs as the agent that made the call, between that agent's tool callbacks
+        (:meth:`_run_tool`). A call that leaves ``tool_context.actions.transfer_to_agent`` set (ADK's
+        ``transfer_to_agent``, any tool that sets the action, or a callback that does, as ADK
+        allows) asks for a transfer, performed once every call of its tool_call message has a
+        result; the target is looked up across the agent tree, as ADK looks it up.
         """
         from google.adk.agents.invocation_context import InvocationContext
         from google.adk.tools import ToolContext as ADKToolContext
@@ -1432,7 +1509,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         args = json.loads(arguments) if arguments else {}
         with context:
             tool_context.state["ak_tool_context"] = context.id
-            result = await tool.run_async(args=args, tool_context=tool_context)
+            result = await self._run_tool(caller, tool, args, tool_context)
 
         target_name = tool_context.actions.transfer_to_agent
         if target_name:
@@ -1441,6 +1518,48 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
                 return f"Error: there is no agent named {target_name} to transfer to"
             self._transfers[call_id] = target
         return str(result) if result is not None else ""
+
+    @classmethod
+    async def _run_tool(cls, caller: Any, tool: BaseTool, args: dict[str, Any], tool_context: ToolContext) -> Any:
+        """Run ``tool`` between ``caller``'s tool callbacks, in the order and with the short-circuits of ADK's own flow.
+
+        The before-callbacks run in turn until one returns a truthy result; a result other than
+        ``None`` answers in the tool's place and the tool does not run. A tool that raises is offered
+        to the error callbacks, the first result other than ``None`` replacing the error, which
+        otherwise propagates. The after-callbacks then run in turn until one returns a truthy result;
+        a result other than ``None`` replaces the tool's. Each callback may be sync or async.
+        """
+        response = None
+        for callback in getattr(caller, "canonical_before_tool_callbacks", None) or []:
+            response = await cls._call(callback, tool=tool, args=args, tool_context=tool_context)
+            if response:
+                break
+
+        if response is None:
+            try:
+                response = await tool.run_async(args=args, tool_context=tool_context)
+            except Exception as error:
+                for callback in getattr(caller, "canonical_on_tool_error_callbacks", None) or []:
+                    response = await cls._call(callback, tool=tool, args=args, tool_context=tool_context, error=error)
+                    if response is not None:
+                        break
+                if response is None:
+                    raise
+
+        altered = None
+        for callback in getattr(caller, "canonical_after_tool_callbacks", None) or []:
+            altered = await cls._call(callback, tool=tool, args=args, tool_context=tool_context, tool_response=response)
+            if altered:
+                break
+        return altered if altered is not None else response
+
+    @staticmethod
+    async def _call(callback: Callable, **kwargs: Any) -> Any:
+        """Call an ADK callback, awaiting it when it is async."""
+        result = callback(**kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     async def disconnect(self) -> None:
         self._closing = True
@@ -1634,31 +1753,34 @@ class GoogleADKToolBuilder(ToolBuilder):
                 return kwargs
             return {**kwargs, "tool_context": tool_context}
 
+        def activated_context(tool_context: ToolContext | None) -> contextlib.AbstractContextManager:
+            """
+            Activates the run's AK tool context for one tool call, if the ADK context carries its id.
+
+            A model's parallel tool calls run as concurrent tasks sharing that one AK context, so it is
+            activated per call with :meth:`AKToolContext.activated`, which keeps each call's reset token
+            separate.
+
+            :param tool_context: The ADK tool context supplied to the wrapper.
+            :return: A context manager for the duration of the call.
+            """
+            if tool_context and tool_context.state and tool_context.state.get("ak_tool_context"):
+                return AKToolContext.fetch(tool_context.state["ak_tool_context"]).activated()
+            return contextlib.nullcontext()
+
         if asyncio.iscoroutinefunction(func):
 
             @functools.wraps(func)
             async def wrapper(*args: Any, tool_context: ToolContext | None = None, **kwargs: Any) -> Any:
-                tctx: AKToolContext | None = None
-                try:
-                    if tool_context and tool_context.state and tool_context.state.get("ak_tool_context"):
-                        tctx = AKToolContext.fetch(tool_context.state["ak_tool_context"]).set()
+                with activated_context(tool_context):
                     return await func(*args, **forwarded_kwargs(args, kwargs, tool_context))
-                finally:
-                    if tctx:
-                        tctx.reset()
 
         else:
 
             @functools.wraps(func)
             def wrapper(*args: Any, tool_context: ToolContext | None = None, **kwargs: Any) -> Any:
-                tctx: AKToolContext | None = None
-                try:
-                    if tool_context and tool_context.state and tool_context.state.get("ak_tool_context"):
-                        tctx = AKToolContext.fetch(tool_context.state["ak_tool_context"]).set()
+                with activated_context(tool_context):
                     return func(*args, **forwarded_kwargs(args, kwargs, tool_context))
-                finally:
-                    if tctx:
-                        tctx.reset()
 
         # Only add a tool_context parameter if the original function does not already
         # declare one, and insert it before any **kwargs (VAR_KEYWORD) parameter to

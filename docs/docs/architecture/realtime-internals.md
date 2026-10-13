@@ -72,7 +72,8 @@ A `RealtimeRunner` adapter talks to the model and reports what it does through t
 | `transcript_delta` | A piece of the model's transcript | In order with its audio |
 | `tool_call` | The model called a function (a tool, or a handoff) | Runs `execute_tool()`, then `send_tool_result()` |
 | `done` | The model's turn ended | In order, after its audio |
-| `interrupt` / `speech_started` | The caller spoke over the model | Drops unheard audio and text, keeps `done` and `agent_changed` |
+| `interrupt` / `speech_started` | The caller started speaking: over the model (`interrupt`), or while it is silent (`speech_started`, reported once per caller turn by both adapters) | An `interrupt`, or a `speech_started` while paced audio is still queued, drops unheard audio and text and keeps `done` and `agent_changed`. Either one marks when the caller last spoke (see [Turn state](#turn-state)) |
+| `speech_heard` / `speech_stopped` | The caller is still speaking (`speech_heard`: Gemini, on each later transcription of their words), or has stopped (`speech_stopped`: OpenAI's server VAD, from an adapter with `reports_speech_stopped`) | Nothing reaches the edge; both mark when the caller last spoke, and `speech_stopped` ends `is_caller_speaking` |
 | `agent_changed` | A handoff moved the call to another agent | In order: after the old agent's output, before the new agent's |
 | `error` | The socket failed | Tells the caller, then replaces the connection |
 
@@ -93,6 +94,45 @@ flowchart LR
 ```
 
 On a barge-in, the queued audio and transcript are dropped (the caller will not hear them), but a queued `done` and `agent_changed` are kept: a handoff that already happened stays true.
+
+## Turn state
+
+Code that talks into a live call from outside it, such as a background job reporting its result, must wait for a quiet moment. Text sent into a call starts a model response, so sending it while the model or the caller is speaking cuts one of them off; on Gemini Live, text sent as a completed turn interrupts any response the model is still generating, even one that has produced no audio yet. `RealtimeConnection` exposes read-only properties for that, safe to read from any thread:
+
+| Property | Is |
+|---|---|
+| `is_responding` | True while model output is still queued for the edge, or a tool call is running until its result is sent (for an ADK handoff, that includes opening the next agent's socket) |
+| `last_model_output_at` | When the model's audio or transcript last left for the edge. Only output counts: not control events (an `interrupt` is the caller's doing), and not a finished tool call |
+| `last_model_generated_at` | When the adapter last reported model audio or transcript: the model's own time, ahead of the paced output above. With `last_agent_change_at` it tells whether the agent now answering has said anything yet, at the moment it calls a tool such as a handoff, while its words may still be queued |
+| `last_agent_change_at` | When the adapter last reported a handoff to another agent (`agent_changed`), in the model's own time: what is generated after it is the new agent's |
+| `last_tool_result_at` | When a tool call's result was last sent to the model. The model owes a reply to it; for an ADK handoff the result seeds the next agent's socket, so this marks the new agent's turn to speak |
+| `is_caller_speaking` | True from the caller starting to speak until the adapter reports they stopped, on an adapter that reports it (`reports_speech_stopped`: OpenAI). Always false on Gemini Live, which does not signal the end of speech |
+| `last_caller_speech_at` | When the caller was last heard speaking: their start (`speech_started` or `interrupt`), each later transcription of their words (`speech_heard`, Gemini), and their stop (`speech_stopped`, OpenAI). On Gemini it keeps moving through a long answer only as far as the model sends transcriptions while the caller speaks |
+| `last_edge_text_at` | When text from the edge last reached the model: text the caller typed, or a prompt the edge sends for them (such as the LiveKit gateway's greeting). Not text the application sends itself with `send_text` |
+
+`last_activity_at` cannot serve here: every caller audio frame moves it, silence included.
+
+The pool cannot see the model generating before its first output, after the caller speaks or types or a tool result is sent. Code deciding the call is quiet therefore checks that the model owes no reply: its last output is later than the caller's last speech, the edge's last text, the last tool result, and the code's own last post (each waited for a bounded time, since an input the model never answers must not hold the call forever). It also waits while `is_responding` or `is_caller_speaking`, and until nothing has happened for a short while. The `software-team` LiveKit example's `CallLink` does exactly this, then uses `RealtimeConnection.send_text`, which is thread-safe:
+
+```python
+import time
+
+from agentkernel.pipeline.realtime_pool import RealtimeConnectionPool
+
+
+def owes_reply(connection, my_last_post_at, wait=15.0):
+    """Whether the model has still to answer something it was given."""
+    output = connection.last_model_output_at
+    given = (connection.last_caller_speech_at, connection.last_edge_text_at, connection.last_tool_result_at, my_last_post_at)
+    now = time.time()
+    return any(at is not None and (output is None or output < at) and now - at < wait for at in given)
+
+
+connection = RealtimeConnectionPool.get().get_connection(session_id)
+busy = connection is None or connection.is_responding or connection.is_caller_speaking
+if not busy and not owes_reply(connection, last_post_at):
+    connection.send_text("[Team update, not from the client] The build finished; 12 tests pass.")
+```
 
 ## Starting a call: announcing the team
 
@@ -163,6 +203,8 @@ sequenceDiagram
 
 A Gemini Live session's instructions, tools and voice are fixed when the socket opens. A transfer therefore opens a new socket configured for the new agent and seeds it with the conversation so far, which is what ADK's own live runner does. The model calls ADK's own `transfer_to_agent` tool; any tool that sets `tool_context.actions.transfer_to_agent` transfers too, as ADK allows.
 
+Every tool call, `transfer_to_agent` included, runs between the calling agent's `before_tool_callback`, `on_tool_error_callback` and `after_tool_callback`, in the order and with the short-circuits of ADK's own flow. A before-callback that returns a result answers in the tool's place, so a callback can refuse a transfer (for example, to stop agents handing a call back and forth without the caller). ADK plugins do not run: a Live socket has no ADK `Runner` to hold them.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -199,6 +241,8 @@ The history the adapter keeps and replays is what ADK's session records, minus t
 | Text AK sent (for example the greeting) | `send_text()` |
 | Every tool call and its result | Each answered tool-call message |
 
+Each entry remembers who it came from: the caller, or the agent that said it or made the call. A new socket is seeded the way ADK seeds a Live socket after a transfer: the caller's words go as they are, and every agent's turn, the new agent's own included, goes on the caller's side as context naming its author (`[architect] said: ...`, `[pm] called tool ...`), fenced as data by ADK's own presenter. So an agent can tell a teammate's words from its own, and answer a question a teammate put to it before handing the call over.
+
 The caller hears a short gap (about 1 to 2 seconds) while the new socket opens; what the caller says during it is not heard.
 
 ## OpenAI and Google ADK side by side
@@ -212,6 +256,7 @@ The caller hears a short gap (about 1 to 2 seconds) while the new socket opens; 
 | Gap on a handoff | None | About 1 to 2 seconds |
 | Voice | One voice for every agent | Each agent's own voice |
 | Checked at connect | Handoffs that filter or nest the history are rejected | Every reachable agent must be an `LlmAgent` with a Live model and a string instruction |
+| Refusing a handoff | An `on_handoff` that raises; the agent stays and the model gets the error | A `before_tool_callback` that answers for `transfer_to_agent` |
 
 ## Where each piece lives
 

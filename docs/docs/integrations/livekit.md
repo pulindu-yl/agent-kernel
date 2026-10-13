@@ -156,7 +156,7 @@ if __name__ == "__main__":
     IOHandler.run(gateways=[GatewayRunner(LiveKitEdgeGateway(session_id="room_01", agent_name="supervisor"))])
 ```
 
-The conversation, and the context the caller has given, carries over to the agent that takes the call.
+The conversation, and the context the caller has given, carries over to the agent that takes the call. On Google ADK, the agent that takes the call sees each earlier turn with who said it (`[billing] said: ...`), as ADK presents another agent's turns, so agents can put questions to each other and answer them.
 
 ### What the caller sees in the room
 
@@ -181,9 +181,35 @@ Each agent participant needs a token of its own, so the gateway needs `AK_LIVEKI
 
 For how handoffs flow through the pipeline, see [Realtime Voice Internals](../architecture/realtime-internals.md).
 
+### Refusing a handoff
+
+Agents that can hand off to each other can also do so without the caller, back and forth. Each framework's own hook can refuse a handoff, and the refused agent keeps the call:
+
+- **OpenAI Agents SDK**: wrap the target in `handoff(agent, on_handoff=...)` and raise from the hook. The model gets the exception's message as the handoff's result.
+- **Google ADK**: give the agent a `before_tool_callback` that returns a result for `transfer_to_agent`. Realtime runs an agent's `before_tool_callback`, `on_tool_error_callback` and `after_tool_callback` around every tool call, as an ADK run does; ADK plugins do not run.
+
+```python
+from google.adk.agents import Agent as GoogleAgent
+
+
+def limit_handoffs(tool, args, tool_context):
+    if tool.name == "transfer_to_agent" and too_many_handoffs():
+        return {"result": "Handoff refused: ask the caller what they think first."}
+    return None  # let the tool run
+
+
+supervisor = GoogleAgent(name="supervisor", model="gemini-3.1-flash-live-preview", sub_agents=[billing], before_tool_callback=limit_handoffs)
+```
+
+## Talking into a live call
+
+Background work can report back into the call: `RealtimeConnectionPool.get().get_connection(session_id).send_text(...)` puts text into the conversation, and whichever agent has the call answers it. Text starts a model response (on Gemini Live it also interrupts one still being generated), so send it only at a quiet moment; the connection's read-only turn state (`is_responding`, `is_caller_speaking`, `last_model_output_at`, `last_tool_result_at`, `last_caller_speech_at`, `last_edge_text_at`) says when that is: nothing is being played or run, and the model has answered whatever it was last given. See [Turn state](../architecture/realtime-internals.md#turn-state). The `software-team` example's `CallLink` shows the whole pattern.
+
 ## Example Projects
 
 Complete working examples (with In-Memory, Kafka, NATS, and AWS SQS architectures) are available in the **examples/api/livekit-voice** directory. The `openai/handoffs` and `google/handoffs` variants show multi-agent handoffs with an internet support line (supervisor, billing and tech support).
+
+The `software-team` showcase puts both patterns together: a client talks to a Gemini Live voice team (Worker, PM, Architect) that agrees requirements and a design with them, then has background agents (Google ADK agents on an OpenAI model through LiteLLM) write, test and review the code in the sandbox, reporting back into the call. The client follows it on its own page: a data-only "project board" participant sends the project's state into the room on its own topic, which the page draws beside the call.
 
 ## Limitations
 

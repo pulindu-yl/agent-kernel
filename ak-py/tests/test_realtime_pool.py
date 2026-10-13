@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import re
 import threading
 import types
 
@@ -550,6 +552,207 @@ class TestRealtimeBargeIn:
         assert _kinds(_drain_output(transport)) == ["agent_changed", "audio_delta", "done"]
 
 
+class TestRealtimeTurnState:
+    """Read-only turn state lets code that talks into a call tell a quiet call from a busy one."""
+
+    class _BlockingAdapter(_Adapter):
+        """A tool that runs until the test releases it, or raises when told to."""
+
+        def __init__(self):
+            super().__init__()
+            self.release = asyncio.Event()
+            self.fail = False
+
+        async def execute_tool(self, name, arguments, context, call_id):
+            await self.release.wait()
+            if self.fail:
+                raise RuntimeError("tool broke")
+            return "done"
+
+    @pytest.fixture(autouse=True)
+    def _transport(self, monkeypatch):
+        monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
+
+    @pytest.mark.asyncio
+    async def test_a_new_connection_is_quiet(self):
+        conn = _connection(loop=asyncio.get_running_loop())
+
+        assert conn.is_responding is False
+        assert conn.last_model_output_at is None
+        assert conn.last_tool_result_at is None
+        assert conn.last_model_generated_at is None
+        assert conn.last_agent_change_at is None
+        assert conn.last_caller_speech_at is None
+        assert conn.last_edge_text_at is None
+
+    @pytest.mark.asyncio
+    async def test_queued_output_is_a_response_until_it_reaches_the_edge(self):
+        conn = _connection(loop=asyncio.get_running_loop())
+        await conn.connect()
+        await asyncio.sleep(0.1)
+        assert conn.is_responding is False
+
+        await conn.handle_framework_event("audio_delta", {"delta": "QUFB"})
+        await conn.handle_framework_event("done", {"status": "completed"})
+        assert conn.is_responding is True
+
+        await asyncio.sleep(0.2)
+        conn._pacing_task.cancel()
+        assert conn.is_responding is False
+        assert conn.last_model_output_at is not None
+
+    @pytest.mark.asyncio
+    async def test_control_events_are_not_model_output(self):
+        """An interrupt is the caller's doing, so it must not read as the model answering them."""
+        conn = _connection(loop=asyncio.get_running_loop())
+        await conn.connect()
+        await conn.handle_framework_event("interrupt", {})
+        await conn.handle_framework_event("done", {"status": "completed"})
+        await asyncio.sleep(0.1)
+        assert conn.last_model_output_at is None
+
+        await conn.handle_framework_event("transcript_delta", {"delta": "Hi", "message_id": "m1"})
+        await asyncio.sleep(0.1)
+        conn._pacing_task.cancel()
+        assert conn.last_model_output_at is not None
+
+    @pytest.mark.asyncio
+    async def test_a_barge_in_ends_the_response_once_its_kept_events_are_out(self):
+        conn = _connection(loop=asyncio.get_running_loop())
+        await conn.handle_framework_event("audio_delta", {"delta": "QUFB"})
+        await conn.handle_framework_event("done", {"status": "completed"})
+        await conn.handle_framework_event("interrupt", {})
+        assert conn.is_responding is True
+
+        await conn.connect()
+        await asyncio.sleep(0.2)
+        conn._pacing_task.cancel()
+        assert conn.is_responding is False
+
+    @pytest.mark.asyncio
+    async def test_a_tool_call_is_a_response_until_its_result_is_sent(self):
+        conn = _connection(agent=_Agent(realtime_runner_cls=self._BlockingAdapter), loop=asyncio.get_running_loop())
+
+        await conn.handle_framework_event("tool_call", {"call_id": "c1", "name": "lookup", "arguments": "{}"})
+        await asyncio.sleep(0.05)
+        assert conn.is_responding is True
+        assert conn.adapter.tool_results == []
+
+        conn.adapter.release.set()
+        await asyncio.sleep(0.05)
+        assert conn.adapter.tool_results == [("c1", "done")]
+        assert conn.is_responding is False
+        # The result is input the model has still to answer, not output: a caller waiting for a quiet
+        # moment must not take the gap before the model's reply for silence.
+        assert conn.last_tool_result_at is not None
+        assert conn.last_model_output_at is None
+
+    @pytest.mark.asyncio
+    async def test_a_failing_tool_call_still_ends(self):
+        conn = _connection(agent=_Agent(realtime_runner_cls=self._BlockingAdapter), loop=asyncio.get_running_loop())
+        conn.adapter.fail = True
+        conn.adapter.release.set()
+
+        await conn._execute_tool_and_reply("c1", "lookup", "{}")
+
+        assert conn.adapter.tool_results == [("c1", "Error: tool broke")]
+        assert conn.is_responding is False
+        assert conn.last_tool_result_at is not None
+
+    @pytest.mark.asyncio
+    async def test_the_caller_starting_to_speak_is_timestamped(self):
+        conn = _connection(loop=asyncio.get_running_loop())
+
+        await conn.handle_framework_event("audio_delta", {"delta": "QUFB"})
+        assert conn.last_caller_speech_at is None
+
+        await conn.handle_framework_event("speech_started", {})
+        first = conn.last_caller_speech_at
+        assert first is not None
+
+        await asyncio.sleep(0.01)
+        await conn.handle_framework_event("interrupt", {})
+        assert conn.last_caller_speech_at > first
+
+    @pytest.mark.asyncio
+    async def test_a_long_answer_keeps_the_caller_heard(self):
+        """Live: the caller's turn start was the only timestamp, so a 20 s answer read as silence after 15 s."""
+        conn = _connection(loop=asyncio.get_running_loop())
+        await conn.handle_framework_event("speech_started", {})
+        started = conn.last_caller_speech_at
+
+        await asyncio.sleep(0.01)
+        await conn.handle_framework_event("speech_heard", {})
+
+        assert conn.last_caller_speech_at > started
+        assert conn.is_caller_speaking is False  # this adapter cannot tell when the caller stops
+        assert list(conn._audio_queue._queue) == []
+
+    @pytest.mark.asyncio
+    async def test_an_adapter_that_reports_the_end_of_speech_marks_the_caller_speaking_until_then(self):
+        class _VADAdapter(_Adapter):
+            reports_speech_stopped = True
+
+        conn = _connection(agent=_Agent(realtime_runner_cls=_VADAdapter), loop=asyncio.get_running_loop())
+
+        await conn.handle_framework_event("speech_started", {})
+        assert conn.is_caller_speaking is True
+        started = conn.last_caller_speech_at
+
+        await asyncio.sleep(0.01)
+        await conn.handle_framework_event("speech_stopped", {})
+        assert conn.is_caller_speaking is False
+        assert conn.last_caller_speech_at > started
+
+        await conn.handle_framework_event("interrupt", {})
+        assert conn.is_caller_speaking is True
+        await conn.handle_framework_event("audio_delta", {"delta": "QUFB"})
+        assert conn.is_caller_speaking is False  # the model answering ends it, should a stop never arrive
+
+    @pytest.mark.asyncio
+    async def test_what_the_model_generates_is_timestamped_before_it_is_paced_out(self):
+        """A handoff's tool call runs while its agent's words are still queued: whether that agent said
+        anything is known from when the words were generated, not from when they reached the edge."""
+        conn = _connection(loop=asyncio.get_running_loop())
+
+        await conn.handle_framework_event("agent_changed", {"agent": "billing", "previous_agent": "supervisor"})
+        changed = conn.last_agent_change_at
+        assert changed is not None and conn.last_model_generated_at is None
+
+        await asyncio.sleep(0.01)
+        await conn.handle_framework_event("audio_delta", {"delta": "QUFB"})
+        assert conn.last_model_generated_at > changed  # the new agent has spoken
+        assert conn.last_model_output_at is None  # though nothing has been paced out yet
+
+    @pytest.mark.asyncio
+    async def test_text_from_the_edge_is_timestamped_and_the_applications_own_is_not(self):
+        """Typed chat is the caller's input, which the model owes a reply to; an application's own update is not."""
+        conn = _connection(loop=asyncio.get_running_loop())
+
+        conn.send_text("[Team update] J1 finished.")
+        await asyncio.sleep(0)
+        assert conn.last_edge_text_at is None
+
+        conn.send_text("Here is the link: example.com", from_edge=True)
+        await asyncio.sleep(0)
+        assert conn.last_edge_text_at is not None
+        assert conn.last_caller_speech_at is None  # typed, not spoken
+        assert conn.adapter.texts == ["[Team update] J1 finished.", "Here is the link: example.com"]
+
+    def test_turn_state_is_readable_from_another_thread(self):
+        loop = asyncio.new_event_loop()
+        conn = _connection(loop=loop)
+        try:
+            loop.run_until_complete(conn.handle_framework_event("audio_delta", {"delta": "QUFB"}))
+            seen = {}
+            reader = threading.Thread(target=lambda: seen.update(responding=conn.is_responding, speech=conn.last_caller_speech_at))
+            reader.start()
+            reader.join(timeout=5)
+            assert seen == {"responding": True, "speech": None}
+        finally:
+            loop.close()
+
+
 class TestRealtimeAgentChanged:
     """The agent speaking is announced in order with the output it divides, so an edge never credits
     one agent's words to another."""
@@ -702,6 +905,19 @@ class TestOpenAIBargeIn:
         await adapter._handle_message(self._event("input_audio_buffer.speech_started"))
 
         assert adapter.events == ["done", "speech_started"]
+
+    @pytest.mark.asyncio
+    async def test_the_end_of_the_users_speech_is_reported(self):
+        """Server VAD signals it, so the pool can tell a long answer from silence."""
+        from agentkernel.framework.openai.openai import OpenAIRealtimeRunner
+
+        adapter = self._adapter()
+
+        await adapter._handle_message(self._event("input_audio_buffer.speech_started"))
+        await adapter._handle_message(self._event("input_audio_buffer.speech_stopped"))
+
+        assert adapter.events == ["speech_started", "speech_stopped"]
+        assert OpenAIRealtimeRunner.reports_speech_stopped is True
 
 
 class TestOpenAIRealtimeSession:
@@ -1540,7 +1756,8 @@ class TestADKConnectConfig:
 class _FakeLiveSession:
     """A Gemini Live session replaying scripted turns: each receive() yields one turn's messages, and
     waits once they are spent, as an open socket does. A callable in the script is a wait: the next
-    turn comes once it returns True for the session, as a model answers only after its tool calls are."""
+    turn comes once it returns True for the session, as a model answers only after its tool calls are.
+    A number is a pause in seconds, as a caller listens before answering."""
 
     def __init__(self, turns):
         self.turns = list(turns)
@@ -1551,9 +1768,12 @@ class _FakeLiveSession:
         self._answered = asyncio.Event()
 
     async def receive(self):
-        while self.turns and callable(self.turns[0]):
-            ready = self.turns.pop(0)
-            while not ready(self):
+        while self.turns and (callable(self.turns[0]) or isinstance(self.turns[0], float)):
+            step = self.turns.pop(0)
+            if isinstance(step, float):
+                await asyncio.sleep(step)
+                continue
+            while not step(self):
                 self._answered.clear()
                 await self._answered.wait()
         if not self.turns:
@@ -1610,6 +1830,18 @@ def _live_message(**server_content):
 
 def _live_transcript(attribute, text):
     return _live_message(**{attribute: types.SimpleNamespace(text=text)})
+
+
+def _seen(turns):
+    """What a seeded Gemini socket shows, one line per part: the caller's words as they are, and each agent's
+    turn as ADK presents it (``[billing] said: ...``), without ADK's preamble and fence markers."""
+    lines = []
+    for content in turns:
+        for part in content.parts:
+            if part.text.startswith("For context:"):
+                continue
+            lines.append(" ".join(re.sub(r"<<<[A-Z_]+>>>", "", part.text).split()))
+    return lines
 
 
 def _live_tool_call(call_id, name, **args):
@@ -1826,6 +2058,9 @@ class TestADKRealtimeTransfers:
                     ),
                     _live_message(turn_complete=True),
                 ],
+                # The caller hears billing out before speaking again: words while its audio is
+                # still being paced would be a barge-in.
+                0.3,
                 [
                     _live_transcript("input_transcription", "And my internet is down."),
                     _live_tool_call("c2", "transfer_to_agent", agent_name="supervisor"),
@@ -1848,21 +2083,25 @@ class TestADKRealtimeTransfers:
         assert client.configs[0][1].history_config is None
         assert client.configs[1][1].history_config.initial_history_in_client_content is True
 
+        # Every agent turn goes on the user's side, naming who did it, as ADK presents it to a Live socket.
         [(seeded, turn_complete)] = billing.client_content
         assert turn_complete is True
-        assert [content.role for content in seeded] == ["user", "model", "user"]
-        assert seeded[0].parts[0].text == "My bill is too high."
-        assert seeded[1].parts[0].function_call.args == {"agent_name": "billing"}
-        assert seeded[2].parts[0].function_response.name == "transfer_to_agent"
+        assert all(content.role == "user" for content in seeded)
+        assert _seen(seeded) == [
+            "My bill is too high.",
+            "[supervisor] called tool `transfer_to_agent` with parameters: {'agent_name': 'billing'}",
+            "[supervisor] `transfer_to_agent` tool returned result: {'result': ''}",
+        ]
         # Gemini 3.x waits for fresh input after replayed history; the placeholder ADK sends prompts it.
         assert billing.realtime_text == ["."]
 
+        # Back at the supervisor, billing's words are billing's, not the supervisor's own.
         [(reseeded, _)] = last.client_content
-        assert [part.text for content in reseeded for part in content.parts if part.text] == [
-            "My bill is too high.",
-            "Billing here.",
-            "And my internet is down.",
-        ]
+        seen = _seen(reseeded)
+        assert seen[0] == "My bill is too high."
+        assert "[billing] said: Billing here." in seen
+        assert "And my internet is down." in seen
+        assert seen[-1] == "[billing] `transfer_to_agent` tool returned result: {'result': ''}"
 
         kinds = _kinds(_drain_output(transport))
         assert kinds == ["agent_changed", "done", "agent_changed", "text_delta", "audio_delta", "done", "done", "agent_changed"]
@@ -1892,9 +2131,12 @@ class TestADKRealtimeTransfers:
 
         seeded = await self._seeded_after_first_transfer(monkeypatch, client, supervisor_tools=[lookup_account])
 
-        calls, responses = seeded[-2], seeded[-1]
-        assert [(part.function_call.id, part.function_call.name) for part in calls.parts] == [("c1", "lookup_account"), ("c2", "transfer_to_agent")]
-        assert [part.function_response.response for part in responses.parts] == [{"result": "A-1042: fibre 500, paid up"}, {"result": ""}]
+        assert _seen(seeded)[-4:] == [
+            "[supervisor] called tool `lookup_account` with parameters: {'account_id': 'A-1042'}",
+            "[supervisor] called tool `transfer_to_agent` with parameters: {'agent_name': 'billing'}",
+            "[supervisor] `lookup_account` tool returned result: {'result': 'A-1042: fibre 500, paid up'}",
+            "[supervisor] `transfer_to_agent` tool returned result: {'result': ''}",
+        ]
         assert len(client.sessions) == 2
 
     @pytest.mark.asyncio
@@ -1921,23 +2163,15 @@ class TestADKRealtimeTransfers:
 
         seeded = await self._seeded_after_first_transfer(monkeypatch, client, supervisor_tools=[lookup_account])
 
-        def describe(content):
-            part = content.parts[0]
-            if part.text:
-                return part.text
-            if part.function_call:
-                return f"call {part.function_call.name}"
-            return f"result {part.function_response.name}: {part.function_response.response['result']}"
-
-        assert [(content.role, describe(content)) for content in seeded] == [
-            ("user", "My account is A-1042."),
-            ("model", "Let me check."),
-            ("model", "call lookup_account"),
-            ("user", "result lookup_account: A-1042: fibre 500, paid up"),
-            ("model", "You are on fibre 500."),
-            ("user", "Why is my bill higher?"),
-            ("model", "call transfer_to_agent"),
-            ("user", "result transfer_to_agent: "),
+        assert _seen(seeded) == [
+            "My account is A-1042.",
+            "[supervisor] said: Let me check.",
+            "[supervisor] called tool `lookup_account` with parameters: {'account_id': 'A-1042'}",
+            "[supervisor] `lookup_account` tool returned result: {'result': 'A-1042: fibre 500, paid up'}",
+            "[supervisor] said: You are on fibre 500.",
+            "Why is my bill higher?",
+            "[supervisor] called tool `transfer_to_agent` with parameters: {'agent_name': 'billing'}",
+            "[supervisor] `transfer_to_agent` tool returned result: {'result': ''}",
         ]
 
     @pytest.mark.asyncio
@@ -1949,9 +2183,10 @@ class TestADKRealtimeTransfers:
         seeded = await self._seeded_after_first_transfer(monkeypatch, client)
 
         assert client.configs[1][1].system_instruction.parts[0].text.startswith("Answer billing questions.")
-        assert [part.function_response.response["result"] for part in seeded[-1].parts] == [
-            "",
-            "Error: only one handoff is performed per turn; this one, to tech_support, was not",
+        assert _seen(seeded)[-2:] == [
+            "[supervisor] `transfer_to_agent` tool returned result: {'result': ''}",
+            "[supervisor] `transfer_to_agent` tool returned result: "
+            "{'result': 'Error: only one handoff is performed per turn; this one, to tech_support, was not'}",
         ]
 
     @pytest.mark.asyncio
@@ -1970,6 +2205,296 @@ class TestADKRealtimeTransfers:
         body = json.loads(_drain_output(transport)[-1].body)
         assert "transfer to 'billing' failed" in body["error"]
         await conn.close()
+
+
+class TestADKRealtimeToolCallbacks:
+    """A tool call runs between the calling agent's tool callbacks, as on an ADK run, transfers included."""
+
+    MODEL = "gemini-3.1-flash-live-preview"
+
+    @classmethod
+    def _graph(cls, supervisor_tools=(), **supervisor_options):
+        from google.adk.agents import Agent as GoogleAgent
+
+        billing = GoogleAgent(name="billing", model=cls.MODEL, description="Invoices and charges.", instruction="Answer billing questions.")
+        supervisor = GoogleAgent(
+            name="supervisor",
+            model=cls.MODEL,
+            description="Routes callers.",
+            instruction="Route the caller.",
+            sub_agents=[billing],
+            tools=list(supervisor_tools),
+            **supervisor_options,
+        )
+        return supervisor, billing
+
+    @staticmethod
+    async def _execute(runner, name, arguments="{}", call_id="c1"):
+        return await runner.execute_tool(name, arguments, TestADKRealtimeTransfers._context(), call_id)
+
+    @staticmethod
+    def lookup(account_id: str) -> str:
+        """Look up a caller's account."""
+        return f"{account_id}: paid up"
+
+    @pytest.mark.asyncio
+    async def test_a_before_callback_that_answers_stops_a_transfer(self):
+        def guard(tool, args, tool_context):
+            if tool.name == "transfer_to_agent":
+                return {"result": "Too many handoffs; talk to the caller first."}
+            return None
+
+        supervisor, _ = self._graph(before_tool_callback=guard)
+        runner = await TestADKRealtimeTransfers._runner(supervisor)
+
+        result = await self._execute(runner, "transfer_to_agent", '{"agent_name": "billing"}')
+
+        assert "Too many handoffs" in result
+        assert runner._transfers == {}
+
+    @pytest.mark.asyncio
+    async def test_a_before_callback_returning_none_lets_the_tool_run(self):
+        seen = []
+
+        def watch(tool, args, tool_context):
+            seen.append((tool.name, args))
+            return None
+
+        supervisor, billing = self._graph(before_tool_callback=watch)
+        runner = await TestADKRealtimeTransfers._runner(supervisor)
+
+        await self._execute(runner, "transfer_to_agent", '{"agent_name": "billing"}')
+
+        assert seen == [("transfer_to_agent", {"agent_name": "billing"})]
+        assert runner._transfers["c1"] is billing
+
+    @pytest.mark.asyncio
+    async def test_before_callbacks_run_in_order_until_one_answers(self):
+        calls = []
+
+        def first(tool, args, tool_context):
+            calls.append("first")
+            return None
+
+        def second(tool, args, tool_context):
+            calls.append("second")
+            return {"result": "from second"}
+
+        def third(tool, args, tool_context):
+            calls.append("third")
+            return {"result": "from third"}
+
+        supervisor, _ = self._graph(supervisor_tools=[self.lookup], before_tool_callback=[first, second, third])
+        runner = await TestADKRealtimeTransfers._runner(supervisor)
+
+        result = await self._execute(runner, "lookup", '{"account_id": "A-1"}')
+
+        assert calls == ["first", "second"]
+        assert "from second" in result
+
+    @pytest.mark.asyncio
+    async def test_a_before_callback_can_ask_for_a_transfer(self):
+        def escalate(tool, args, tool_context):
+            tool_context.actions.transfer_to_agent = "billing"
+            return {"result": "escalated"}
+
+        supervisor, billing = self._graph(supervisor_tools=[self.lookup], before_tool_callback=escalate)
+        runner = await TestADKRealtimeTransfers._runner(supervisor)
+
+        result = await self._execute(runner, "lookup", '{"account_id": "A-1"}')
+
+        assert "escalated" in result
+        assert runner._transfers["c1"] is billing
+
+    @pytest.mark.asyncio
+    async def test_an_after_callback_replaces_the_result(self):
+        def shout(tool, args, tool_context, tool_response):
+            return {"result": tool_response.upper()}
+
+        supervisor, _ = self._graph(supervisor_tools=[self.lookup], after_tool_callback=shout)
+        runner = await TestADKRealtimeTransfers._runner(supervisor)
+
+        result = await self._execute(runner, "lookup", '{"account_id": "a-1"}')
+
+        assert "A-1: PAID UP" in result
+
+    @pytest.mark.asyncio
+    async def test_an_after_callback_returning_none_keeps_the_result(self):
+        supervisor, _ = self._graph(supervisor_tools=[self.lookup], after_tool_callback=lambda tool, args, tool_context, tool_response: None)
+        runner = await TestADKRealtimeTransfers._runner(supervisor)
+
+        assert await self._execute(runner, "lookup", '{"account_id": "A-1"}') == "A-1: paid up"
+
+    @pytest.mark.asyncio
+    async def test_an_error_callback_replaces_the_error(self):
+        def broken(account_id: str) -> str:
+            """Look up a caller's account."""
+            raise ValueError("account service down")
+
+        def recover(tool, args, tool_context, error):
+            return {"result": f"Could not look it up: {error}"}
+
+        supervisor, _ = self._graph(supervisor_tools=[broken], on_tool_error_callback=recover)
+        runner = await TestADKRealtimeTransfers._runner(supervisor)
+
+        result = await self._execute(runner, "broken", '{"account_id": "A-1"}')
+
+        assert "Could not look it up: account service down" in result
+
+    @pytest.mark.asyncio
+    async def test_without_an_error_callback_the_error_propagates(self):
+        def broken(account_id: str) -> str:
+            """Look up a caller's account."""
+            raise ValueError("account service down")
+
+        supervisor, _ = self._graph(supervisor_tools=[broken], on_tool_error_callback=lambda tool, args, tool_context, error: None)
+        runner = await TestADKRealtimeTransfers._runner(supervisor)
+
+        with pytest.raises(ValueError, match="account service down"):
+            await self._execute(runner, "broken", '{"account_id": "A-1"}')
+
+    @pytest.mark.asyncio
+    async def test_async_callbacks_are_awaited(self):
+        async def guard(tool, args, tool_context):
+            await asyncio.sleep(0)
+            return {"result": "refused"}
+
+        async def note(tool, args, tool_context, tool_response):
+            await asyncio.sleep(0)
+            return None
+
+        supervisor, _ = self._graph(before_tool_callback=guard, after_tool_callback=note)
+        runner = await TestADKRealtimeTransfers._runner(supervisor)
+
+        result = await self._execute(runner, "transfer_to_agent", '{"agent_name": "billing"}')
+
+        assert "refused" in result
+        assert runner._transfers == {}
+
+    @pytest.mark.asyncio
+    async def test_the_callbacks_are_the_calling_agents(self):
+        """A call made before a transfer runs as the agent that made it, with that agent's callbacks."""
+        callers = []
+
+        supervisor, billing = self._graph(
+            before_tool_callback=lambda tool, args, tool_context: callers.append(("supervisor", tool_context.agent_name))
+        )
+        billing.before_tool_callback = lambda tool, args, tool_context: callers.append(("billing", tool_context.agent_name))
+        runner = await TestADKRealtimeTransfers._runner(billing)
+        runner._callers["c1"] = supervisor
+
+        await self._execute(runner, "transfer_to_agent", '{"agent_name": "billing"}')
+
+        assert callers == [("supervisor", "supervisor")]
+
+
+class TestADKRealtimeSpeechStarted:
+    """The caller starting a turn while Gemini is silent is reported once, so the pool can timestamp it."""
+
+    @staticmethod
+    def _runner():
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        events = []
+
+        async def callback(event_type, data):
+            events.append(event_type)
+
+        runner = GoogleADKRealtimeRunner()
+        runner._callback = callback
+        return runner, events
+
+    @staticmethod
+    def _audio():
+        return _live_message(model_turn=types.SimpleNamespace(parts=[types.SimpleNamespace(inline_data=types.SimpleNamespace(data=b"\x00\x00"))]))
+
+    @staticmethod
+    def _caller(events):
+        return [event for event in events if event in ("speech_started", "interrupt")]
+
+    @pytest.mark.asyncio
+    async def test_the_callers_words_while_the_model_is_silent_are_reported_once(self):
+        runner, events = self._runner()
+
+        await runner._handle_message(_live_transcript("input_transcription", "I need"))
+        await runner._handle_message(_live_transcript("input_transcription", " a login page."))
+
+        assert self._caller(events) == ["speech_started"]
+
+    @pytest.mark.asyncio
+    async def test_later_words_of_the_same_turn_say_the_caller_is_still_speaking(self):
+        runner, events = self._runner()
+
+        await runner._handle_message(_live_transcript("interim_input_transcription", "I need"))
+        await runner._handle_message(_live_transcript("interim_input_transcription", "I need a login page"))
+        await runner._handle_message(_live_transcript("input_transcription", "I need a login page."))
+
+        assert [e for e in events if e.startswith("speech_")] == ["speech_started", "speech_heard", "speech_heard"]
+
+    @pytest.mark.asyncio
+    async def test_words_over_the_model_before_the_barge_in_are_not_speech_heard(self):
+        runner, events = self._runner()
+        await runner._handle_message(self._audio())
+
+        await runner._handle_message(_live_transcript("interim_input_transcription", "Wait"))
+
+        assert "speech_heard" not in events
+
+    @pytest.mark.asyncio
+    async def test_the_callers_words_are_logged_when_the_turn_ends(self, caplog):
+        """The edge logs the agent's words; this logs the caller's, so a log reads as both sides of the call."""
+        runner, _ = self._runner()
+
+        with caplog.at_level(logging.INFO, logger="ak.adk.realtime"):
+            await runner._handle_message(_live_transcript("input_transcription", "I need"))
+            await runner._handle_message(_live_transcript("input_transcription", " a login page."))
+            await runner._handle_message(_live_message(turn_complete=True))
+
+        assert "Caller said: I need a login page." in caplog.messages
+
+    @pytest.mark.asyncio
+    async def test_interim_words_count_too(self):
+        runner, events = self._runner()
+
+        await runner._handle_message(_live_transcript("interim_input_transcription", "I ne"))
+
+        assert self._caller(events) == ["speech_started"]
+
+    @pytest.mark.asyncio
+    async def test_words_over_the_model_are_a_barge_in_reported_once(self):
+        runner, events = self._runner()
+        await runner._handle_message(self._audio())
+
+        await runner._handle_message(_live_transcript("interim_input_transcription", "Wait"))
+        await runner._handle_message(_live_transcript("input_transcription", "Wait, one more thing."))
+
+        assert self._caller(events) == ["interrupt"]
+
+    @pytest.mark.asyncio
+    async def test_the_callers_next_turn_is_reported_after_the_model_answers(self):
+        runner, events = self._runner()
+
+        await runner._handle_message(_live_transcript("input_transcription", "Hello team."))
+        await runner._handle_message(self._audio())
+        await runner._handle_message(_live_message(turn_complete=True))
+        await runner._handle_message(_live_transcript("input_transcription", "Can you start?"))
+
+        assert self._caller(events) == ["speech_started", "speech_started"]
+
+    @pytest.mark.asyncio
+    async def test_the_pool_timestamps_it(self, monkeypatch):
+        """End to end: Gemini's speech_started reaches the connection's turn state, with nothing emitted."""
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        transport = InMemoryTransport()
+        monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: transport))
+        conn = _connection(agent=_Agent(realtime_runner_cls=GoogleADKRealtimeRunner), loop=asyncio.get_running_loop())
+        conn.adapter._callback = conn.handle_framework_event
+
+        await conn.adapter._handle_message(_live_transcript("input_transcription", "Hello team."))
+
+        assert conn.last_caller_speech_at is not None
+        assert list(conn._audio_queue._queue) == []
 
 
 class TestRealtimeRunnerCleanup:
