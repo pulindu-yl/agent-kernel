@@ -96,8 +96,10 @@ class Logfire(BaseTrace):
 
     def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
         """
-        Fetches spans back from Logfire through the SQL Query API (needs ``LOGFIRE_READ_TOKEN``).
+        Fetches spans back from Logfire through the SQL Query API (needs ``LOGFIRE_READ_TOKEN``, resolved
+        through the secret manager).
         """
+        from ...secret import SecretManager
         from .fetch import LogfireTraceFetcher
 
-        return LogfireTraceFetcher().fetch(query)
+        return LogfireTraceFetcher(SecretManager.current().get(LogfireTraceFetcher.READ_TOKEN_ENV, None)).fetch(query)

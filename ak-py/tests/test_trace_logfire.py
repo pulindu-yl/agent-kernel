@@ -67,6 +67,28 @@ def test_init_keeps_session_id_from_scrubbing(fake_logfire):
     assert callback(types.SimpleNamespace(path=("attributes", "session_token"), value="x")) is None
 
 
+def test_fetch_resolves_the_read_token_through_the_secret_manager(fake_logfire, monkeypatch):
+    from agentkernel.core.util.factory import AKConfigError
+    from agentkernel.secret import SecretManager
+    from agentkernel.trace import TraceQuery
+    from agentkernel.trace.logfire.fetch import LogfireTraceFetcher
+    from agentkernel.trace.logfire.logfire import Logfire
+
+    monkeypatch.delenv("LOGFIRE_READ_TOKEN", raising=False)
+    secrets = MagicMock()
+    secrets.get.side_effect = lambda key, default=None: "from-store" if key == "LOGFIRE_READ_TOKEN" else default
+    with (
+        patch.object(SecretManager, "current", return_value=secrets),
+        patch.object(LogfireTraceFetcher, "fetch", autospec=True, return_value=[]) as fetch,
+    ):
+        Logfire().fetch(TraceQuery())
+        assert fetch.call_args.args[0]._read_token == "from-store"
+
+        secrets.get.side_effect = lambda key, default=None: default
+        with pytest.raises(AKConfigError, match="LOGFIRE_READ_TOKEN"):
+            Logfire().fetch(TraceQuery())
+
+
 def test_init_configures_once(fake_logfire):
     from agentkernel.trace.logfire.logfire import Logfire
 

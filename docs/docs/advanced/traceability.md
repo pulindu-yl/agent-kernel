@@ -101,9 +101,9 @@ LANGFUSE_SECRET_KEY=sk-lf-...
 LANGFUSE_HOST=https://cloud.langfuse.com
 ```
 
-On AWS Lambda (when `AWS_LAMBDA_FUNCTION_NAME` is set), Agent Kernel flushes the Langfuse client at the end of
-every agent run, including failed runs, because Lambda freezes the sandbox as soon as an invocation returns and
-pending spans would otherwise wait for the next invocation. The cost is one export round trip per run.
+### Running on AWS Lambda
+
+The Langfuse client normally exports in the background, but Lambda freezes the execution environment as soon as an invocation returns, so pending spans would wait for the next invocation or be lost. When `AWS_LAMBDA_FUNCTION_NAME` is set, Agent Kernel therefore flushes the Langfuse client at the end of every agent run, including failed runs. The cost is one export round trip added to each run. Streamed runs are not flushed.
 
 ### Getting Langfuse Credentials
 
@@ -611,7 +611,8 @@ for span in tool_calls:
 | `limit` | Maximum spans returned (default 1000); the most recent are kept |
 
 Each result is a `FetchedSpan` (trace/span/parent ids, name, kind, start/end time, session id, input, output,
-usage, attributes) plus `raw`, the provider's full record. Spans are returned oldest first.
+usage, attributes) plus `raw`, the provider's full record. Its `provider` is the tracer's `trace.type` name
+(`langfuse`, `logfire`, `openllmetry` or `cloudwatch`). Spans are returned oldest first.
 
 `usage` is a `SpanUsage` (`input_tokens`, `output_tokens`, `total_tokens`, `cost` in USD) for spans that record a
 model call, and `None` otherwise. It covers only that span's own call, never its children, so the cost of a whole
@@ -631,9 +632,13 @@ With OpenLLMetry and Pydantic AI, each LLM call is recorded twice (an `openai.ch
 | Provider | Read API | Credentials |
 |----------|----------|-------------|
 | Langfuse | v2 observations API | Same `LANGFUSE_*` keys used for sending |
-| Logfire | SQL Query API | A separate **read token** in `LOGFIRE_READ_TOKEN` (`logfire read-tokens --project <org>/<project> create`) |
+| Logfire | SQL Query API | A separate **read token**, `LOGFIRE_READ_TOKEN` (`logfire read-tokens --project <org>/<project> create`) |
 | OpenLLMetry (Traceloop) | Warehouse spans REST API | Same `TRACELOOP_API_KEY` (and `TRACELOOP_BASE_URL`) |
 | AWS CloudWatch | CloudWatch Logs Insights over the `aws/spans` log group | The standard AWS chain and region; the identity needs `logs:StartQuery`, `logs:GetQueryResults` and `logs:StopQuery` on `aws/spans` (`AWSXrayWriteOnlyAccess` does not grant them) |
+
+`LOGFIRE_READ_TOKEN` and `TRACELOOP_API_KEY` are read through Agent Kernel's [secret manager](./secrets.md): an
+environment variable wins, and with `secret.provider.type: aws_ssm` the key can live in SSM Parameter Store
+instead. The `LANGFUSE_*` keys are read by the Langfuse SDK itself, so they stay environment variables.
 
 Session ids reach every tracing provider exactly as you pass them: Langfuse, OpenLLMetry and CloudWatch record
 them on spans, and Logfire keeps them out of its default scrubbing so traces can be filtered by session. Agent
@@ -646,13 +651,17 @@ Provider limits to keep in mind:
 - **Logfire:** spans are readable ~5 minutes after ingestion; queries return at most 10,000 rows, so larger
   fetches are paged automatically.
 - **Traceloop:** fetching is best effort. The free plan keeps spans for 24 hours only, and the warehouse
-  API's filter ids haven't been verified against a live account, so Agent Kernel re-checks every filter
-  on the spans it gets back.
+  API's filter ids haven't been verified against a live account. `kinds` is applied only after the spans
+  arrive (a span's kind can come from either of two attributes, and the API can't OR them), so a
+  kind-filtered fetch pages through every span in the window.
 - **CloudWatch:** only spans ingested through Transaction Search are readable, since they are what lands in
   `aws/spans`. Transaction Search must be on, and the spans must reach X-Ray: the default export does, but if
   you point `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` at a collector, it has to forward to X-Ray. Without
   `aws/spans`, `fetch` raises an `AKConfigError` telling you to enable Transaction Search. Logs Insights returns at most 10,000 rows per query, so larger fetches are paged automatically,
   and each query is billed by the data it scans.
+
+Every built-in fetcher re-checks each filter on the spans it gets back, so no provider's own boundary rules leak
+into the result.
 
 A bring-your-own tracer can support fetching by overriding `BaseTrace.fetch(query)`; tracers that don't raise
 `NotImplementedError`. `TraceQuery.matches(span)` applies every filter to a span, and

@@ -281,7 +281,8 @@ tokens = sum(span.usage.total_tokens or 0 for span in spans if span.usage)  # sp
 ```
 
 - Langfuse and OpenLLMetry reuse the sending credentials.
-- Logfire needs a separate read token: `export LOGFIRE_READ_TOKEN="..."`.
+- Logfire needs a separate read token: `export LOGFIRE_READ_TOKEN="..."`. It and `TRACELOOP_API_KEY` are read
+  through `SecretManager`, so they can also come from AWS SSM (`secret.provider.type: aws_ssm`).
 - CloudWatch reads `aws/spans` through Logs Insights, so the identity needs `logs:StartQuery`,
   `logs:GetQueryResults` and `logs:StopQuery` (`AWSXrayWriteOnlyAccess` does not grant them).
 - Full filter list and provider limits: [Traceability guide](https://kernel.yaala.ai/docs/advanced/traceability#fetching-spans-back).

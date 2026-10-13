@@ -15,10 +15,11 @@ import pytest
 
 from agentkernel.core.config import AKConfig
 from agentkernel.core.util.factory import AKConfigError
+from agentkernel.secret import SecretManager
 from agentkernel.trace import FetchedSpan, SpanKind, SpanUsage, TraceQuery
 from agentkernel.trace.base import BaseTrace
 from agentkernel.trace.cloudwatch.fetch import CloudWatchTraceFetcher
-from agentkernel.trace.fetch import OTelSpanClassifier
+from agentkernel.trace.fetch import OTelSpanClassifier, TraceFetcher
 from agentkernel.trace.langfuse.fetch import LangfuseTraceFetcher
 from agentkernel.trace.logfire.fetch import LogfireTraceFetcher
 from agentkernel.trace.openllmetry.fetch import TraceloopTraceFetcher
@@ -30,6 +31,16 @@ START = END - timedelta(hours=1)
 
 def _ts(minutes: int) -> datetime:
     return START + timedelta(minutes=minutes)
+
+
+class _SecretStub:
+    """Stands in for SecretManager.current(): resolves only the given keys."""
+
+    def __init__(self, **values):
+        self.values = values
+
+    def get(self, key, default=None):
+        return self.values.get(key, default)
 
 
 # --- TraceQuery -------------------------------------------------------------------------------------------
@@ -186,6 +197,132 @@ class TestTraceFetch:
             Trace(SendOnly()).fetch()
 
 
+# --- TraceFetcher (the built-ins' shared paging and merge) ---------------------------------------------------
+
+
+def _span(span_id, minute, session_id=None, kind=SpanKind.TOOL):
+    return FetchedSpan(provider="fake", trace_id="t1", span_id=span_id, start_time=_ts(minute), session_id=session_id, kind=kind)
+
+
+class _ScriptedFetcher(TraceFetcher):
+    """Collects whatever the test scripts, recording the query it was given."""
+
+    provider = "fake"
+
+    def __init__(self, spans=()):
+        self.spans = list(spans)
+        self.queries = []
+
+    def _collect(self, query):
+        self.queries.append(query)
+        return self.spans
+
+
+class TestTraceFetcher:
+    def test_fetch_pins_a_defaulted_window(self, monkeypatch):
+        class AdvancingClock(datetime):
+            ticks = 0
+
+            @classmethod
+            def now(cls, tz=None):
+                cls.ticks += 1
+                return END + timedelta(seconds=cls.ticks)
+
+        monkeypatch.setattr("agentkernel.trace.fetch.datetime", AdvancingClock)
+        windows = []
+
+        class WindowRecorder(_ScriptedFetcher):
+            def _collect(self, query):
+                windows.extend([query.window(), query.window()])
+                return [_span("edge", 59)] if query.matches(_span("edge", 59)) else []
+
+        spans = WindowRecorder().fetch(TraceQuery(last=timedelta(minutes=5)))
+        # the clock moved on every now() call, yet every window seen inside the fetch is the first one
+        assert windows[0] == windows[1] == (END - timedelta(minutes=5) + timedelta(seconds=1), END + timedelta(seconds=1))
+        assert AdvancingClock.ticks == 1 and [span.span_id for span in spans] == ["edge"]
+
+    def test_fetch_keeps_the_first_span_per_id_and_the_newest_limit(self):
+        first_a = _span("a", 1)
+        fetcher = _ScriptedFetcher([_span("c", 3), first_a, _span("b", 2), _span("a", 9)])
+        spans = fetcher.fetch(TraceQuery(start=START, end=END, limit=2))
+        assert [span.span_id for span in spans] == ["b", "c"]
+        assert fetcher.fetch(TraceQuery(start=START, end=END))[0] is first_a
+
+    @pytest.mark.parametrize(
+        "pages, limit, expected_calls",
+        [
+            ({None: ([1], "c1"), "c1": ([2], None)}, 10, 2),  # empty cursor
+            ({None: ([1], "c1"), "c1": ([], "c2")}, 10, 2),  # empty page
+            ({None: ([1], "c1"), "c1": ([2], "c1")}, 10, 2),  # repeated cursor
+            ({None: ([1, 2], "c1")}, 2, 1),  # limit reached
+        ],
+    )
+    def test_follow_cursor_stop_rules(self, pages, limit, expected_calls):
+        calls = []
+
+        def page(cursor):
+            calls.append(cursor)
+            return pages[cursor]
+
+        query = TraceQuery(start=START, end=END, limit=limit)
+        spans = _ScriptedFetcher()._follow_cursor(query, page, lambda minute: _span(f"s{minute}", minute))
+        assert len(calls) == expected_calls and len(spans) <= limit
+
+    def test_follow_cursor_keeps_only_matching_spans(self):
+        query = TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL])
+        items = [_span("tool", 1), _span("llm", 2, kind=SpanKind.LLM), _span("late", 61)]
+        spans = _ScriptedFetcher()._follow_cursor(query, lambda cursor: (items, None), lambda span: span)
+        assert [span.span_id for span in spans] == ["tool"]
+
+    def test_page_backward_dedupes_the_boundary_and_backfills_the_session(self):
+        pages = [[(_ts(4), _span("d", 4)), (_ts(3), _span("c", 3))], [(_ts(3), _span("c", 3)), (_ts(2), _span("b", 2, session_id="s-1"))], []]
+        befores = []
+
+        def page(size, before):
+            befores.append(before)
+            return pages[len(befores) - 1]
+
+        query = TraceQuery(start=START, end=END, session_id="s-1", limit=10)
+        spans = _ScriptedFetcher()._page_backward(query, before=END, max_rows=2, page=page)
+        assert [span.span_id for span in spans] == ["d", "c", "b"]
+        assert all(span.session_id == "s-1" for span in spans)
+        assert befores == [END, _ts(3), _ts(2)]
+
+    def test_page_backward_stops_on_a_short_page_or_the_limit(self):
+        calls = []
+
+        def page(size, before):
+            calls.append(size)
+            return [(_ts(5 - i), _span(f"s{len(calls)}-{i}", 5 - i)) for i in range(size)]
+
+        query = TraceQuery(start=START, end=END, limit=3)
+        spans = _ScriptedFetcher()._page_backward(query, before=END, max_rows=2, page=page)
+        assert len(spans) == 3 and calls == [2, 1]
+
+        short = _ScriptedFetcher()._page_backward(
+            TraceQuery(start=START, end=END), before=END, max_rows=5, page=lambda size, before: [(_ts(1), _span("a", 1))]
+        )
+        assert [span.span_id for span in short] == ["a"]
+
+    def test_page_backward_stops_on_rows_without_a_cursor_timestamp(self):
+        calls = []
+
+        def page(size, before):
+            calls.append(before)
+            return [(None, _span("a", 1)), (None, _span("b", 2))]
+
+        spans = _ScriptedFetcher()._page_backward(TraceQuery(start=START, end=END), before=END, max_rows=2, page=page)
+        assert len(spans) == 2 and len(calls) == 1
+
+    def test_page_backward_warns_on_a_full_page_with_no_fresh_rows(self, caplog):
+        rows = [(_ts(3), _span("a", 3)), (_ts(3), _span("b", 3))]
+        fetcher = _ScriptedFetcher()
+        with caplog.at_level("WARNING", logger="ak.trace.fetch"):
+            spans = fetcher._page_backward(TraceQuery(start=START, end=END), before=END, max_rows=2, page=lambda size, before: rows)
+        assert [span.span_id for span in spans] == ["a", "b"]
+        assert "share one timestamp" in caplog.text
+
+
 # --- Langfuse ---------------------------------------------------------------------------------------------
 
 
@@ -312,10 +449,9 @@ def fake_query_client(monkeypatch):
 
 
 class TestLogfireFetcher:
-    def test_missing_read_token_raises(self, monkeypatch):
-        monkeypatch.delenv(LogfireTraceFetcher.READ_TOKEN_ENV, raising=False)
+    def test_missing_read_token_raises(self):
         with pytest.raises(AKConfigError, match="LOGFIRE_READ_TOKEN"):
-            LogfireTraceFetcher().fetch(TraceQuery())
+            LogfireTraceFetcher(None)
 
     def test_queries_window_and_maps_rows(self, fake_query_client):
         fake_query_client.query_json_rows.return_value = {"rows": [_row("b", 5), _row("a", 1, session_id="s-1")]}
@@ -347,15 +483,23 @@ class TestLogfireFetcher:
         assert span.usage == SpanUsage(input_tokens=42, output_tokens=7, total_tokens=49)
 
     def test_sql_escapes_literals_and_handles_span_kind(self):
-        sql = LogfireTraceFetcher(read_token="tok")._sql(TraceQuery(name="it's", kinds=[SpanKind.SPAN]), 10, None)
-        assert "'it''s'" in sql
+        sql = LogfireTraceFetcher(read_token="tok")._sql(TraceQuery(name="it's", kinds=[SpanKind.SPAN]), 10, END)
+        assert "COALESCE(message, span_name) = 'it''s'" in sql
         assert "NOT COALESCE(" in sql
+
+    def test_drops_a_row_at_the_window_end(self, fake_query_client):
+        # an inclusive max_timestamp would return it; matches() applies the exclusive end
+        fake_query_client.query_json_rows.return_value = {"rows": [_row("end", 60), _row("a", 1)]}
+
+        spans = LogfireTraceFetcher(read_token="tok").fetch(TraceQuery(start=START, end=END))
+
+        assert [span.span_id for span in spans] == ["a"]
 
 
 # --- Traceloop --------------------------------------------------------------------------------------------
 
 
-def _item(span_id, minute, operation="execute_tool", session="s-1"):
+def _item(span_id, minute, operation="execute_tool", session="s-1", attributes=None):
     return {
         "trace_id": "t1",
         "span_id": span_id,
@@ -363,7 +507,8 @@ def _item(span_id, minute, operation="execute_tool", session="s-1"):
         "span_name": f"{span_id}.tool",
         "timestamp": int(_ts(minute).timestamp() * 1000),
         "duration_ms": 1500,
-        "span_attributes": {
+        "span_attributes": attributes
+        or {
             "gen_ai.operation.name": operation,
             "gen_ai.tool.call.arguments": '{"city": "Colombo"}',
             "traceloop.association.properties.session_id": session,
@@ -372,10 +517,9 @@ def _item(span_id, minute, operation="execute_tool", session="s-1"):
 
 
 class TestTraceloopFetcher:
-    def test_missing_api_key_raises(self, monkeypatch):
-        monkeypatch.delenv("TRACELOOP_API_KEY", raising=False)
+    def test_missing_api_key_raises(self):
         with pytest.raises(AKConfigError, match="TRACELOOP_API_KEY"):
-            TraceloopTraceFetcher().fetch(TraceQuery())
+            TraceloopTraceFetcher(None)
 
     def test_paginates_filters_and_maps(self):
         requests = []
@@ -397,9 +541,45 @@ class TestTraceloopFetcher:
         params = requests[0].url.params
         assert requests[0].headers["Authorization"] == "Bearer key"
         assert params["from_timestamp_sec"] == str(int(START.timestamp())) and params["to_timestamp_sec"] == str(int(END.timestamp()))
-        filters = json.loads(params["filters"])
-        assert {"id": "gen_ai.operation.name", "operator": "in", "value": ["execute_tool"]} in filters
+        # kinds are applied locally only: no kind filter is sent even when kinds is set
+        assert json.loads(params["filters"]) == [{"id": "traceloop.association.properties.session_id", "operator": "equals", "value": "s-1"}]
         assert requests[1].url.params["cursor"] == "c1"
+
+    def test_returns_a_tool_span_typed_only_by_traceloop_span_kind(self):
+        # the SDK's own @tool decorator sets traceloop.span.kind but no gen_ai.operation.name
+        attributes = {"traceloop.span.kind": "tool", "traceloop.association.properties.session_id": "s-1"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"spans": {"data": [_item("decorated", 1, attributes=attributes)], "next_cursor": None}})
+
+        fetcher = TraceloopTraceFetcher(api_key="key", transport=httpx.MockTransport(handler))
+        (span,) = fetcher.fetch(TraceQuery(start=START, end=END, kinds=["tool"]))
+
+        assert span.span_id == "decorated" and span.kind == SpanKind.TOOL
+
+    def test_tracer_resolves_the_key_through_the_secret_manager(self, monkeypatch):
+        monkeypatch.delenv("TRACELOOP_API_KEY", raising=False)
+        monkeypatch.setenv("TRACELOOP_BASE_URL", "https://tl.test")
+        sdk = types.ModuleType("traceloop.sdk")
+        sdk.Traceloop = MagicMock()
+        monkeypatch.setitem(sys.modules, "traceloop", types.ModuleType("traceloop"))
+        monkeypatch.setitem(sys.modules, "traceloop.sdk", sdk)
+        monkeypatch.delitem(sys.modules, "agentkernel.trace.openllmetry.openllmetry", raising=False)
+        from agentkernel.trace.openllmetry.openllmetry import OpenLLMetry
+
+        secrets = _SecretStub(TRACELOOP_API_KEY="from-store")
+        with (
+            patch.object(SecretManager, "current", return_value=secrets),
+            patch.object(TraceloopTraceFetcher, "fetch", autospec=True, return_value=[]) as fetch,
+        ):
+            OpenLLMetry.fetch(MagicMock(), TraceQuery())
+            fetcher = fetch.call_args.args[0]
+            assert fetcher._api_key == "from-store" and fetcher._base_url == "https://tl.test"
+
+            secrets.values.clear()
+            with pytest.raises(AKConfigError, match="TRACELOOP_API_KEY"):
+                OpenLLMetry.fetch(MagicMock(), TraceQuery())
+        monkeypatch.delitem(sys.modules, "agentkernel.trace.openllmetry.openllmetry", raising=False)
 
     @pytest.mark.parametrize("value", ["2026-10-08T11:00:00Z", 1791457200, 1791457200000, 1791457200000000, 1791457200000000000])
     def test_timestamp_formats(self, value):
@@ -517,6 +697,19 @@ class TestCloudWatchFetcher:
         assert 'name = "say \\"hi\\""' in insights
         assert 'traceId in ["t1", "t2"]' in insights
         assert "openinference" not in insights  # SPAN is everything else, so kinds are filtered locally
+
+
+@pytest.mark.parametrize(
+    "fetcher, provider",
+    [
+        (LangfuseTraceFetcher(MagicMock()), "langfuse"),
+        (LogfireTraceFetcher("tok"), "logfire"),
+        (TraceloopTraceFetcher("key"), "openllmetry"),
+        (CloudWatchTraceFetcher(client=MagicMock()), "cloudwatch"),
+    ],
+)
+def test_provider_is_the_trace_type_short_name(fetcher, provider):
+    assert fetcher.provider == provider
 
 
 def test_oldest_first_handles_missing_start_times():

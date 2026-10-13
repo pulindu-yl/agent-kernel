@@ -5,13 +5,14 @@ import logging
 import math
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from functools import partial
+from typing import Any, Iterable, Optional
 
 from ...core.util.factory import AKConfigError
-from ..fetch import FetchedSpan, OTelSpanClassifier, SpanKind, TraceQuery
+from ..fetch import FetchedSpan, OTelSpanClassifier, SpanKind, TraceFetcher, TraceQuery
 
 
-class CloudWatchTraceFetcher:
+class CloudWatchTraceFetcher(TraceFetcher):
     """
     Fetches spans from the ``aws/spans`` log group, where Transaction Search stores every span sent to
     X-Ray as OpenTelemetry JSON, through CloudWatch Logs Insights. Credentials and region come from the
@@ -22,6 +23,7 @@ class CloudWatchTraceFetcher:
     backwards on ``@timestamp``.
     """
 
+    provider = "cloudwatch"
     LOG_GROUP = "aws/spans"
     _MAX_ROWS = 10_000
     _POLL_INTERVAL = 1.0
@@ -52,32 +54,16 @@ class CloudWatchTraceFetcher:
         self._timeout = timeout
         self._log = logging.getLogger("ak.trace.cloudwatch.fetch")
 
-    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
-        """
-        Fetches the spans matching the query, oldest first. When more than ``limit`` match, the most
-        recent ones are kept.
-        """
+    def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]:
         client = self._client or self._create_client()
-        start, end = query.window()
+        _, end = query.window()
+        # each query's endTime is ceil(before), so rows in the boundary second are re-read and dropped by span id
         before = max(end, min(end + self._END_PADDING, datetime.now(timezone.utc)))
-        spans: dict[str, FetchedSpan] = {}
-        seen: set[str] = set()
-        while len(spans) < query.limit:
-            page = min(self._MAX_ROWS, query.limit - len(spans))
-            rows = self._run(client, self._insights(query, page), start, before)
-            fresh = [(stamp, span) for stamp, span in map(self._to_span, rows) if span.span_id not in seen]
-            seen.update(span.span_id for _, span in fresh)
-            for _, span in fresh:
-                if self._matches(query, span, start, end):
-                    spans[span.span_id] = span
-            # rows in the boundary second are re-read on the next page and skipped by span id
-            stamps = [stamp for stamp, _ in fresh if stamp is not None]
-            if len(rows) < page or not stamps:
-                if len(rows) == page and not fresh:
-                    self._log.warning("More than %d spans share one second in %s; stopping the fetch early", page, self._log_group)
-                break
-            before = min(stamps)
-        return FetchedSpan.oldest_first(spans.values())[-query.limit :]
+        return self._page_backward(query, before=before, max_rows=self._MAX_ROWS, page=partial(self._page, client, query))
+
+    def _page(self, client: Any, query: TraceQuery, size: int, before: datetime) -> list[tuple[Optional[datetime], FetchedSpan]]:
+        start, _ = query.window()
+        return [self._to_span(row) for row in self._run(client, self._insights(query, size), start, before)]
 
     def _create_client(self) -> Any:
         from botocore.session import Session as BotocoreSession
@@ -143,21 +129,12 @@ class CloudWatchTraceFetcher:
     def _literal(value: str) -> str:
         return json.dumps(str(value))
 
-    @staticmethod
-    def _matches(query: TraceQuery, span: FetchedSpan, start: datetime, end: datetime) -> bool:
-        # strict, like TraceQuery.matches: a span missing the filtered value is rejected
-        if span.start_time is None or not start <= span.start_time < end:
-            return False
-        if query.session_id is not None and span.session_id != query.session_id:
-            return False
-        return query.accepts(span.kind)
-
     def _to_span(self, row: dict[str, str]) -> tuple[Optional[datetime], FetchedSpan]:
         record = json.loads(row["@message"])
         attributes = self._flatten(record.get("attributes") or {})
         span_input, span_output = OTelSpanClassifier.io(attributes)
         span = FetchedSpan(
-            provider="cloudwatch",
+            provider=self.provider,
             trace_id=record["traceId"],
             span_id=record["spanId"],
             parent_span_id=record.get("parentSpanId") or None,

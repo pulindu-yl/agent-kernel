@@ -167,7 +167,7 @@ def table(aws):
             {
                 "IndexName": "session_id-index",
                 "KeySchema": [{"AttributeName": "session_id", "KeyType": "HASH"}],
-                "Projection": {"ProjectionType": "ALL"},
+                "Projection": {"ProjectionType": "INCLUDE", "NonKeyAttributes": ["progress", "error", "updated_at"]},
             }
         ],
     )

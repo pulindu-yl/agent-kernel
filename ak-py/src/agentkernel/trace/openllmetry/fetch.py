@@ -3,73 +3,56 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator, Optional
+from functools import partial
+from typing import Any, Iterable, Optional
 
 import httpx
 
 from ...core.util.factory import AKConfigError
-from ..fetch import FetchedSpan, OTelSpanClassifier, SpanKind, TraceQuery
+from ..fetch import FetchedSpan, OTelSpanClassifier, TraceFetcher, TraceQuery
 
 
-class TraceloopTraceFetcher:
+class TraceloopTraceFetcher(TraceFetcher):
     """
     Fetches spans from Traceloop through its warehouse REST API (``GET /v2/warehouse/spans``), with the
     same ``TRACELOOP_API_KEY`` / ``TRACELOOP_BASE_URL`` the SDK sends with. The SDK has no read client.
 
+    Kinds are filtered locally only: a span's kind can come from ``gen_ai.operation.name`` or
+    ``traceloop.span.kind``, and the ``filters`` API has no OR across attribute ids.
+
     Traceloop's free plan keeps spans for 24 hours only.
     """
 
+    provider = "openllmetry"
     DEFAULT_BASE_URL = "https://api.traceloop.com"
     _PATH = "/v2/warehouse/spans"
     _PAGE_SIZE = 500
     _TIMEOUT = 60.0
     _SESSION_ATTRIBUTE = "traceloop.association.properties.session_id"
-    # gen_ai.operation.name is set by both Traceloop's own and Pydantic AI's instrumentation
-    _OPERATIONS = {
-        SpanKind.AGENT: ["invoke_agent", "create_agent"],
-        SpanKind.LLM: ["chat", "text_completion", "generate_content"],
-        SpanKind.TOOL: ["execute_tool"],
-    }
 
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, transport: Optional[httpx.BaseTransport] = None):
+    def __init__(self, api_key: Optional[str], base_url: Optional[str] = None, transport: Optional[httpx.BaseTransport] = None):
         """
-        :param api_key: Traceloop API key; defaults to ``TRACELOOP_API_KEY``.
-        :param base_url: API base URL; defaults to ``TRACELOOP_BASE_URL`` or the Traceloop cloud.
+        :param api_key: Traceloop API key (``TRACELOOP_API_KEY``, which the tracer resolves).
+        :param base_url: API base URL; defaults to the Traceloop cloud.
         :param transport: Optional httpx transport (tests).
+        :raises AKConfigError: If the API key is missing.
         """
-        self._api_key = api_key or os.getenv("TRACELOOP_API_KEY")
-        self._base_url = base_url or os.getenv("TRACELOOP_BASE_URL") or self.DEFAULT_BASE_URL
+        if not api_key:
+            raise AKConfigError("fetching Traceloop traces needs an API key; set TRACELOOP_API_KEY")
+        self._api_key = api_key
+        self._base_url = base_url or self.DEFAULT_BASE_URL
         self._transport = transport
         self._log = logging.getLogger("ak.trace.openllmetry.fetch")
 
-    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
-        """
-        Fetches the spans matching the query, oldest first. When more than ``limit`` match, the most
-        recent ones are kept.
-        """
-        if not self._api_key:
-            raise AKConfigError("fetching Traceloop traces needs an API key; set TRACELOOP_API_KEY")
-        start, end = query.window()
-        spans: dict[str, FetchedSpan] = {}
+    def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]:
         headers = {"Authorization": f"Bearer {self._api_key}"}
         with httpx.Client(base_url=self._base_url, headers=headers, timeout=self._TIMEOUT, transport=self._transport) as client:
-            for item in self._pages(client, self._params(query, start, end)):
-                span = self._to_span(item)
-                # server-side filters are best effort (attribute ids may be renamed by the backend), so re-check here
-                if not query.matches(span):
-                    continue
-                spans.setdefault(span.span_id, span)
-                if len(spans) >= query.limit:
-                    break
-        return FetchedSpan.oldest_first(spans.values())
+            return self._follow_cursor(query, partial(self._page, client, self._params(query)), self._to_span)
 
-    def _params(self, query: TraceQuery, start: datetime, end: datetime) -> dict[str, Any]:
+    def _params(self, query: TraceQuery) -> dict[str, Any]:
+        start, end = query.window()
         filters: list[dict[str, Any]] = []
-        if query.kinds is not None and SpanKind.SPAN not in query.kinds:
-            operations = [operation for kind in query.kinds for operation in self._OPERATIONS[kind]]
-            filters.append({"id": "gen_ai.operation.name", "operator": "in", "value": operations})
         if query.session_id:
             filters.append({"id": self._SESSION_ATTRIBUTE, "operator": "equals", "value": query.session_id})
         if query.trace_ids:
@@ -87,18 +70,12 @@ class TraceloopTraceFetcher:
             params["filters"] = json.dumps(filters)
         return params
 
-    def _pages(self, client: httpx.Client, params: dict[str, Any]) -> Iterator[dict[str, Any]]:
-        while True:
-            response = client.get(self._PATH, params=params)
-            response.raise_for_status()
-            body = response.json()
-            page = body.get("spans", body)
-            yield from page.get("data") or []
-            cursor = page.get("next_cursor")
-            # a repeated cursor would page forever when local filtering keeps the limit from being reached
-            if not cursor or not page.get("data") or cursor == params.get("cursor"):
-                return
-            params = {**params, "cursor": cursor}
+    def _page(self, client: httpx.Client, params: dict[str, Any], cursor: Optional[str]) -> tuple[list[dict[str, Any]], Optional[str]]:
+        response = client.get(self._PATH, params={**params, "cursor": cursor} if cursor else params)
+        response.raise_for_status()
+        body = response.json()
+        page = body.get("spans", body)
+        return page.get("data") or [], page.get("next_cursor")
 
     def _to_span(self, item: dict[str, Any]) -> FetchedSpan:
         attributes = item.get("span_attributes") or {}
@@ -108,7 +85,7 @@ class TraceloopTraceFetcher:
         duration_ms = item.get("duration_ms") or item.get("duration")
         span_input, span_output = OTelSpanClassifier.io(attributes)
         return FetchedSpan(
-            provider="traceloop",
+            provider=self.provider,
             trace_id=item["trace_id"],
             span_id=item["span_id"],
             parent_span_id=item.get("parent_span_id") or None,

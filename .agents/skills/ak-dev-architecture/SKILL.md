@@ -1053,7 +1053,7 @@ ak-py/src/agentkernel/
 ├── trace/                   # Observability
 │   ├── base.py              # BaseTrace (+ optional, non-abstract fetch(query))
 │   ├── trace.py             # Trace factory (+ Trace.fetch facade: TraceQuery or keyword filters)
-│   ├── fetch.py             # SpanKind, TraceQuery, SpanUsage, FetchedSpan, OTelSpanClassifier (provider-neutral read model)
+│   ├── fetch.py             # SpanKind, TraceQuery, SpanUsage, FetchedSpan, OTelSpanClassifier (provider-neutral read model); TraceFetcher (internal base of the built-in fetchers)
 │   ├── testing.py           # TraceFetchContract conformance suite (imports pytest; test code only)
 │   ├── langfuse/            # Langfuse adapter (+ fetch.py: v2 observations API; runners flush on AWS Lambda)
 │   ├── openllmetry/         # OpenLLMetry adapter (+ fetch.py: Traceloop warehouse REST API)

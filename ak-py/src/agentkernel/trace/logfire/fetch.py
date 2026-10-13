@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime
-from typing import Any, Optional
+from functools import partial
+from typing import Any, Iterable, Optional
 
 from ...core.util.factory import AKConfigError
-from ..fetch import FetchedSpan, OTelSpanClassifier, SpanKind, TraceQuery
+from ..fetch import FetchedSpan, OTelSpanClassifier, SpanKind, TraceFetcher, TraceQuery
 
 
-class LogfireTraceFetcher:
+class LogfireTraceFetcher(TraceFetcher):
     """
     Fetches spans from Logfire through its SQL Query API, using a project read token
     (``LOGFIRE_READ_TOKEN``; the write token used for sending cannot read).
@@ -19,6 +19,7 @@ class LogfireTraceFetcher:
     backwards on ``start_timestamp``. Data becomes queryable a few minutes after ingestion.
     """
 
+    provider = "logfire"
     READ_TOKEN_ENV = "LOGFIRE_READ_TOKEN"
     _MAX_ROWS = 10_000
     _COLUMNS = "trace_id, span_id, parent_span_id, span_name, message, start_timestamp, end_timestamp, attributes, tags, otel_scope_name"
@@ -33,45 +34,32 @@ class LogfireTraceFetcher:
         "OR attributes->>'openinference.span.kind' = 'AGENT' OR span_name LIKE 'Agent run:%')",
     }
 
-    def __init__(self, read_token: Optional[str] = None, base_url: Optional[str] = None):
+    def __init__(self, read_token: Optional[str], base_url: Optional[str] = None):
         """
-        :param read_token: Logfire read token; defaults to ``LOGFIRE_READ_TOKEN``.
+        :param read_token: Logfire read token (``LOGFIRE_READ_TOKEN``, which the tracer resolves).
         :param base_url: Query API base URL; defaults to the region encoded in the token.
+        :raises AKConfigError: If the read token is missing.
         """
-        self._read_token = read_token or os.getenv(self.READ_TOKEN_ENV)
+        if not read_token:
+            raise AKConfigError(f"fetching Logfire traces needs a read token; set {self.READ_TOKEN_ENV} (logfire read-tokens create)")
+        self._read_token = read_token
         self._base_url = base_url
         self._log = logging.getLogger("ak.trace.logfire.fetch")
 
-    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
-        """
-        Fetches the spans matching the query, oldest first. When more than ``limit`` match, the most
-        recent ones are kept.
-        """
-        if not self._read_token:
-            raise AKConfigError(f"fetching Logfire traces needs a read token; set {self.READ_TOKEN_ENV} (logfire read-tokens create)")
+    def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]:
         from logfire.experimental.query_client import LogfireQueryClient
 
-        start, end = query.window()
-        spans: dict[str, FetchedSpan] = {}
-        seen: set[str] = set()
-        before: Optional[datetime] = None
+        _, end = query.window()
         with LogfireQueryClient(read_token=self._read_token, base_url=self._base_url) as client:
-            while len(spans) < query.limit:
-                page = min(self._MAX_ROWS, query.limit - len(spans))
-                rows = client.query_json_rows(sql=self._sql(query, page, before), min_timestamp=start, max_timestamp=end, limit=page)["rows"]
-                fresh = [span for span in map(self._to_span, rows) if span.span_id not in seen]
-                seen.update(span.span_id for span in fresh)
-                for span in fresh:
-                    if query.accepts(span.kind):
-                        span.session_id = span.session_id or query.session_id
-                        spans[span.span_id] = span
-                # rows sharing the boundary timestamp are re-read on the next page and skipped by span id
-                before = min((span.start_time for span in fresh if span.start_time), default=None)
-                if len(rows) < page or before is None:
-                    break
-        return FetchedSpan.oldest_first(spans.values())[-query.limit :]
+            return self._page_backward(query, before=end, max_rows=self._MAX_ROWS, page=partial(self._page, client, query))
 
-    def _sql(self, query: TraceQuery, limit: int, before: Optional[datetime]) -> str:
+    def _page(self, client: Any, query: TraceQuery, size: int, before: datetime) -> list[tuple[Optional[datetime], FetchedSpan]]:
+        # whether max_timestamp is inclusive is undocumented; matches() applies the exclusive end either way
+        start, end = query.window()
+        rows = client.query_json_rows(sql=self._sql(query, size, before), min_timestamp=start, max_timestamp=end, limit=size)["rows"]
+        return [(span.start_time, span) for span in map(self._to_span, rows)]
+
+    def _sql(self, query: TraceQuery, limit: int, before: datetime) -> str:
         conditions = ["kind = 'span'"]
         if query.kinds is not None and SpanKind.SPAN not in query.kinds:
             conditions.append("(" + " OR ".join(self._KIND_SQL[kind] for kind in query.kinds) + ")")
@@ -80,14 +68,14 @@ class LogfireTraceFetcher:
             wanted = [self._KIND_SQL[kind] for kind in query.kinds if kind != SpanKind.SPAN]
             conditions.append("(" + " OR ".join([f"NOT COALESCE({others}, false)", *wanted]) + ")")
         if query.name:
-            conditions.append(f"(span_name = {self._literal(query.name)} OR message = {self._literal(query.name)})")
+            # the same value _to_span writes to name, so matches() keeps every row this selects
+            conditions.append(f"COALESCE(message, span_name) = {self._literal(query.name)}")
         if query.trace_ids:
             conditions.append(f"trace_id IN ({', '.join(map(self._literal, query.trace_ids))})")
         if query.session_id:
             # AK sets session_id on its wrapper span only, so match every span of those traces
             conditions.append(f"trace_id IN (SELECT trace_id FROM records WHERE attributes->>'session_id' = {self._literal(query.session_id)})")
-        if before is not None:
-            conditions.append(f"start_timestamp <= {self._literal(before.isoformat())}")
+        conditions.append(f"start_timestamp <= {self._literal(before.isoformat())}")
         return f"SELECT {self._COLUMNS} FROM records WHERE {' AND '.join(conditions)} ORDER BY start_timestamp DESC LIMIT {limit}"
 
     @staticmethod
@@ -102,7 +90,7 @@ class LogfireTraceFetcher:
         classify_attributes = {**attributes, "logfire.msg_template": row.get("span_name"), "logfire.tags": row.get("tags") or []}
         span_input, span_output = OTelSpanClassifier.io(attributes)
         return FetchedSpan(
-            provider="logfire",
+            provider=self.provider,
             trace_id=row["trace_id"],
             span_id=row["span_id"],
             parent_span_id=row.get("parent_span_id"),

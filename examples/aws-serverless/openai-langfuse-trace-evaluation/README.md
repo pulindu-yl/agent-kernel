@@ -105,7 +105,8 @@ such as Opik's `GEval`.
 ## The results table
 
 `<prefix>-trace-evaluations`, partition key `trace_id`, with a `session_id-index` and a 90-day TTL on
-`expires_at`. One row per trace:
+`expires_at`. The index holds only `progress`, `error` and `updated_at` (what `/check` counts), not a second
+copy of every row's spans, so read whole rows from the table itself. One row per trace:
 
 | Attribute | On | Meaning |
 |---|---|---|
@@ -191,10 +192,11 @@ limit is 400 KB) by dropping tool calls and shortening `input`/`output`, so a la
     curl "$BASE/check?session_id=<SESSION_ID>&expected=3"
     ```
 
-4. Read the results:
+4. Read the results (the session index projects only the progress, so this reads the table; fine at
+    example scale):
     ```bash
-    aws dynamodb query --table-name "$(terraform -chdir=deploy output -raw results_table_name)" \
-      --index-name session_id-index --key-condition-expression "session_id = :s" \
+    aws dynamodb scan --table-name "$(terraform -chdir=deploy output -raw results_table_name)" \
+      --filter-expression "session_id = :s" \
       --expression-attribute-values '{":s": {"S": "<SESSION_ID>"}}'
     ```
 

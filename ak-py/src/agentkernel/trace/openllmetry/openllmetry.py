@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from contextvars import ContextVar
 from typing import Any, Dict, Optional
@@ -151,8 +152,11 @@ class OpenLLMetry(BaseTrace):
 
     def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
         """
-        Fetches spans back from Traceloop through the warehouse REST API (same ``TRACELOOP_API_KEY``).
+        Fetches spans back from Traceloop through the warehouse REST API (same ``TRACELOOP_API_KEY``, resolved
+        through the secret manager).
         """
+        from ...secret import SecretManager
         from .fetch import TraceloopTraceFetcher
 
-        return TraceloopTraceFetcher().fetch(query)
+        api_key = SecretManager.current().get("TRACELOOP_API_KEY", None)
+        return TraceloopTraceFetcher(api_key, base_url=os.environ.get("TRACELOOP_BASE_URL")).fetch(query)

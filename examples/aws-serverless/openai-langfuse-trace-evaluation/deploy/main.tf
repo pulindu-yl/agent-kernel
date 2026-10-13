@@ -106,9 +106,10 @@ resource "aws_dynamodb_table" "results" {
   }
 
   global_secondary_index {
-    name            = "session_id-index"
-    hash_key        = "session_id"
-    projection_type = "ALL"
+    name               = "session_id-index"
+    hash_key           = "session_id"
+    projection_type    = "INCLUDE" # /check reads only these; ALL would copy every row's spans_gz
+    non_key_attributes = ["progress", "error", "updated_at"]
   }
 
   ttl {

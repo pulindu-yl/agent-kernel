@@ -4,14 +4,17 @@
 ``FetchedSpan`` is the shape every tracer returns (with ``SpanUsage`` for its model call's tokens and
 cost), and ``OTelSpanClassifier`` maps the raw
 OpenTelemetry attribute conventions AK's runners emit (OpenInference, OTel GenAI, Traceloop,
-Logfire native) onto one ``SpanKind``.
+Logfire native) onto one ``SpanKind``. ``TraceFetcher`` holds the paging and merging the built-in
+fetchers share.
 """
 
 from __future__ import annotations
 
+import logging
+from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, ClassVar, Iterable, Optional
 
 from pydantic import BaseModel, Field
 
@@ -217,3 +220,94 @@ class OTelSpanClassifier:
             if attributes.get(key):
                 return str(attributes[key])
         return None
+
+
+class TraceFetcher(ABC):
+    """The base of the built-in fetchers: the pinned window, the merge and the two paging loops they share.
+
+    Subclasses implement only their provider's requests (``_collect``) and their ``_to_span`` mapping. Not
+    exported: bring-your-own tracers override ``BaseTrace.fetch`` and only have to pass ``TraceFetchContract``.
+    """
+
+    provider: ClassVar[str]  # the tracer's trace.type short name, written to every FetchedSpan.provider
+    _log = logging.getLogger("ak.trace.fetch")
+
+    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+        """
+        Fetches the spans matching the query, oldest first. When more than ``limit`` match, the most
+        recent ones are kept.
+        """
+        # matches() resolves window() on every call, so a defaulted end (now) would move between calls
+        start, end = query.window()
+        query = query.model_copy(update={"start": start, "end": end})
+        spans: dict[str, FetchedSpan] = {}
+        for span in self._collect(query):
+            spans.setdefault(span.span_id, span)
+        return FetchedSpan.oldest_first(spans.values())[-query.limit :]
+
+    @abstractmethod
+    def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]:
+        """Runs the provider's requests for a query whose window is already pinned."""
+
+    def _follow_cursor(
+        self,
+        query: TraceQuery,
+        page: Callable[[Optional[str]], tuple[list[Any], Optional[str]]],
+        to_span: Callable[[Any], FetchedSpan],
+    ) -> list[FetchedSpan]:
+        """
+        Follows a newest-first cursor API, keeping up to ``limit`` spans that ``query.matches``.
+
+        :param page: Returns ``(items, next_cursor)`` for a cursor (None for the first page).
+        :param to_span: Maps one item to a span.
+        """
+        kept: list[FetchedSpan] = []
+        cursor: Optional[str] = None
+        while True:
+            items, next_cursor = page(cursor)
+            for item in items:
+                span = to_span(item)
+                if query.matches(span):
+                    kept.append(span)
+                    if len(kept) >= query.limit:
+                        return kept
+            # a repeated cursor would page forever when local filtering keeps the limit from being reached
+            if not next_cursor or not items or next_cursor == cursor:
+                return kept
+            cursor = next_cursor
+
+    def _page_backward(
+        self,
+        query: TraceQuery,
+        before: datetime,
+        max_rows: int,
+        page: Callable[[int, datetime], list[tuple[Optional[datetime], FetchedSpan]]],
+    ) -> list[FetchedSpan]:
+        """
+        Pages backwards in time over an API with a row cap and no cursor, keeping up to ``limit`` spans
+        that ``query.matches``.
+
+        :param before: The upper bound of the first page.
+        :param max_rows: The API's row cap per query.
+        :param page: Returns up to ``size`` ``(cursor timestamp, span)`` rows at or before ``before``, newest first.
+        """
+        kept: list[FetchedSpan] = []
+        seen: set[str] = set()
+        while len(kept) < query.limit:
+            size = min(max_rows, query.limit - len(kept))
+            rows = page(size, before)
+            fresh = [(stamp, span) for stamp, span in rows if span.span_id not in seen]
+            seen.update(span.span_id for _, span in fresh)
+            for _, span in fresh:
+                # both callers filter by session server side, so spans without their own id belong to it
+                span.session_id = span.session_id or query.session_id
+                if query.matches(span):
+                    kept.append(span)
+            # rows at the boundary timestamp are re-read on the next page and dropped as already seen
+            stamps = [stamp for stamp, _ in fresh if stamp is not None]
+            if len(rows) < size or not stamps:
+                if len(rows) == size and not fresh:
+                    self._log.warning("More than %d spans share one timestamp; stopping the %s fetch early", size, self.provider)
+                break
+            before = min(stamps)
+        return kept
