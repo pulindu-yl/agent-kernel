@@ -99,16 +99,16 @@ graph LR
 
 ### Configuration
 
-- Reuses phase 1's `_SecretConfig` (`ak-py/src/agentkernel/core/config.py:911-924`):
+- Reuses phase 1's `_SecretConfig` (`ak-py/src/agentkernel/core/config.py:954-967`):
   - `secret.provider.type: kubernetes` is the only opt-in; no `enabled` flag.
   - `secret.cache_ttl` is the rotation-pickup window on top of the kubelet's refresh, meaning unchanged.
   - `secret.prefix` is not read.
 - **One new field: `secret.provider.kubernetes.mount_path`** (`AK_SECRET__PROVIDER__KUBERNETES__MOUNT_PATH`), default `/var/run/secrets/agentkernel`, never required.
-  - A per-backend block under `_SecretProviderConfig` (`core/config.py:902-908`), the shape of `sandbox.kubernetes`.
+  - A per-backend block under `_SecretProviderConfig` (`core/config.py:945-951`), the shape of `sandbox.kubernetes`.
   - Why it cannot be derived: no existing field names a filesystem location for secrets, and the mount location is decided by whoever writes the pod spec.
   - Read only by `KubernetesSecretProvider`.
 - **No field lists the Secrets.** The provider discovers them under `mount_path`, so the list lives only in the chart's `secretStore.secrets`.
-- It does not reuse `sandbox.kubernetes.*` (`core/config.py:737`), which configures where sandbox pods are created, a different concern.
+- It does not reuse `sandbox.kubernetes.*` (`core/config.py:780`), which configures where sandbox pods are created, a different concern.
 - The `provider.type` and `prefix` field descriptions name the new provider. Existing YAML and `AK_*` environment variables are unaffected, and the default (`env`) is unchanged.
 
 ### Deployment (`ak-deployment/ak-k8s/chart`)

@@ -352,6 +352,19 @@ def test_kubernetes_unsearchable_secret_directory_raises(tmp_path):
         secret.chmod(0o700)
 
 
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores file permissions")
+def test_kubernetes_unreadable_key_file_raises(tmp_path):
+    key = tmp_path / "creds" / "KEY"
+    _write(key, "secret-value")
+    key.chmod(0)
+    try:
+        with pytest.raises(SecretError, match="PermissionError") as info:
+            KubernetesSecretProvider(str(tmp_path)).get_secret("KEY")
+        assert str(key) in str(info.value) and "secret-value" not in str(info.value)
+    finally:
+        key.chmod(0o600)
+
+
 def test_kubernetes_secret_directory_linked_outside_mount_raises(tmp_path):
     _write(tmp_path / "outside" / "KEY", "outside-value")
     mount = tmp_path / "mount"

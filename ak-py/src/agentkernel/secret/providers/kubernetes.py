@@ -73,9 +73,9 @@ class KubernetesSecretProvider(SecretProvider):
                             candidates.append(path)
         except (FileNotFoundError, NotADirectoryError) as exc:
             raise SecretError(
-                f"Kubernetes secret mount '{self._mount_path}' is missing or not a directory: set secretStore.enabled "
-                "and secretStore.secrets in the Helm chart, mount the Secrets there, or correct "
-                "secret.provider.kubernetes.mount_path"
+                f"Kubernetes secret mount '{self._mount_path}' is missing or not a directory: mount the Secrets "
+                f"under '{self._mount_path}' or correct secret.provider.kubernetes.mount_path (the Helm chart's "
+                "secretStore mounts under the default)"
             ) from exc
         except OSError as exc:
             raise SecretError(f"cannot list Kubernetes secret mount '{self._mount_path}': {type(exc).__name__}") from exc

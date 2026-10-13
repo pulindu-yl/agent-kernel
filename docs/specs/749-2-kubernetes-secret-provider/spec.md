@@ -54,10 +54,13 @@ class KubernetesSecretProvider(SecretProvider):
 
         :raises ValueError: If key is not a single, non-hidden path component.
         :raises SecretError: If mount_path is missing or not a directory, the key exists in more
-                             than one place, or a file cannot be listed, read or decoded.
+                             than one place, a matching file resolves outside mount_path, or a
+                             file cannot be listed, read or decoded.
         """
 
     def _find_candidates(self, key: str) -> list[str]: ...   # lists mount_path once
+    @staticmethod
+    def _is_regular_file(path: str) -> bool: ...            # S_ISREG via os.stat; False on absent, SecretError on other OSError
     def _read(self, path: str) -> Optional[str]: ...          # None when the file vanished
 ```
 
@@ -155,13 +158,13 @@ stays unexported because it imports `boto3`. With the export, a caller can build
 
 ### Config changes
 
-**Reuse audit.** The existing `_SecretConfig` (`core/config.py:911-924`) is reused whole:
+**Reuse audit.** The existing `_SecretConfig` (`core/config.py:954-967`) is reused whole:
 `provider.type` selects the backend and `cache_ttl` is the rotation-pickup window. `prefix` exists
-but is not read. `_SandboxKubernetesConfig` (`core/config.py:737`) configures where sandbox pods are
+but is not read. `_SandboxKubernetesConfig` (`core/config.py:780`) configures where sandbox pods are
 created (namespace, image, kubeconfig), and none of its fields is a filesystem path for secrets.
 Reusing it would couple two unrelated concerns.
 
-One new model, placed directly before `_SecretProviderConfig` (`core/config.py:902`):
+One new model, placed directly before `_SecretProviderConfig` (`core/config.py:945`):
 
 ```python
 class _SecretKubernetesConfig(BaseModel):
@@ -466,20 +469,25 @@ therefore CI, uses this checkout for both.
   [Testing → Verify](#verify-one-off-for-this-change).
 
 **Docs surfaces.** Each gains `kubernetes` alongside `env`/`aws_ssm` and, where the surface
-documents config, the new field.
+documents config, the new field. Locations are cited by heading, since these files churn.
 
 | Surface | Change |
 |---|---|
-| `docs/docs/advanced/secrets.md` | `kubernetes` in the provider table (`:27`) and config sketch (`:45`); a new `### kubernetes` subsection after `### aws_ssm` (`:91`) covering: the layout, lookup across Secrets and the duplicate-key error; **key compatibility** (data keys must match `^[A-Z][A-Z0-9_]*$`, non-matching keys are silently unreachable, no remapping, and how to create compatible keys with `kubectl create secret generic … --from-literal=OPENAI_API_KEY=…` / `--from-env-file=.env`, or an External Secrets Operator `target.template.data` that renames remote keys); `mount_path` and other file-per-key mounts (CSI driver, Docker / Compose); the chart's `secretStore`, the tier placement rule and the exact volumes it renders; creating/adding/rotating Secrets with the kubelet delay and the no-`subPath` rule; **security** (every key of every listed Secret is readable by any code in the agent-executing container, including `local_subprocess` sandbox code; list only what agents need, keep unrelated keys out of those Secrets, use an isolated sandbox provider for untrusted code); **local development** (export the key, which wins, or set `mount_path` to a local directory laid out as `<dir>/<secret-name>/<KEY>` or flat `<dir>/<KEY>`; a missing directory is a `SecretError` even with `default=`, so keep `env` in a local config when neither applies); and that env still wins |
-| `docs/docs/core-concepts/configuration.md` | `:187-189` sketch and `:520-521` env list: `kubernetes` and `AK_SECRET__PROVIDER__KUBERNETES__MOUNT_PATH` |
-| `ak-deployment/ak-k8s/README.md` | `:112-113` points at a new *Secrets* section: `secretStore` values, the tier placement rule (and the render failure when no tier executes agents), no RBAC, key compatibility, the security note, rotation; links to `secrets.md` for the rest |
-| `ak-py/README.md` | `:15` feature line and `:701-711` config reference |
-| `.agents/skills/ak-dev-architecture/SKILL.md` | `:12` description, `:660` factory mapping, `:676-678` config sketch, `:1044` tree |
-| `.agents/skills/ak-dev-new-secret-provider/SKILL.md` | `:5` "beyond env, aws_ssm and kubernetes", *Existing Providers* table (`:29`), and a note in step 6 (`:146`) that the Helm analog is a volume mount, not an IAM grant |
-| `.agents/skills/ak-dev-testing-conventions/SKILL.md` | `:149` factory test row names `kubernetes` |
-| `docs/docs/agent-skills.md` | `:133` "beyond `env`, `aws_ssm` and `kubernetes`" |
-| `ak-py/src/agentkernel/skills/ak-add-capabilities/SKILL.md` | `:1310` provider question and `:1325` config comment |
-| `ak-py/src/agentkernel/skills/ak-cloud-deploy/SKILL.md` | *On-Prem / Kubernetes (Helm Chart)* (`:1247`): the `extraEnv` `secretKeyRef` install (`:1315-1317`) gains the `secretStore` alternative with `secret.provider.type: kubernetes` |
+| `docs/docs/advanced/secrets.md` | `kubernetes` in the *Overview* provider table and the *Configuration* sketch; a new `### kubernetes` subsection after `### aws_ssm` covering: the layout, lookup across Secrets and the duplicate-key error; **key compatibility** (data keys must match `^[A-Z][A-Z0-9_]*$`, non-matching keys are silently unreachable, no remapping, and how to create compatible keys with `kubectl create secret generic … --from-literal=OPENAI_API_KEY=…` / `--from-env-file=.env`, or an External Secrets Operator `target.template.data` that renames remote keys); `mount_path` and other file-per-key mounts (CSI driver, Docker / Compose); the chart's `secretStore`, the tier placement rule and the exact volumes it renders; creating/adding/rotating Secrets with the kubelet delay and the no-`subPath` rule; **security** (every key of every listed Secret is readable by any code in the agent-executing container, including `local_subprocess` sandbox code; list only what agents need, keep unrelated keys out of those Secrets, use an isolated sandbox provider for untrusted code); **local development** (export the key, which wins, or set `mount_path` to a local directory laid out as `<dir>/<secret-name>/<KEY>` or flat `<dir>/<KEY>`; a missing directory is a `SecretError` even with `default=`, so keep `env` in a local config when neither applies); and that env still wins |
+| `docs/docs/core-concepts/configuration.md` | The `secret:` block of the *Basic Configuration File* sketch and the *Secret Resolution* env list: `kubernetes` and `AK_SECRET__PROVIDER__KUBERNETES__MOUNT_PATH` |
+| `ak-deployment/ak-k8s/README.md` | *The application image contract* (model credentials paragraph) points at a new *Secrets* section: `secretStore` values, the tier placement rule (and the render failure when no tier executes agents), no RBAC, key compatibility, the security note, rotation; links to `secrets.md` for the rest |
+| `ak-py/README.md` | *Features* (Secret Resolution line) and the *Secret Resolution* config reference |
+| `.agents/skills/ak-dev-architecture/SKILL.md` | Frontmatter description, *Secret Resolution* (factory mapping and the *Configuration* sketch), *Directory Structure* tree |
+| `.agents/skills/ak-dev-new-secret-provider/SKILL.md` | Frontmatter "beyond env, aws_ssm and kubernetes", *Existing Providers* table, and a note in *6. Deployment Wiring* that the Helm analog is a volume mount, not an IAM grant |
+| `.agents/skills/ak-dev-testing-conventions/SKILL.md` | *Test File Organization*: the `test_secret_factory.py` row names `kubernetes` |
+| `docs/docs/agent-skills.md` | *Developer Skills*: the `ak-dev-new-secret-provider` row says "beyond `env`, `aws_ssm` and `kubernetes`" |
+| `ak-py/src/agentkernel/skills/ak-add-capabilities/SKILL.md` | *Secret Resolution*: the provider question and the config comment |
+| `ak-py/src/agentkernel/skills/ak-cloud-deploy/SKILL.md` | *On-Prem / Kubernetes (Helm Chart)*: the `extraEnv` `secretKeyRef` install gains the `secretStore` alternative with `secret.provider.type: kubernetes` |
+| `README.md` | *Compliance & Governance*: the Secret Resolution bullet names mounted Kubernetes Secrets |
+| `docs/docs/intro.md` | *Enterprise-Ready Features*: the Secret Resolution bullet names Kubernetes Secrets |
+| `docs/docs/deployment/onprem-kubernetes.md` | A new *Secret Resolution (Kubernetes Secrets)* section: `extraEnv` or `secretStore`, the tier placement rule, env still wins; links to `secrets.md` and the chart README |
+| `docs/src/components/FeatureExplorer/data.tsx` | The *Secret Resolution* card's description and tags name Kubernetes Secrets |
+| `docs/src/components/IntegrationsMarquee/data.tsx` | The Kubernetes entry's title mentions mounted Secrets |
 
 Both bundled-skill `evals/evals.json` files are **not** changed. Their cases test the AWS flows,
 which this change leaves untouched. `docs/docs/examples/overview.md` has no entry for
@@ -515,7 +523,7 @@ which this change leaves untouched. `docs/docs/examples/overview.md` has no entr
 |---|---|---|---|
 | `mount_path` empty (YAML/code) or relative | `AKConfigError` naming `secret.provider.kubernetes.mount_path` | `KubernetesSecretProvider.__init__` | At first `SecretManager.current()` |
 | Key empty, starting with `.`, or containing `/`/`os.sep` (direct provider call) | `ValueError` | `get_secret` | Programming error; through the manager it is already rejected by `_validate_key` |
-| `mount_path` does not exist (`FileNotFoundError`) or is not a directory (`NotADirectoryError`) | `SecretError` naming `mount_path`, saying to set `secretStore.enabled`/`secretStore.secrets`, mount Secrets there, or correct `secret.provider.kubernetes.mount_path`; chained | `_find_candidates` | Out of `get`, **even with `default=`** (`secret/manager.py:68`); never cached |
+| `mount_path` does not exist (`FileNotFoundError`) or is not a directory (`NotADirectoryError`) | `SecretError` naming `mount_path`, saying to mount the Secrets there or correct `secret.provider.kubernetes.mount_path`, with the hint last that the Helm chart's `secretStore` mounts under the default; deployment-neutral otherwise, as `aws_ssm`'s messages are; chained | `_find_candidates` | Out of `get`, **even with `default=`** (`secret/manager.py:68`); never cached |
 | Any other `OSError` listing `mount_path` (e.g. `PermissionError`) | `SecretError` naming the path and `type(exc).__name__`; chained | `_find_candidates` | Same |
 | Any `OSError` other than `FileNotFoundError`/`NotADirectoryError` checking `<mount_path>/<dir>/<key>` (e.g. an unsearchable Secret directory) | `SecretError` naming the path and `type(exc).__name__`; chained | `_is_regular_file` | Same |
 | A candidate resolves outside `mount_path` | `SecretError` naming the path, never contents | `_find_candidates`, before reading | Same |
@@ -558,7 +566,7 @@ which this change leaves untouched. `docs/docs/examples/overview.md` has no entr
   - A directory named `KEY` is not a candidate.
   - An empty file is a miss (`None`).
   - **`mount_path` errors**: a missing directory, and a regular file, raise `SecretError` whose
-    message names the path and `secretStore`.
+    message names the path and mentions `secretStore` only as the trailing chart hint.
   - An unreadable directory (`chmod 000`, skipped when running as root) raises `SecretError`;
     so does an unsearchable Secret directory under it, naming `<dir>/KEY`.
   - **Containment**: a Secret directory symlinked outside `mount_path`, and a key file (top level

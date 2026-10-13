@@ -34,6 +34,7 @@ fullnameOverride: ""
 #   - name: OPENAI_API_KEY
 #     valueFrom:
 #       secretKeyRef: {name: openai, key: api-key}
+# Or mount whole Secrets as files with `secretStore` below.
 extraEnv: []
 # Extra envFrom sources (ConfigMaps/Secrets) for every Agent Kernel container.
 extraEnvFrom: []

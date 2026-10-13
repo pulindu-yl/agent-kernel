@@ -17,7 +17,7 @@ make lint-check-all
   `AK_SECRET__PROVIDER__KUBERNETES__MOUNT_PATH`; nothing consumes it yet.
 - **Files:** `ak-py/src/agentkernel/core/config.py`, `ak-py/tests/test_config.py`
 - **Steps:**
-  1. Add `_SecretKubernetesConfig` before `_SecretProviderConfig` (`config.py:902`) and the
+  1. Add `_SecretKubernetesConfig` before `_SecretProviderConfig` (`config.py:945`) and the
      `kubernetes` field on `_SecretProviderConfig` — spec.md § Config changes.
   2. Update the `provider.type` and `prefix` descriptions.
   3. `test_config.py`: default, env override, empty env var keeps the default — spec.md § Testing.
@@ -104,12 +104,15 @@ make lint-check-all
 ## Iteration 7: Sync docs and skills
 
 Run `ak-dev-sync-skills-from-branch` and `ak-dev-sync-docs-from-branch` before merge. The surfaces
-are listed, with lines, in spec.md § Examples and docs → *Docs surfaces*:
+are listed, by heading, in spec.md § Examples and docs → *Docs surfaces*:
 
 - **Docs site:** `docs/docs/advanced/secrets.md` (new `### kubernetes` subsection: layout, key
   compatibility, `mount_path`, `secretStore` and tier rule, rotation, security, local development),
-  `docs/docs/core-concepts/configuration.md`, `docs/docs/agent-skills.md`.
-- **Deployment / package READMEs:** `ak-deployment/ak-k8s/README.md` (*Secrets* section),
+  `docs/docs/core-concepts/configuration.md`, `docs/docs/agent-skills.md`, `docs/docs/intro.md`,
+  `docs/docs/deployment/onprem-kubernetes.md` (new *Secret Resolution* section).
+- **Landing page:** `docs/src/components/FeatureExplorer/data.tsx`,
+  `docs/src/components/IntegrationsMarquee/data.tsx`.
+- **READMEs:** root `README.md`, `ak-deployment/ak-k8s/README.md` (*Secrets* section),
   `ak-py/README.md`.
 - **Dev skills:** `ak-dev-architecture`, `ak-dev-new-secret-provider` (Existing Providers + Helm
   note in step 6), `ak-dev-testing-conventions`.
