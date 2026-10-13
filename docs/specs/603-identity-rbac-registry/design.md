@@ -71,6 +71,8 @@ and `research/design-options.md` section 4).
     (the RFC 8693 `act` chain: who is acting for this subject).
   - `Principal.anonymous()` returns `subject="anonymous"`, `provider="anonymous"`;
     `is_anonymous` property.
+  - Frozen (`model_config = ConfigDict(frozen=True)`): a principal read from the session cannot be
+    mutated by a hook or tool; a changed identity is a new object only `Runtime` can publish.
   - Groups and provider roles are carried verbatim; `roles` additionally holds AK roles produced
     by the role mapping (section 3).
 - `AccessLevel` (`StrEnum`, ordered, comparable): `read < write < admin`. It is the **capability
@@ -98,13 +100,37 @@ and `research/design-options.md` section 4).
     `acting_user_id`. `principal` wins; `acting_user_id` alone synthesizes
     `Principal(subject=acting_user_id, provider="legacy")`; both present and disagreeing raise
     `ValueError`; neither present means `Principal.anonymous()`.
-  - Publishes `PRINCIPAL_CACHE_KEY = "ak.principal"` in the volatile cache next to
-    `ACTING_USER_CACHE_KEY` (which keeps its current value and absence rules: set only for a
-    non-anonymous principal), cleared in the same `finally`.
+  - Publishes the principal in the volatile cache under `PRINCIPAL_CACHE_KEY = "ak.principal"`,
+    next to `ACTING_USER_CACHE_KEY` (which keeps its current value and absence rules: set only for
+    a non-anonymous principal), both cleared in the same `finally`. The volatile cache is never
+    persisted (every store writes `session.get_all(volatile=False)`, `core/session/redis.py:100`,
+    `valkey.py:100`, `dynamodb.py:105`, `cosmosdb.py:108`), so a run identity cannot be read back
+    by a later run.
+  - Publication is **read-only to everything but `Runtime`**: `KeyValueCache`
+    (`core/util/key_value_cache.py:29-49`) refuses `set` and `delete` on keys with the reserved
+    `ak.` prefix (`ValueError` naming the key), and `Runtime` writes them through private
+    `_set_reserved` / `_delete_reserved` methods. This protects today's `ak.acting_user_id` too.
+    Storage stays session-attached rather than a `ContextVar` alone because ADK re-activates the
+    tool context from state per call (`framework/adk/adk.py:654-660`), where a context variable
+    would be lost.
   - Sets `principal.actor = Principal(kind="agent", subject=agent.descriptor.identity.subject,
     provider="agentkernel")` on a copy of the run principal before publishing it.
-- `ToolContext.principal` property (`core/tool.py`): the published `Principal`, or `None` outside
-  a run; `Session` gains no new accessor.
+- `Session.get_principal() -> Optional[Principal]` (`core/base.py`) fronts the reserved key the way
+  `get_framework_context()` fronts `FRAMEWORK_CONTEXT` (`core/base.py:188-211`); nothing outside
+  `Session` and `Runtime` spells the key. `ToolContext.principal` (`core/tool.py`) delegates to it
+  and is `None` outside a run. Hooks and tools read the user id, groups, roles and claims from
+  this object; they cannot write any of it.
+- Session ownership (the durable side): `Session.Keys.OWNER = "owner"` is a new reserved durable
+  key holding `SessionOwner(subject, provider)`; `Session.get_owner() -> Optional[SessionOwner]`
+  is its only public reader. `Runtime` sets it once, on the first run with a non-anonymous
+  principal when the key is absent, and never overwrites it; it persists with the session and
+  survives `clear_framework_context()`. Enforcement is in section 6; the recorded owner is also
+  the hook #243 needs for user-scoped lookup and replaces the hand-rolled
+  `nv_cache["user_identity"]` pattern (`examples/sandbox/identity/identity.py:28`).
+- Identity reaches tools and hooks, never the model: `ChatService._attach_additional_context`
+  keeps excluding `user_id` and `group_id` (`core/chat_service.py:127-143`); the `Principal` is
+  never written into `framework_context`, a prompt, an `AgentRequestAny`, or a framework's native
+  state (ADK `state`, LangGraph channels); adapter gates read it from the session.
 
 ### 2. Establishing the acting principal on every surface
 
@@ -253,10 +279,16 @@ and `research/design-options.md` section 4).
   branches whose adapters subclass the contract suite when they land.
 - `StaticAuthorizer` (`static`) evaluates the `authorization.grants` and `authorization.tools`
   blocks (its policy source; engine backends ignore these blocks and own their policy):
+  - A grant is `subjects`, `agents`, `level`. `subjects` and `agents` are lists; a bare string is
+    coerced to a one-element list, so `agents: support-triage` and `agents: [a, b]` are both
+    valid. A grant applies to every (subject, agent) pair it names.
   - Subject grammar: `*` (everyone, anonymous included), `authenticated` (any non-anonymous
-    principal), `user:<subject>`, `group:<name>`, `role:<name>`; agent is an id or `*`.
-  - `agent_level` is the highest level over matching grants for that agent id or `*`; `None` when
-    none matches.
+    principal), `user:<subject>` (matches the subject of a principal of any kind, so a
+    client-credentials service principal is granted the same way), `group:<name>`,
+    `role:<name>`; an agent entry is an agent id or `*`.
+  - `agent_level` is the highest level over every matching (subject, agent) pair across all
+    grants; `None` when none matches. There are no negative grants at the agent level; `deny`
+    exists only for tools.
   - Tool tier: the `tiers` entry for `(agent, tool)` if present, else the system tool's declared
     `tier`, else `read`.
   - `check_tool` allows when the tool is not in `deny`, is in `allow` when `allow` is set, and its
@@ -279,6 +311,56 @@ and `research/design-options.md` section 4).
   forms, highest-level-wins, `*` agent grants, tier gating, `allow` / `deny` precedence, anonymous
   handling, and `visible_agents` equivalence with the candidate walk; every backend subclasses it.
 
+### 5.1 Worked example: how users, agents and tools combine
+
+- Roles come from three places and compose: IdP groups verbatim (`group:`), IdP roles verbatim
+  (`role:`), and AK roles produced by `identity.role_mapping` (also `role:`). A role is not bound
+  to one agent; a grant binds subjects to agents (or `*`) at a level. A tool's tier is per
+  agent, so the same tool name can be `write` on one agent and `admin` on another.
+- Who holds a role is decided in the IdP, not in AK: group and role membership is managed there,
+  arrives in the token under the claim paths the provider block names, and `identity.role_mapping`
+  only renames provider values into AK roles (provider values stay usable as `group:` and `role:`
+  subjects). AK stores no user-to-role assignments in this round; a direct per-user grant uses
+  `user:<subject>`, and the `static` provider lists groups and roles per credential for dev.
+
+```yaml
+identity:
+  role_mapping: {sre-oncall: [operator], platform-admins: [admin]}
+authorization:
+  type: static
+  grants:
+    - {subjects: role:admin,     agents: "*",                     level: admin}
+    - {subjects: role:operator,  agents: k8s-troubleshooter,      level: write}
+    - {subjects: group:support,  agents: [support-triage, faq],   level: write}
+    - {subjects: authenticated,  agents: support-triage,          level: read}
+    - {subjects: "*",            agents: faq,                     level: read}
+  tools:
+    - agent: k8s-troubleshooter
+      tiers: {kubectl_get: read, kubectl_describe: read, kubectl_apply: write, kubectl_delete_namespace: admin}
+    - agent: support-triage
+      tiers: {lookup_ticket: read, create_ticket: write, refund: admin}
+      deny: [delete_ticket]
+registry:
+  agents:
+    faq: {visibility: public}
+    support-triage: {visibility: internal}
+    k8s-troubleshooter: {visibility: private}
+```
+
+| Principal (from the IdP) | `faq` | `support-triage` | `k8s-troubleshooter` |
+|---|---|---|---|
+| anonymous | `read`: listed, chats, `read`-tier tools | 404 (not visible, no level) | 404 |
+| Dave, authenticated, no groups | `read` | `read`: listed (`internal`); `lookup_ticket` only; `create_ticket` hidden, and invoking it by name returns the reason string | 404 |
+| Bob, groups `[support]` | `write` (the list grant) | `write` (highest of `authenticated` read and `group:support` write): `lookup_ticket`, `create_ticket`; `refund` hidden (`admin` tier); `delete_ticket` denied by `deny` whatever the level | 404 |
+| Alice, groups `[sre-oncall]`, mapped role `operator` | `read` | `read` | `write`: `kubectl_get`, `kubectl_describe`, `kubectl_apply`; `kubectl_delete_namespace` hidden; sandbox tools (declared `write`) available |
+| Carol, groups `[platform-admins]`, mapped role `admin` | `admin` | `admin`: every tool except `delete_ticket` (`deny` beats level) | `admin`: every tool |
+
+- On Alice's run the published principal is `subject=alice, groups=[sre-oncall],
+  roles=[operator], actor=Principal(kind=agent, subject=k8s-troubleshooter)`, so a tool calling a
+  downstream API can bind or log both the user and the agent acting for her.
+- Removing `support-triage`'s `authenticated` grant makes it listed-but-unusable for Dave (403 on
+  chat, still visible); changing its visibility to `private` makes it 404 for him instead.
+
 ### 6. Enforcement points
 
 | Decision | Fires | Mechanism | Rule |
@@ -288,6 +370,7 @@ and `research/design-options.md` section 4).
 | Which agents the principal may see | Catalog routes | `AccessGate.visible_agents`, narrowed by `surfaces` | Feeds REST, AG-UI, MCP `tools/list`, `/a2a/catalog` |
 | Which tools agent A offers this run | Per run, at tool-list time | `Runtime` resolves `AccessGate.tool_filter(principal, agent)` once, after `resolve_run_options` and before the framework-context load, and publishes it under `TOOL_FILTER_CACHE_KEY`; adapters apply it natively (section 7) | Visibility only; hidden tools are not a boundary |
 | May agent A invoke tool T now, for this principal | Call time | The same filter re-checked at the call through each adapter's native gate or wrapper (section 7) | A denied call returns a tool result string naming the reason (`"Tool 'apply_manifest' requires level write; the current principal has read"`), never an exception into the framework (the OKF `write_kb` behaviour, `knowledgebase/okf/tools.py:150-152`); a failure inside the gate itself denies |
+| May the principal continue session S | `Runtime.run` / `stream`, after the agent check; the thread path at `ConversationThreadManager.get_or_create_thread` | `AccessGate.authorize_session(principal, session)`: allowed when the gate is absent, the session has no owner, the principal is anonymous (the agent check already decided), the owner's subject equals the principal's, or either side is a messaging principal (Q17); otherwise `PermissionError`. The thread path compares the existing `Thread.user_id` with the principal before any write (`integration/thread/manager.py:108-114` checks nothing today) | Closes session continuation by anyone who knows a `session_id`; 403 at the choke point, and before a thread message is written on the thread path |
 | Threads, schedules, sandbox principal | Existing checks | Unchanged ownership rules; `AgentPrincipalResolver` reads `ToolContext.principal` so `sandbox.identity.mode: user` works with the run principal and no custom resolver | Absorbing ownership checks into the authorizer is round 2 |
 
 - HTTP mapping: `PermissionError` to 403 is added beside the `ValueError` to 400 branches in the
@@ -369,9 +452,9 @@ identity:
 authorization:
   type: static                      # static | casbin | openfga | cedar | authzen | dotted path
   grants:
-    - {subject: role:admin, agent: "*", level: admin}
-    - {subject: group:support, agent: support-triage, level: write}
-    - {subject: authenticated, agent: faq, level: read}
+    - {subjects: role:admin, agents: "*", level: admin}
+    - {subjects: [group:support, role:cx-lead], agents: [support-triage, faq], level: write}
+    - {subjects: authenticated, agents: faq, level: read}
   tools:
     - agent: support-triage
       tiers: {create_ticket: write, lookup_ticket: read}
@@ -434,7 +517,10 @@ registry:
   `AuthorizerContract`; `tests/test_agent_registry_*.py` per backend over fakes of the shared
   drivers; `tests/test_access_gate.py` (visibility rules, 403 versus 404, tool filter);
   `tests/test_tool_gates_<adapter>.py` for the six adapters (denied tool hidden where supported,
-  denied call returns the reason string, no-authorization path keyword-for-keyword unchanged).
+  denied call returns the reason string, no-authorization path keyword-for-keyword unchanged);
+  `tests/test_session_identity.py` (`ak.` keys refused from application code, `get_principal` and
+  `get_owner` read-only, owner set once and persisted, principal never persisted, ownership 403,
+  messaging exemption).
 - Changed: `tests/test_api_http.py:185-289` (the dependency stores the principal; body mismatch
   400), `tests/test_pipeline_ws.py:350` (frame mismatch frame), `tests/test_module.py:146`
   (`AgentRegistrationError`), `tests/test_authoriser_shared.py` (legacy path unchanged, adapter
@@ -483,7 +569,7 @@ graph TD
   round 2. `owner` is catalog metadata in this change.
 - An `impersonate` grant letting a service caller act as another user (settled, Q3).
 - Canonical identity resolution for messaging sender ids (#243) and session or thread lookup by
-  user.
+  user; the recorded session owner is the hook for both.
 - Absorbing thread and schedule ownership checks, or sandbox policy, into the authorizer.
 - Authenticated extended A2A cards, A2A card signing, and MCP client-side authentication for
   agents calling remote MCP servers.
@@ -510,3 +596,13 @@ graph TD
 - Q16. The static provider resolves credential values by key through the `secret` capability. Is
   requiring that (no literal tokens in YAML) acceptable for the dev loop, given `secret.provider`
   defaults to `env`?
+- Q17. Session ownership exempts messaging sessions, where a Slack channel or Teams group session
+  is legitimately shared by many senders. Recommendation: messaging principals carry
+  `provider="messaging:<platform>"` and the gate skips enforcement when either the owner or the
+  current principal has that prefix, so no platform list leaks into the gate. Alternative: a
+  `shared` flag on `SessionOwner` set by the messaging `AgentRunner` path.
+- Q18. Should an `agents` entry also accept `tag:<name>`, resolved through the registry against
+  `AgentDescriptor.tags`, so a grant can target "every support agent" without listing ids? Cheap
+  (the gate already holds the registry) and consistent with AWS tag-based conditions, but it makes
+  a grant's reach depend on registry metadata. Recommendation: add it; a tag nobody carries matches
+  nothing and warns once.
