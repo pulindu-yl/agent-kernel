@@ -10,6 +10,8 @@ slug: /
 :::tip What's New
 🎨 **A2UI** - Turn two config keys on and an agent's JSON reply reaches the client as an [A2UI](https://a2ui.org/) document: `result` carries the object and `media_type` names the format, over REST, MCP and AG-UI alike. [Learn more →](./advanced/a2ui.md)
 
+🔀 **Realtime multi-agent handoffs** - A voice call moves between agents with the OpenAI Agents SDK's handoffs or Google ADK's transfers, and in LiveKit every agent appears as its own participant, with only the active one unmuted. [Learn more →](./integrations/livekit.md#multi-agent-handoffs)
+
 🙋 **Human in the Loop** - Let a run pause for a person's approval or answer, and resume from their decision minutes or hours later, on any replica. Works on OpenAI, LangGraph, Pydantic AI and Google ADK, over REST, streaming and AG-UI. [Learn more →](./advanced/human-in-the-loop.md)
 
 🎙️ **LiveKit Voice Integration** - Connect OpenAI Agents SDK and Google ADK agents to LiveKit WebRTC rooms through the realtime execution pipeline. [Learn more →](./integrations/livekit.md)

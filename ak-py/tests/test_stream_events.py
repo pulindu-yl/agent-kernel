@@ -5,6 +5,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from agentkernel.core.event import (
+    AgentChanged,
     AudioDelta,
     DataMessage,
     Interrupt,
@@ -48,6 +49,7 @@ ALL_EVENTS = [
     ReasoningEnd(message_id="m1"),
     AudioDelta(message_id="m1", content="YmFzZTY0Cg=="),
     Interrupt(),
+    AgentChanged(agent="billing", previous_agent="supervisor"),
     RunPaused(run_id="run-1", agent="refunds", interruptions=[PausedInterruption(id="i1", kind="tool_call", tool_name="refund")]),
     DataMessage(message_id="m1", content={"version": "v1.0", "cost": 1.5}, media_type="application/a2ui+json"),
 ]
