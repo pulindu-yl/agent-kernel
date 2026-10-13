@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import time
 import uuid
@@ -8,6 +9,8 @@ import pytest
 import pytest_asyncio
 
 from simulate_traffic import TrafficSimulator
+
+_log = logging.getLogger("ak.example.trace_evaluation.lambda_test")
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")  # uses a single session for all tests
 
@@ -46,6 +49,14 @@ class EvaluationClient:
                 response = await client.get(self.check_url, params={"session_id": session_id, "expected": expected})
                 response.raise_for_status()
                 progress = response.json()
+                _log.info(
+                    "/check: %s graded, %s grading, %s pending, %s failed, %s unfinished",
+                    progress["graded"],
+                    progress["grading"],
+                    progress["pending"],
+                    progress["failed"],
+                    progress["unfinished"],
+                )
                 if progress["complete"] or progress["grading"] == 0 or time.monotonic() >= deadline:
                     return progress
                 await asyncio.sleep(poll_interval)
@@ -75,19 +86,27 @@ async def client(chat_url):
 @pytest.mark.asyncio
 async def test_every_request_is_graded(simulator, client):
     """Sends the questions, runs up to ROUNDS /eval calls, and expects every request graded."""
+    _log.info("warming up the agent on a throwaway session")
+    await asyncio.to_thread(simulator.warm_up)
+    _log.info("session %s: sending %d questions", simulator.session_id, EXPECTED)
     replies = await asyncio.to_thread(simulator.send_questions)
+    for question, reply in zip(TrafficSimulator.QUESTIONS, replies):
+        _log.info("> %s\n%s", question, reply)
     assert len(replies) == EXPECTED and all(replies), f"expected {EXPECTED} non-empty replies, got {replies}"
 
+    _log.info("waiting %d s for Langfuse to ingest the traces", INITIAL_WAIT)
     await asyncio.sleep(INITIAL_WAIT)
 
     progress: dict = {}
-    for _ in range(ROUNDS):
+    for round_number in range(1, ROUNDS + 1):
         code, body = await client.start_evaluation(simulator.session_id)
+        _log.info("/eval round %d: %s %s", round_number, code, body)
         assert code == 202, f"/eval failed: {body.get('error')}"
         progress = await client.wait_until_graded(simulator.session_id, expected=EXPECTED)
         if progress["complete"]:
             break
         # not all graded: the next /eval queues pending, failed and leftover grading traces
+        _log.info("not all graded; next /eval in %d s", ROUND_INTERVAL)
         await asyncio.sleep(ROUND_INTERVAL)
 
     assert progress["complete"], (

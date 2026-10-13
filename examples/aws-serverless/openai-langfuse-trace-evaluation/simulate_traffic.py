@@ -20,6 +20,10 @@ class TrafficSimulator:
     MAX_ATTEMPTS = 3
     TIMEOUT = 30.0
     RETRY_WAIT = 5.0
+    # Only failures that mean the request never reached the agent. A 504 or a read timeout is not retried: the
+    # request may already be queued, and sending it again would run the agent twice and leave an extra trace.
+    RETRY_STATUSES = frozenset({429, 502, 503})
+    WARM_UP_QUESTION = "Hello"
 
     def __init__(self, chat_url: str, session_id: str | None = None, transport: httpx.BaseTransport | None = None):
         self._chat_url = chat_url
@@ -36,18 +40,31 @@ class TrafficSimulator:
         with httpx.Client(timeout=self.TIMEOUT, transport=self._transport) as client:
             return [self._send_question(client, question) for question in self.QUESTIONS]
 
+    def warm_up(self) -> None:
+        """Sends one question under a throwaway session, so cold starts hit it rather than the graded requests.
+
+        Its reply and any failure are ignored: a cold start can make it time out at the gateway while the
+        Lambdas still start.
+        """
+        payload = {"prompt": self.WARM_UP_QUESTION, "session_id": f"warm-up-{uuid.uuid4()}", "agent": "triage"}
+        with httpx.Client(timeout=self.TIMEOUT, transport=self._transport) as client:
+            try:
+                client.post(self._chat_url, json=payload)
+            except httpx.HTTPError:
+                pass
+
     def _send_question(self, client: httpx.Client, question: str) -> str:
-        """Posts one question to /chat, retrying 5xx responses and timeouts, and returns the reply."""
+        """Posts one question to /chat, retrying only failures that never reached the agent, and returns the reply."""
         payload = {"prompt": question, "session_id": self._session_id, "agent": "triage"}
-        # Retry 5xx and timeouts: serverless cold starts can exceed the gateway timeout
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
             try:
                 response = client.post(self._chat_url, json=payload)
-            except httpx.TimeoutException:
+            except (httpx.ConnectError, httpx.ConnectTimeout):
                 if attempt == self.MAX_ATTEMPTS:
                     raise
+                time.sleep(self.RETRY_WAIT)
                 continue
-            if response.status_code < 500 or attempt == self.MAX_ATTEMPTS:
+            if response.status_code not in self.RETRY_STATUSES or attempt == self.MAX_ATTEMPTS:
                 break
             time.sleep(self.RETRY_WAIT)
         response.raise_for_status()

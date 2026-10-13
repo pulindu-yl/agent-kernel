@@ -37,6 +37,9 @@ package = false
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# Show the live test's progress logs as it runs
+log_cli = true
+log_cli_level = "INFO"
 
 [tool.isort]
 profile = "black"

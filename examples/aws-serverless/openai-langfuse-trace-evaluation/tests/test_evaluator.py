@@ -829,11 +829,13 @@ class TestTrafficSimulator:
     URL = "https://example.com/api/v1/chat"
 
     @staticmethod
-    def transport(requests: list, failures: int = 0) -> httpx.MockTransport:
+    def transport(requests: list, failures: int = 0, status: int = 502) -> httpx.MockTransport:
+        """A fake /chat that records each request and answers the first ``failures`` with ``status``, then 200."""
+
         def handle(request: httpx.Request) -> httpx.Response:
             requests.append(json.loads(request.content))
             if len(requests) <= failures:
-                return httpx.Response(502)
+                return httpx.Response(status)
             return httpx.Response(200, json={"result": f"reply {len(requests)}"})
 
         return httpx.MockTransport(handle)
@@ -851,13 +853,59 @@ class TestTrafficSimulator:
         simulator.send_questions()
         assert {r["session_id"] for r in requests} == {simulator.session_id}
 
-    def test_retries_5xx(self, monkeypatch):
+    @pytest.mark.parametrize("status", [429, 502, 503])
+    def test_retries_failures_before_the_agent(self, monkeypatch, status):
+        """429, 502 and 503 mean the request never reached the agent, so it is sent again."""
         monkeypatch.setattr(TrafficSimulator, "RETRY_WAIT", 0)
         requests: list = []
         replies = TrafficSimulator(
-            self.URL, session_id="s-1", transport=self.transport(requests, failures=1)
+            self.URL, session_id="s-1", transport=self.transport(requests, failures=1, status=status)
         ).send_questions()
         assert len(requests) == 4 and replies[0] == "reply 2"
+
+    @pytest.mark.parametrize("status", [500, 504])
+    def test_no_retry_once_the_request_may_be_queued(self, monkeypatch, status):
+        """500 and 504 may come after the request is queued, so it is sent once and the error raised."""
+        monkeypatch.setattr(TrafficSimulator, "RETRY_WAIT", 0)
+        requests: list = []
+        simulator = TrafficSimulator(self.URL, transport=self.transport(requests, failures=1, status=status))
+        with pytest.raises(httpx.HTTPStatusError):
+            simulator.send_questions()
+        assert len(requests) == 1
+
+    def test_retries_connect_errors_only(self, monkeypatch):
+        """A connect error is retried; a read timeout (the request may have arrived) is raised."""
+        monkeypatch.setattr(TrafficSimulator, "RETRY_WAIT", 0)
+        attempts = []
+
+        def handle(error: type[httpx.TransportError]):
+            def raise_error(request: httpx.Request) -> httpx.Response:
+                attempts.append(error)
+                if len(attempts) == 1:
+                    raise error("failed", request=request)
+                return httpx.Response(200, json={"result": "ok"})
+
+            return httpx.MockTransport(raise_error)
+
+        assert TrafficSimulator(self.URL, transport=handle(httpx.ConnectError)).send_questions()[0] == "ok"
+        attempts.clear()
+        with pytest.raises(httpx.ReadTimeout):
+            TrafficSimulator(self.URL, transport=handle(httpx.ReadTimeout)).send_questions()
+        assert len(attempts) == 1
+
+    def test_warm_up_uses_a_throwaway_session_and_ignores_failures(self):
+        """warm_up sends one request on a warm-up- session and swallows a 504 or a timeout."""
+        requests: list = []
+        simulator = TrafficSimulator(
+            self.URL, session_id="s-1", transport=self.transport(requests, failures=1, status=504)
+        )
+        simulator.warm_up()
+        assert len(requests) == 1 and requests[0]["session_id"].startswith("warm-up-")
+
+        def raise_timeout(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("timed out", request=request)
+
+        TrafficSimulator(self.URL, transport=httpx.MockTransport(raise_timeout)).warm_up()
 
     def test_chat_url_from_env(self, monkeypatch, tmp_path):
         monkeypatch.setenv("AK_TEST_ENDPOINT", self.URL)
