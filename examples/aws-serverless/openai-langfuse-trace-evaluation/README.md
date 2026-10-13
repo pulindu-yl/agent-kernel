@@ -94,6 +94,14 @@ threshold `0.5`. None needs an expected answer.
 
 Tool-call count, failed tool calls, latency, tokens and cost come from the spans and are stored, not judged.
 
+The judges see the request, the tool calls and the answer, but not the agent's instructions, so they score a
+reply against what the user asked for. A correct refusal therefore fails: the off-topic question ("Write me a
+poem about the ocean.") is declined as the triage agent is told to, and its row has `passed` false, with
+`task_completion` and `answer_relevance` near 0. `hallucination` is unreliable there too: with no tool result
+as context, the judge sometimes reads the refusal as unfaithful and scores it 1. To grade against your own
+rules, give the judges the agent's instructions (for example as `hallucination` context) or add a rubric metric
+such as Opik's `GEval`.
+
 ## The results table
 
 `<prefix>-trace-evaluations`, partition key `trace_id`, with a `session_id-index` and a 90-day TTL on
@@ -198,13 +206,14 @@ Unit tests (no cloud access; the judges, Langfuse and DynamoDB are faked, Dynamo
 ./build.sh local && uv run --no-sync pytest tests/
 ```
 
-The integration test sends the three questions to a deployment, waits, then runs up to three `/eval`
-rounds, and passes once `/check` reports every request graded. It runs in the weekly integration tests;
+The integration test first sends one question under a throwaway session and waits 2 minutes, so cold starts
+(which can outlast API Gateway's 29 s) hit it rather than the graded requests. It then sends the three
+questions, waits, runs up to three `/eval` rounds, and passes once `/check` reports every request graded. It runs in the weekly integration tests;
 locally:
 
 ```bash
 AK_TEST_ENDPOINT=$(terraform -chdir=deploy output -raw agent_invoke_url) uv run --no-sync pytest lambda_test.py
 ```
 
-It takes about 3 to 5 minutes, most of it waiting for Langfuse ingestion. It checks only that every request
+It takes about 5 to 7 minutes, most of it waiting for the warm-up and Langfuse ingestion. It checks only that every request
 was graded and stored, not the judges' verdicts.
