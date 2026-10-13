@@ -1,4 +1,4 @@
-"""Tests for fetching traces back from the tracing providers' clouds (trace/fetch.py and the per-provider fetchers).
+"""Tests for fetching spans back from the tracing providers' clouds (trace/fetch.py and the per-provider fetchers).
 
 No provider SDK is needed: Langfuse gets a fake client, Logfire a fake ``logfire.experimental.query_client``
 module, and Traceloop an ``httpx.MockTransport``.

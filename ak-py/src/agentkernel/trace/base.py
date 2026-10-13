@@ -62,4 +62,4 @@ class BaseTrace(ABC):
 
         :param query: The provider-neutral filter (time window, span kinds, session, ...).
         """
-        raise NotImplementedError(f"{type(self).__name__} does not support fetching traces")
+        raise NotImplementedError(f"{type(self).__name__} does not support fetching spans")

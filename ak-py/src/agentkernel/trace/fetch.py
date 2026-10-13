@@ -1,4 +1,4 @@
-"""Provider-neutral model for fetching traces back from a tracing provider's cloud.
+"""Provider-neutral model for fetching spans back from a tracing provider's cloud.
 
 ``TraceQuery`` is the generic filter every tracer translates into its own query language,
 ``FetchedSpan`` is the shape every tracer returns (with ``SpanUsage`` for its model call's tokens and

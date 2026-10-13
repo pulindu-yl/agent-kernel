@@ -131,7 +131,7 @@ class Trace(BaseTrace):
         :raises ValueError: When both ``query`` and keyword filters are given, so filters are never silently ignored.
         """
         if self._instance is None:
-            raise AKConfigError("cannot fetch traces: tracing is disabled (set trace.enabled: true)")
+            raise AKConfigError("cannot fetch spans: tracing is disabled (set trace.enabled: true)")
         if query is not None and filters:
             raise ValueError("pass either a TraceQuery or keyword filters, not both")
         return self._instance.fetch(query if query is not None else TraceQuery(**filters))

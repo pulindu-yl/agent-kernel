@@ -577,7 +577,7 @@ The batch span processor normally exports in the background, but Lambda freezes 
 2. Go to **Application Signals → Transaction Search** and filter spans by `session.id` or by service `AgentKernel`. Open a trace to see the run span with its agent, LLM, and tool spans nested under it.
 3. Optionally, check **GenAI Observability**. Agent Kernel sets the `aws.service.type=gen_ai_agent` resource attribute and `session.id` that the AWS Distro for OpenTelemetry sets, but AWS does not document whether its agent and session views list agents that export without the distro, so treat Transaction Search as the supported view.
 
-## Fetching Traces Back
+## Fetching Spans Back
 
 Traces stay in your provider's cloud, but you can read them back into Python (for example, to run evaluations
 over recent tool calls) with `Trace.fetch()`. It takes one provider-neutral filter and translates it into
