@@ -1,7 +1,7 @@
 # #803: Agent evaluation on production traffic — Implementation Spec
 
 This spec details how to build the three phases [design.md](design.md) requires: Phase 1 (fetch) in Agent
-Kernel core, and Phases 2 (evaluate) and 3 (store) in the `aws-serverless/langfuse-trace-evaluation`
+Kernel core, and Phases 2 (evaluate) and 3 (store) in the `aws-serverless/openai-langfuse-trace-evaluation`
 example.
 
 **Phase 1** adds a `fetch(query)` method to `BaseTrace` and a `Trace.fetch(...)` facade.
@@ -748,7 +748,7 @@ against each provider after a real agent run, and tick off `research/provider-re
 ## Phases 2–3 design (example)
 
 Phases 2 and 3 add no Agent Kernel core code. Everything below lives in
-`examples/aws-serverless/langfuse-trace-evaluation/` and uses only public AK API: `Trace.get().fetch(...)`,
+`examples/aws-serverless/openai-langfuse-trace-evaluation/` and uses only public AK API: `Trace.get().fetch(...)`,
 `FetchedSpan`, `SpanKind`, `SpanUsage`, `OTelSpanClassifier`, `AKEvaluator`, `AKEvaluationCase`,
 `AKEvaluationResult`, `AKMetricNotSupported`, `AKTestConfig`, `Lambda`, `ServerlessAgentRunner` and
 `ResponseHandler`.
@@ -763,7 +763,7 @@ response handler stores each reply. Nothing runs on a schedule.
 ### Example layout
 
 ```
-examples/aws-serverless/langfuse-trace-evaluation/
+examples/aws-serverless/openai-langfuse-trace-evaluation/
 ├── README.md
 ├── pyproject.toml           # runtime dependencies; dev group
 ├── uv.lock
@@ -847,7 +847,7 @@ handler = ResponseHandler.handle
 - `config.yaml` (shared by the three Lambdas): `trace: {enabled: true, type: langfuse}`, and the queue-mode
   blocks of the `openai` / `scalable-openai` siblings: `execution.mode: rest_sync`, `execution.queues.type:
   sqs` (URLs injected per Lambda), and Redis `session` and `execution.response_store` on the base
-  deployment's Redis cluster, with their own `ak:lf-trace-eval:` prefixes.
+  deployment's Redis cluster, with their own `ak:openai-langfuse:` prefixes.
 - `get_order_status` knows `A-1001` (shipped, arriving Friday) and returns `"Order <id> not found"` for any
   other id, so the traffic includes one tool result the agent must report honestly.
 - The Langfuse runners flush on Lambda themselves (Phase 1), so the agent runner needs no tracing code.
@@ -1227,7 +1227,7 @@ module "serverless_agents" {                       # queue mode, like aws-server
   is_production        = var.is_production
   vpc_id               = var.vpc_id
   private_subnet_ids   = var.private_subnet_ids
-  product_display_name = "AK Langfuse Trace Evaluation Example"
+  product_display_name = "AK OpenAI Langfuse Trace Evaluation Serverless Example"
   queue_mode           = true
   execution_mode       = "rest_sync"
   create_redis_cluster        = false              # the base deployment's Redis (config.yaml)
@@ -1345,7 +1345,7 @@ resource "aws_lambda_function_event_invoke_config" "grading" {
   `run_single_test.py` `test_aws_deployment` reads), `results_table_name`.
 - `providers.tf`: the siblings' file. No `backend.tf`: like the siblings, the pipeline injects it and
   `.gitignore` excludes it.
-- `terraform.tfvars`: `region = "ap-southeast-2"`, `prefix = "ak-lf-trace-eval-dev-examples"`.
+- `terraform.tfvars`: `region = "ap-southeast-2"`, `prefix = "ak-oai-lf-eval-dev-examples"`.
 - Packaging: the request handler (292 MB of dependencies with Opik) and the agent runner (OpenAI Agents
   SDK) are container images, being over Lambda's 250 MB unzipped zip limit; the response handler (51 MB)
   is a `LocalZip`, as in `schedule-openai`.
@@ -1386,7 +1386,7 @@ dev = ["agentkernel[test]>=0.9.4", "httpx>=0.27.0", "moto[dynamodb]>=5.0.0", "bl
 
 - **AK core:** none (rule 1).
 - **`.github/integration-test-config.yaml`:** a new weekly entry under `# AWS Serverless`:
-  `type: aws-serverless`, `path: examples/aws-serverless/langfuse-trace-evaluation`, `deploy_dir: deploy`.
+  `type: aws-serverless`, `path: examples/aws-serverless/openai-langfuse-trace-evaluation`, `deploy_dir: deploy`.
 - **`.github/workflows/integration-test-weekly.yaml`, job `run-tests`, Deploy and Destroy:** the example's
   path joins `scalable-openai` and `schedule-openai` in the condition that passes the base deployment's
   agent runner and response handler security groups.
@@ -1555,7 +1555,7 @@ class EvaluationClient:                      # test helper, like APITestClient i
 **Run:**
 
 ```bash
-cd examples/aws-serverless/langfuse-trace-evaluation
+cd examples/aws-serverless/openai-langfuse-trace-evaluation
 ./build.sh local && uv run pytest tests/                    # unit tests
 cd deploy && ./deploy.sh local && cd ..
 uv run python simulate_traffic.py                          # 3 questions; prints the session id

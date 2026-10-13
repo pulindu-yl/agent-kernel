@@ -17,7 +17,7 @@ graded. The weekly integration test drives the whole loop over HTTP.
 | 3. Store | `EvaluationStore` over one DynamoDB table | example `evaluator/` |
 | 2–3 runtime | one AK serverless deployment in queue mode (request handler: `/chat`, `/eval`, `/check`; agent runner; response handler), the DynamoDB table, its IAM policy | example `lambda_*.py`, `deploy/main.tf` |
 
-The example is `examples/aws-serverless/langfuse-trace-evaluation/`.
+The example is `examples/aws-serverless/openai-langfuse-trace-evaluation/`.
 
 ## Terminology
 
@@ -513,7 +513,7 @@ graph LR
 
 ### Example layout
 
-- `examples/aws-serverless/langfuse-trace-evaluation/`, with one deployable in `deploy/main.tf` and one
+- `examples/aws-serverless/openai-langfuse-trace-evaluation/`, with one deployable in `deploy/main.tf` and one
   script, `simulate_traffic.py` (§Simulated traffic):
   - **One AK serverless deployment in queue mode** (`config.yaml` with `trace.enabled: true` and
     `trace.type: langfuse`), three Lambdas behind one API Gateway:

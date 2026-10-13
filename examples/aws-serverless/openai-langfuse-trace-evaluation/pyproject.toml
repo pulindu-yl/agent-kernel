@@ -1,5 +1,5 @@
 [project]
-name = "aws-serverless-langfuse-trace-evaluation"
+name = "aws-serverless-openai-langfuse-trace-evaluation"
 version = "0.1.0"
 description = "Agent Kernel OpenAI agent on AWS Lambda whose Langfuse traces are graded by Opik judges and stored in DynamoDB"
 readme = "README.md"

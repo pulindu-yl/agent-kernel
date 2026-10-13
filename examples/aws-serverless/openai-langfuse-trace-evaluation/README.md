@@ -1,4 +1,4 @@
-# Grading Production Traces from Langfuse in AWS Serverless (Lambda)
+# Agent Kernel OpenAI Agents with Langfuse Trace Evaluation in AWS Serverless (Lambda)
 
 This example evaluates an agent on its real traffic. An OpenAI Agents SDK agent runs on AWS Lambda in queue
 mode with Langfuse tracing. On request, the request-handler Lambda reads a session's traces back with

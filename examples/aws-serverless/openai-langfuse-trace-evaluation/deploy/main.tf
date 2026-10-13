@@ -11,7 +11,7 @@ module "serverless_agents" {
   is_production        = var.is_production
   vpc_id               = var.vpc_id
   private_subnet_ids   = var.private_subnet_ids
-  product_display_name = "AK Langfuse Trace Evaluation Example"
+  product_display_name = "AK OpenAI Langfuse Trace Evaluation Serverless Example"
 
   queue_mode     = true
   execution_mode = "rest_sync"
@@ -28,7 +28,7 @@ module "serverless_agents" {
 
   request_handler = {
     function_name        = "trace-eval-rqh"
-    function_description = "Agent Kernel Langfuse trace evaluation example: ingress, /eval, /check and grading"
+    function_description = "Agent Kernel OpenAI Langfuse trace evaluation example: ingress, /eval, /check and grading"
     handler_path         = "lambda_request_handler.handler"
     package_path         = "../dist_request_handler"
     package_type         = "Image"
@@ -49,7 +49,7 @@ module "serverless_agents" {
 
   agent_runner = {
     function_name        = "trace-eval-ar"
-    function_description = "Agent Kernel Langfuse trace evaluation example: agent execution"
+    function_description = "Agent Kernel OpenAI Langfuse trace evaluation example: agent execution"
     handler_path         = "lambda_agent_runner.handler"
     package_path         = "../dist_agent_runner"
     package_type         = "Image"
@@ -65,7 +65,7 @@ module "serverless_agents" {
 
   response_handler = {
     function_name        = "trace-eval-rsh"
-    function_description = "Agent Kernel Langfuse trace evaluation example: response storage"
+    function_description = "Agent Kernel OpenAI Langfuse trace evaluation example: response storage"
     handler_path         = "lambda_response_handler.handler"
     package_type         = "LocalZip"
     package_path         = "../dist_response_handler.zip"

@@ -4,7 +4,7 @@ logging:
 session:
   type: redis
   redis:
-    prefix: "ak:lf-trace-eval:example:"
+    prefix: "ak:openai-langfuse:example:"
     url: "redis://ak-openai-serverless-dev-examples-redis.zinik6.0001.apse2.cache.amazonaws.com:6379"
 execution:
   mode: rest_sync
@@ -22,7 +22,7 @@ execution:
   response_store:
     type: redis
     redis:
-      prefix: "ak:lf-trace-eval:response:"
+      prefix: "ak:openai-langfuse:response:"
       url: "redis://ak-openai-serverless-dev-examples-redis.zinik6.0001.apse2.cache.amazonaws.com:6379"
     retry_count: 6
     delay: 10

@@ -124,7 +124,7 @@ Phase 1 (iterations 1–7) lands first: the example in Phases 2–3 (iterations 
 
 ## Phases 2–3: Evaluate and store (example)
 
-All files are under `examples/aws-serverless/langfuse-trace-evaluation/` unless a path says otherwise.
+All files are under `examples/aws-serverless/openai-langfuse-trace-evaluation/` unless a path says otherwise.
 
 ### Before merge: owner tasks (not code)
 

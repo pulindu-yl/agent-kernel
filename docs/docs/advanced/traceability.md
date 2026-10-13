@@ -683,7 +683,7 @@ class TestMyTraceFetch(TraceFetchContract):
         ...  # write these spans to the backend your tracer reads
 ```
 
-For an end-to-end use of `fetch` and `usage`, see the [`langfuse-trace-evaluation` example](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/aws-serverless/langfuse-trace-evaluation): an agent on
+For an end-to-end use of `fetch` and `usage`, see the [`openai-langfuse-trace-evaluation` example](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/aws-serverless/openai-langfuse-trace-evaluation): an agent on
 AWS Lambda whose Langfuse traces are read back per session, graded by Opik LLM judges and stored in DynamoDB.
 
 ## Integrate with Your Own Traceability Platform

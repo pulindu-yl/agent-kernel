@@ -257,7 +257,7 @@ wheels = [
 ]
 
 [[package]]
-name = "aws-serverless-langfuse-trace-evaluation"
+name = "aws-serverless-openai-langfuse-trace-evaluation"
 version = "0.1.0"
 source = { virtual = "." }
 
