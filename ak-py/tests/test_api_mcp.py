@@ -125,3 +125,71 @@ class TestExecutorReplyShapes:
             result = await MCP.Executor("a").execute("s1", "hi", AsyncMock())
 
         assert result == "hello"
+
+    @pytest.mark.asyncio
+    async def test_a_list_payload_travels_under_result(self):
+        """MCP's `structuredContent` is an object, so an array payload cannot be sent bare.
+
+        fastmcp enforces it: `ToolResult(structured_content=[...])` raises `ValueError`. A2UI on
+        v0.9.1 is a message sequence, so this is a first-class payload shape, not an edge case.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from fastmcp.tools.tool import ToolResult
+
+        from agentkernel.api.mcp.akmcp import MCP
+        from agentkernel.core.model import AgentReplyAny
+
+        content = [{"createSurface": {"surfaceId": "s1"}}, {"updateComponents": {}}]
+        reply = AgentReplyAny(content=content, media_type="application/a2ui+json")
+
+        with patch("agentkernel.api.mcp.akmcp.AgentService") as service_cls:
+            service_cls.return_value.run_multi = AsyncMock(return_value=reply)
+            result = await MCP.Executor("a").execute("s1", "hi", AsyncMock())
+
+        assert isinstance(result, ToolResult)
+        assert result.structured_content == {"result": content}
+        assert result.meta == {"media_type": "application/a2ui+json", "fastmcp": {"wrap_result": True}}
+
+    @pytest.mark.asyncio
+    async def test_a_wrapped_list_reaches_a_client_unwrapped(self):
+        """The wrap is transparent: `fastmcp.wrap_result` is what the client reads to undo it.
+
+        Asserted through a real client rather than on the ToolResult, because the claim is about
+        what the caller receives — without the flag they would have to know about `result`.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from fastmcp import Client, FastMCP
+
+        from agentkernel.api.mcp.akmcp import MCP
+        from agentkernel.core.model import AgentReplyAny
+
+        content = [{"createSurface": {"surfaceId": "s1"}}]
+        reply = AgentReplyAny(content=content, media_type="application/a2ui+json")
+
+        server = FastMCP(MCP_NAME)
+        server.tool(MCP.Executor("a").execute, name="a", description="test agent")
+
+        with patch("agentkernel.api.mcp.akmcp.AgentService") as service_cls:
+            service_cls.return_value.run_multi = AsyncMock(return_value=reply)
+            async with Client(server) as client:
+                result = await client.call_tool("a", {"session_id": "s1", "prompt": "hi"})
+
+        assert result.structured_content == {"result": content}
+        assert result.data == content
+        assert result.meta["media_type"] == "application/a2ui+json"
+
+    @pytest.mark.asyncio
+    async def test_a_non_text_reply_returns_the_string_it_always_did(self):
+        """`run_multi` replaced `AgentService.run`, whose mapping sent every other reply here."""
+        from unittest.mock import AsyncMock, patch
+
+        from agentkernel.api.mcp.akmcp import MCP
+        from agentkernel.core.model import AgentReplyImage
+
+        with patch("agentkernel.api.mcp.akmcp.AgentService") as service_cls:
+            service_cls.return_value.run_multi = AsyncMock(return_value=AgentReplyImage(response="here it is", name="chart.png", image_data="aGk="))
+            result = await MCP.Executor("a").execute("s1", "hi", AsyncMock())
+
+        assert result == "Non-text reply given"

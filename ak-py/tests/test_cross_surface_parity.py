@@ -109,6 +109,33 @@ async def test_mcp_carries_the_same_pair(labelled_reply):
     assert result.meta == {"media_type": MEDIA_TYPE}
 
 
+@pytest.mark.asyncio
+async def test_an_array_payload_is_reshaped_only_by_mcp():
+    """The one place parity cannot hold, and the only place it is allowed not to.
+
+    A2UI on v0.9.1 is a sequence, so a reply may carry an array. Every surface here carries it
+    unchanged except MCP, whose `structuredContent` is an object by specification.
+    """
+    from agentkernel.api.mcp.akmcp import MCP
+    from agentkernel.integration.agui.mapping import AGUIMapper
+
+    content = [{"createSurface": {"surfaceId": "s1"}}, {"updateComponents": {}}]
+    reply = AgentReplyAny(content=content, media_type=MEDIA_TYPE)
+
+    rest = ResponseBuilder.build_response(200, "s1", rest_api_mode=True, result=reply)["result"]
+    stream = json.loads(ResponseBuilder.stream_chunk(StreamChunk(event=DataMessage(message_id="m1", content=content)), "s1"))
+    agui = AGUIMapper.to_agui(DataMessage(message_id="m1", content=content, media_type=MEDIA_TYPE))
+
+    assert rest == stream["event"]["content"] == agui.value == content
+
+    with patch("agentkernel.api.mcp.akmcp.AgentService") as service_cls:
+        service_cls.return_value.run_multi = AsyncMock(return_value=reply)
+        mcp = await MCP.Executor("expenses").execute("s1", "hi", AsyncMock())
+
+    assert mcp.structured_content == {"result": content}
+    assert mcp.meta == {"media_type": MEDIA_TYPE, "fastmcp": {"wrap_result": True}}
+
+
 def test_thread_history_records_the_same_bytes_from_either_path(labelled_reply):
     """The queue runner holds the response body's `result`; the direct handler holds the reply."""
     from agentkernel.integration.thread.recorder import ThreadRecorder

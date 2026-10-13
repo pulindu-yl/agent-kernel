@@ -161,11 +161,16 @@ class TestBypasses:
 
 
 class TestGatesUseTheCodec:
-    """The six call sites exist so one rule serializes every response body.
+    """The five call sites exist so one rule serializes every response body.
 
     Each is a value that bare ``json.dumps`` rejects, proving the gate is not the stdlib call it
     replaced. The copy-drift this prevents is the reason `encode` is on the codec rather than
     written out at each site.
+
+    The thread recorder is the sixth candidate and deliberately stays out: it mirrors
+    ``AgentReplyAny.__str__``'s own ``json.dumps(default=str)`` so the queue path and the direct
+    path hold identical bytes for the same reply, which matters more there than agreeing with the
+    live response.
     """
 
     def test_a_body_that_bare_json_rejects_still_encodes(self):

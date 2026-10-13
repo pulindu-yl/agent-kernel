@@ -91,5 +91,18 @@ fastmcp emits a text block alongside it, so a client reading only text blocks ke
 unlabelled reply — text, image, or structured-but-unlabelled — returns exactly the string it always
 did.
 
+A payload that is a JSON **array** rather than an object is the one case that changes shape. MCP
+requires `structuredContent` to be an object, so the array travels under a `result` key with the
+flag that tells a client to unwrap it again:
+
+```json
+{
+  "structuredContent": {"result": [{"createSurface": {"surfaceId": "s1"}}]},
+  "_meta": {"media_type": "application/a2ui+json", "fastmcp": {"wrap_result": true}}
+}
+```
+
+A fastmcp client hands you the array itself; any other client reads it from `result`.
+
 Note that `_meta` is optional in MCP: a host is free to drop it, in which case the client receives
 the payload without knowing its format.

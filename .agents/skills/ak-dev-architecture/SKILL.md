@@ -143,7 +143,7 @@ Global orchestrator and agent registry:
   3. **Every** event passes through `PostHook.on_stream_event()` (return the event to pass it, a modified event of the same `type` to rewrite it, `None` to drop the whole chunk, or a `list[StreamEvent]` to emit several in its place — a list is emitted as-is and ends the chain for that event). A post-hook raising `StreamHalt` ends the run: `StreamBoundaryTracker` (`core/runtime.py`, not a module of its own, unexported) supplies the closes for any boundary still open, then one `StreamChunk(error=..., done=True)` is yielded and the session is **not** stored; any other exception propagates unchanged
   4. Yields a `StreamChunk(delta=..., event=...)` per event — `delta` is populated only for `TextDelta` (every other event type carries `event` alone) — then a final `StreamChunk(done=True)`
   5. Stores session and clears volatile cache in `finally`, same as `run()`
-- **System hooks**: Automatically includes `InputGuardrailFactory` as system pre-hook, `OutputGuardrailFactory` as system post-hook
+- **System hooks**: Automatically includes `InputGuardrailFactory`, `MultimodalPreHookFactory` and `SandboxPreHookFactory` as system pre-hooks, and `OutputGuardrailFactory` then `A2UIPostHookFactory` as system post-hooks. Both lists are built once per process and cached on the class (`_get_system_pre_hooks` / `_get_system_post_hooks`), so a hook factory reads the config at first use, not at import. Order is load-bearing on the post-hook side: the output guardrail inspects the reply before the A2UI hook can relabel it as a structured payload
 - **Context manager**: `with Runtime(sessions):` sets an isolated runtime as current
 
 ### AgentService (`ak-py/src/agentkernel/core/service.py`)
@@ -272,7 +272,7 @@ Pydantic-based configuration:
 - **Auto-initialized** at import time via `AKConfig._set()`
 - **Config sources** (priority order): environment variables (`AK_` prefix) → config file (YAML/JSON, default `config.yaml`) → defaults
 - **Override path**: Set `AK_CONFIG_PATH_OVERRIDE` env var
-- **Key sections**: `session`, `api`, `websocket_api`, `a2a`, `mcp`, `slack`, `whatsapp`, `messenger`, `instagram`, `telegram`, `teams`, `gmail`, `multimodal`, `thread`, `schedule`, `okf`, `trace`, `guardrail`, `sandbox`, `secret`, `execution`, `logging`. Every messaging block carries an `outbound_adapter` dotted-path override (#524)
+- **Key sections**: `session`, `api`, `websocket_api`, `a2a`, `mcp`, `a2ui`, `slack`, `whatsapp`, `messenger`, `instagram`, `telegram`, `teams`, `gmail`, `multimodal`, `thread`, `schedule`, `okf`, `trace`, `guardrail`, `sandbox`, `secret`, `execution`, `logging`. Every messaging block carries an `outbound_adapter` dotted-path override (#524)
 - **Optional (capability-gating) sections**: `thread`, `schedule` and `okf` are `Optional` — the presence of the block is the enabled-check, so they have no default value
 
 ## Request/Reply Model (`ak-py/src/agentkernel/core/model.py`)
@@ -965,6 +965,11 @@ ak-py/src/agentkernel/
 │   ├── adk/                 # Google ADK adapter
 │   ├── smolagents/          # Smolagents adapter
 │   └── pydanticai/          # Pydantic AI adapter
+├── a2ui/                    # A2UI labelling capability: A2UIPostHook (labels a parsed JSON reply
+│   │                        #   `application/a2ui+json`), NoOpA2UIPostHook, A2UIPostHookFactory.
+│   │                        #   A capability, not an integration — it adds no surface of its own,
+│   │                        #   and it is the only place in src/ that names A2UI
+│   └── hook.py
 ├── api/                     # API layers
 │   ├── handler.py           # REST API handler
 │   ├── http.py              # RESTAPI class (run() delegates to pipeline IOHandler: see activation rule)

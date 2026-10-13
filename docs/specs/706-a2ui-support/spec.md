@@ -7,8 +7,11 @@ the label from two config keys. Requirements come from [`design.md`](design.md) 
 how they are built, not whether. Where the two disagree, `design.md` is authoritative and this file
 is wrong.
 
-Code facts verified against `develop` at `80936df9`; paths are relative to
-`ak-py/src/agentkernel/` unless stated. Protocol facts verified against
+Code facts verified against `develop` at `97fa8d91`, the current merge base — re-pinned from
+`80936df9`, which predated the human-in-the-loop merge (#606). **Line citations resolve against this
+branch**, not against that merge base, so a reviewer reading the PR can follow them; the re-pin
+moved them by 20 to 120 lines in `core/model.py`, `core/chat_service.py`, `core/event.py` and
+`core/config.py`. Paths are relative to `ak-py/src/agentkernel/` unless stated. Protocol facts verified against
 [a2ui.org](https://a2ui.org/) (September 2026): **v0.9.1 is Current, v1.0 is a release candidate**.
 
 **Pluggability note, stated so a reviewer can confirm rather than flag it.** The house rule is ABC +
@@ -66,7 +69,7 @@ instance.
    infinities as `null` **silently** — verified — and `null` is indistinguishable from an omitted
    field, so a client could not tell a divide-by-zero from a deliberate gap (Decision 8).
 3. **Round-trips**: `json.loads(TypeAdapter(Any).dump_json(value))`. The same operation `from_output`
-   already performs on its pydantic branch (`core/model.py:163`), applied to the plain-dict branch so
+   already performs on its pydantic branch (`core/model.py:265`), applied to the plain-dict branch so
    the two converge. Verified: `datetime` → ISO 8601, `Decimal` → quoted string, `UUID`/`bytes` →
    string, `set` → list, `int` key → string key, top-level list passes.
 4. **Re-raises a serializer failure as `ValueError`**, which pydantic wraps into a `ValidationError`
@@ -110,17 +113,17 @@ class AgentReplyAny(BaseModel):
     type: Literal["other"] = "other"
 ```
 
-- **`content` widens from `dict` (`core/model.py:143`) to `dict | list`.** A JSON array is a
+- **`content` widens from `dict` (`core/model.py:238`) to `dict | list`.** A JSON array is a
   legitimate structured reply the type has always excluded, and A2UI forces it: on v0.9.1 a UI is a
   *sequence* of messages (Decision 10).
-- **`from_output` (`core/model.py:151`) is *not* widened** — a bare list stays unstructured there,
+- **`from_output` (`core/model.py:247`) is *not* widened** — a bare list stays unstructured there,
   even though `content` accepts one. An earlier draft of this spec widened it; implementing that
   showed it changes `result` for an agent that never opted in: a list-returning framework produced
   `AgentReplyText(str(["a", "b"]))` → `"['a', 'b']"`, and promoting it to `AgentReplyAny` makes that
   `'["a", "b"]'`. Ungated, so it contradicts Decision 3's guarantee. A caller that means to send an
   array builds the reply itself, which is what piece 5's hook does — the only thing the widening was
   needed for.
-- **`__str__` (`core/model.py:147`) is not edited.** It already calls `json.dumps(self.content,
+- **`__str__` (`core/model.py:243`) is not edited.** It already calls `json.dumps(self.content,
   default=str)`, which serialises a list as readily as a dict. Its *output* changes for content that
   was never JSON-safe — see Behavioural changes.
 - **`media_type` is never set by an adapter.** All six build replies through `from_output`, which
@@ -130,7 +133,7 @@ class AgentReplyAny(BaseModel):
 
 ### `core/event.py` — `DataMessage`
 
-New member of the `StreamEvent` union (`core/event.py:131`), following the existing members' shape:
+New member of the `StreamEvent` union (`core/event.py:220`), following the existing members' shape:
 
 ```python
 class DataMessage(StreamEventBase):
@@ -149,7 +152,7 @@ class DataMessage(StreamEventBase):
   payload. `DataDelta` was rejected: it is not a fragment, and the name would invite streaming
   partial payloads, which Non-goals rules out.
 - **`DataMessage` is exported from `core/__init__.py`** alongside the other members — that module
-  already re-exports `MessageStart`, `TextDelta` and the rest (`core/__init__.py:15-25`), so omitting
+  already re-exports `MessageStart`, `TextDelta` and the rest (`core/__init__.py:16-32`), so omitting
   it would make this the one event type callers cannot import from `agentkernel.core`.
 - **The module docstring's invariant must be amended in the same change**, not left contradicting the
   code. `core/event.py:16-17` currently reads "No field carries a framework-native object. Every
@@ -165,7 +168,7 @@ New top-level package, sibling to `sandbox/`. A capability, not an integration: 
 ```
 a2ui/
 ├── __init__.py     # A2UIPostHook, A2UIPostHookFactory
-└── hooks.py        # both classes
+└── hook.py         # both classes
 ```
 
 ```python
@@ -233,8 +236,8 @@ hook chain must never break the runtime.
 
 ### `core/chat_service.py` — the response builder
 
-One change, in `ResponseBuilder.build_response` (`core/chat_service.py:303`). The current body
-(`:317`) is a single expression; it becomes a branch:
+One change, in `ResponseBuilder.build_response` (`core/chat_service.py:326`). The current body
+(`:354-355`) is a single expression; it becomes a branch:
 
 ```python
 if isinstance(result, AgentReplyAny) and result.media_type:
@@ -254,8 +257,8 @@ else:
 - This one function serves REST, WebSocket, async mode and conversation threads. No per-surface
   change is needed for any of them.
 
-**`ResponseBuilder.stream_chunk` (`core/chat_service.py:338`)** changes `chunk.model_dump(exclude_none=True)`
-(`:346`) to `chunk.model_dump(mode="json", exclude_none=True)`. Today's events are all
+**`ResponseBuilder.stream_chunk` (`core/chat_service.py:384`)** changes `chunk.model_dump(exclude_none=True)`
+(`:397`) to `chunk.model_dump(mode="json", exclude_none=True)`. Today's events are all
 `str`/`int`/`bool`,
 so this is byte-identical for them; without it a `DataMessage` reaches the bare `json.dumps` at
 `:348` in python mode and can raise **mid-stream**, after the client has rendered part of the message.
@@ -277,14 +280,14 @@ to drift. One component, four call sites.
 | `deployment/aws/serverless/core/router/rest_lambda.py:288` | `json.dumps(res_body)` |
 | `deployment/azure/akfunction.py:53` | `json.dumps(res_body)` |
 
-`pipeline/request_handler.py:116` renders the 202 path through `JSONResponse`, which is
+`pipeline/request_handler.py` renders the 202 path through `JSONResponse`, which is
 `json.dumps(..., allow_nan=False)`. Direct REST survives the same payload because FastAPI's
 `jsonable_encoder` copes, so the two paths disagree — the per-surface divergence §2 argues against.
-It changes to the same `PayloadCodec.encode`.
+It changes to the same `PayloadCodec.encode`, wrapped in a plain `Response` (`:122`).
 
 ### `core/util/driver/dynamodb.py` — float ↔ Decimal
 
-`DynamoDBDriver.put` (`:84`) does no float conversion, so boto3 raises `Float types are not supported`
+`DynamoDBDriver.put` (`:137`) does no float conversion, so boto3 raises `Float types are not supported`
 inside the output consumer, burning the retry budget. Any payload carrying a price, a score or a
 coordinate trips it. Piece 1's JSON-safe rule does **not** fix this — JSON-safe means the float stays
 a float.
@@ -314,22 +317,43 @@ whose encoder copes with `Decimal`, but the Lambda poll path does `json.dumps` o
 
 ### `api/mcp/akmcp.py` — MCP
 
-`MCP.Executor.execute` (`:39`) currently calls `service.run(prompt=prompt)`, which stringifies one
+`MCP.Executor.execute` (`:41`) currently calls `service.run(prompt=prompt)`, which stringifies one
 layer lower in `AgentService.run` (`core/service.py:156`). It switches to `run_multi` and branches:
 
 ```python
 reply = await service.run_multi([AgentRequestText(prompt=prompt)])
 await ctx.debug(f"Agent response '{reply}'")
 if isinstance(reply, AgentReplyAny) and reply.media_type:
-    return ToolResult(structured_content=reply.content, meta={"media_type": reply.media_type})
-return str(reply)
+    meta: dict[str, Any] = {"media_type": reply.media_type}
+    if isinstance(reply.content, dict):
+        return ToolResult(structured_content=reply.content, meta=meta)
+    meta["fastmcp"] = {"wrap_result": True}
+    return ToolResult(structured_content={"result": reply.content}, meta=meta)
+if isinstance(reply, AgentReplyText):
+    return reply.response
+if isinstance(reply, AgentReplyAny):
+    return str(reply)
+return "Non-text reply given"
 ```
 
 - The `-> Any` annotation and the `ctx` logging are untouched. Verified against the pinned fastmcp
   (3.4.7): a dict return annotated `-> Any` already produces `structuredContent`, and a `ToolResult`
   carrying `meta` round-trips to a client intact.
+- **An array payload cannot travel bare.** MCP's `structuredContent` is an object by specification,
+  and fastmcp enforces it: `ToolResult(structured_content=[{"a": 1}])` raises
+  `ValueError: structured_content must be a dict or None`. Since Decision 10 makes a v0.9.1 message
+  sequence a first-class payload, the array travels under `result` — fastmcp's own convention for a
+  non-object return (`fastmcp/tools/base.py:367`) — with the `fastmcp.wrap_result` flag a client
+  reads to undo it (`fastmcp/client/mixins/tools.py:433-444`). Verified end to end: the client's
+  `.data` is the array, `structuredContent` is a valid MCP object. This is MCP's constraint rather
+  than an Agent Kernel envelope, so Decision 9 still holds.
 - **Any reply without a media type** — text, image, or structured-but-unlabelled — still produces
-  exactly the string it does today (`:45` returns `response`, which `str()` already yielded).
+  exactly the string it does today. That is why the three-way branch is spelled out here rather than
+  collapsed to `str(reply)`: it reproduces the mapping `AgentService.run` applied (`core/service.py:156`)
+  before this method stopped calling it, and `str(reply)` alone would surface
+  `AgentReplyImage.__str__` where `"Non-text reply given"` used to go. That string is poor, and REST
+  already returns the better one for the same reply — but changing it here is ungated, so image
+  replies over MCP are a **Non-goal** (design.md §9) rather than a side effect of this change.
 - **The key is `media_type` here and `mimeType` on A2A — deliberately, not an oversight.** A2UI
   publishes an A2A binding that names `mimeType`, so A2A uses A2A's word. MCP has no such binding, so
   `_meta` carries Agent Kernel's own name, matching the reply field and the REST response key.
@@ -362,15 +386,15 @@ field`. The five framework adapters are unaffected, verified. Groundwork:
 
 ### `integration/agui/mapping.py` — AG-UI
 
-One `case "data_message"` above the `case _` fallback (`:64`), producing AG-UI's custom event with
+One `case "data_message"` above the `case _` fallback (`:67`), producing AG-UI's custom event with
 `media_type` as the name and `content` as the value. Unmapped types already return `None`, so an
 AG-UI client on an older mapper degrades rather than breaks.
 
 ### `integration/thread/recorder.py` — thread recording
 
-`ThreadRecorder.post_run` (`:59`) stores `str(result)` into `ThreadMessage.content` (`:66`). Through
+`ThreadRecorder.post_run` (`:60`) stores `str(result)` into `ThreadMessage.content` (`:67`). Through
 the queue, `AgentRunner` passes the already-built response body's `result` value
-(`pipeline/agent_runner.py:61`), which for a labelled reply is now a **dict**, and `str()` on a dict
+(`pipeline/agent_runner.py:56`), which for a labelled reply is now a **dict**, and `str()` on a dict
 yields a Python repr — single quotes, `None`, `True`. The direct thread handler stores proper JSON
 for the same reply. So the same agent, in the same thread store, would be recorded one way in
 single-process mode and another through the queue, permanently.
@@ -381,7 +405,7 @@ single-process mode and another through the queue, permanently.
 |---|---|---|
 | `integration/thread/thread_chat.py:136` (direct) | an `AgentReply` **object** | `json.dumps(content)` — already correct |
 | `integration/thread/thread_chat.py:178` (direct, streamed) | a `str` of joined deltas | itself — correct |
-| `pipeline/agent_runner.py:151` (queue) | the response body's `result` **value** — a `dict` once labelled | a Python **repr** — the defect |
+| `pipeline/agent_runner.py:56` (queue) | the response body's `result` **value** — a `dict` once labelled | a Python **repr** — the defect |
 
 So the fix cannot be "always `json.dumps`": that would raise `TypeError` on the direct path's model
 object. The normalisation becomes a method on the recorder — `ThreadRecorder._as_thread_content` —
@@ -394,9 +418,18 @@ def _as_thread_content(result: Any) -> str:
     if isinstance(result, str):
         return result
     if isinstance(result, (dict, list)):
-        return PayloadCodec.encode(result)     # the queue path's labelled reply
-    return str(result)                         # an AgentReply — its __str__ is already json.dumps
+        return json.dumps(result, default=str)  # the queue path's labelled reply
+    return str(result)                          # an AgentReply — its __str__ is already json.dumps
 ```
+
+**The dict branch is the one gate site that deliberately does not use `PayloadCodec.encode`.** It
+mirrors `AgentReplyAny.__str__`'s own call instead, `default=str` included, because the two thread
+paths must agree with each other before they agree with anything else: the direct handler stores
+`str(reply)` and the queue runner stores this, for the same reply. For JSON-safe content the codec
+and `default=str` produce identical bytes, so the choice only shows on a value that reached
+`content` through one of the documented bypasses — there, thread history holds `str()`'s form while
+the live reply carries ISO 8601. That divergence is accepted; two encodings of the same reply inside
+one store is not. **Five gate sites use `PayloadCodec.encode`, not six.**
 
 `ThreadMessage.content` stays `str` (`integration/thread/model.py:33`) — **labelling stored history
 is a Non-goal**; this fixes the encoding only.
@@ -409,13 +442,13 @@ is a Non-goal**; this fixes the encoding only.
 | `core/service.py:144` `AgentService.run` | **None.** Still returns `str`. MCP moves to `run_multi`; A2A and the CLI keep `run`. |
 | `pipeline/ws/base.py` | **None.** `send(..., message: dict)` passes the response dict through as a JSON frame, so WebSocket gets the object form free. |
 | Redis / Valkey response stores | **None, verified.** They re-serialise a body that is already JSON-native. |
-| `pipeline/response_handler.py:192` | **None — deliberately.** The messaging integrations receive a Python repr for a labelled reply; they are text surfaces with no A2UI renderer, and pointing a labelled agent at one is the application's choice. Non-goal, recorded with the consequence spelled out. |
+| `pipeline/response_handler.py:68` | **None — deliberately.** The messaging integrations receive a Python repr for a labelled reply; they are text surfaces with no A2UI renderer, and pointing a labelled agent at one is the application's choice. Non-goal, recorded with the consequence spelled out. |
 | Existing test fixtures and example clients | **None.** All unlabelled. |
 
 ### Config changes
 
-One new block. **`_A2UIConfig`**, placed beside `_SandboxConfig` (`core/config.py:786`) and registered
-on `AKConfig` beside `sandbox` (`core/config.py:919`):
+One new block. **`_A2UIConfig`**, placed beside `_SandboxConfig` (`core/config.py:889`) and registered
+on `AKConfig` beside `sandbox` (`core/config.py:1053`):
 
 ```python
 class _A2UIConfig(BaseModel):
@@ -468,10 +501,11 @@ Numbered, exhaustive. Every one is intentional.
 2. **`result` becomes `str | dict | list`.** A client must read `media_type` to know which it has.
    *Justification:* Decision 3 plus Decision 10 — the third shape is A2UI v0.9.1's message sequence.
 3. **`str(AgentReplyAny(...))` changes output for content that was never JSON-safe.** A `datetime`
-   becomes ISO 8601 rather than `str()`'s space-separated form; a `Decimal` becomes a JSON number
-   rather than a quoted string; a `set` becomes a list. *Justification:* the four encoders converge
-   on one form (Piece 1). **This is the only behavioural change that is not gated on a media type**,
-   and the only changelog line the design requires.
+   becomes ISO 8601 rather than `str()`'s space-separated form; a `set` becomes a list; UTF-8
+   `bytes` become their string; a non-string key becomes a string. A `Decimal` is **not** in the
+   list — normalisation renders it as the same quoted string `default=str` did. *Justification:*
+   the four encoders converge on one form (Piece 1). **This is the only behavioural change that is
+   not gated on a media type**, and the only changelog line the design requires.
 4. **`AgentReplyAny(content=...)` now raises `ValidationError` for an unserialisable object**, where
    it previously accepted it and `default=str` shipped `"<Row object at 0x…>"` to a client as data.
    *Justification:* raising at construction beats shipping a repr as data.
@@ -496,11 +530,20 @@ Numbered, exhaustive. Every one is intentional.
 **Non-changes — fixed on purpose:**
 
 - `__str__`'s *code*, the `AgentReply` union, and every framework adapter.
+- What MCP returns for an image reply. Still `"Non-text reply given"`, still without `image_data`,
+  and still different from the string REST returns for the same reply. A Non-goal, not a guarantee
+  worth keeping — see design.md §9.
+- `AgentPausedReplyAny` (#606). It redeclares `content: dict` (`core/model.py:290`) and builds the
+  value in a `model_validator(mode="after")`, so it bypasses `JSONPayload` on both counts — the
+  bypass Decision 4 names. Accepted rather than fixed: its content is derived from strings and
+  `interruption.model_dump(mode="json")`, so it is JSON-safe by construction and the annotation
+  would have nothing to do. Applying it would mean an explicit `PayloadCodec.normalise` call inside
+  the validator, since assignment there skips validation anyway.
 - `AgentService.run`'s signature and return type (`str`).
 - `ThreadMessage.content`'s type (`str`) and the thread read routes.
 - `pipeline/response_handler.py`'s messaging path.
 - The response dict for any reply without a `media_type` — byte for byte, including the
-  deferred-schedule 202 acknowledgement (`core/chat_service.py:496` builds an `AgentReplyAny` with no
+  deferred-schedule 202 acknowledgement (`core/chat_service.py:551` builds an `AgentReplyAny` with no
   media type).
 - Every `result` example in the published docs (six files) and every `["result"]` read in the example
   test suites (seven, across four files) — all text or unlabelled.
@@ -562,11 +605,14 @@ Run with `cd ak-py && uv run pytest`.
 - `enabled: false` and an absent block both yield `NoOpA2UIPostHook`.
 - A factory whose config read raises degrades to the no-op rather than failing the run.
 - **End-to-end, once:** config on, an agent returning an A2UI document, `result` arrives as an
-  object with `media_type` set — with **no application post-hook anywhere in the test**.
+  object with `media_type` set — with **no application post-hook anywhere in the test**. The
+  `Runtime.run` half of that claim lives in `tests/test_runtime.py`, which is where the registration
+  can actually be exercised; this file builds the hook directly.
 
 **`tests/test_cross_surface_parity.py`** — one labelled structured reply asserted to arrive with the
-same content and the same label on REST, WebSocket, MCP and AG-UI. A2A joins when the port issue
-adds the data part. Nothing like it exists today; it is what makes §3's claim checkable and what
+same content and the same label on REST, WebSocket, MCP and AG-UI, plus an **array** payload
+asserted to reach every surface unchanged except MCP, which is the one carrier that cannot hold it
+bare. A2A joins when the port issue adds the data part. Nothing like it exists today; it is what makes §3's claim checkable and what
 catches a future surface regressing to an early encode. **The fixture must carry a `datetime` and a
 `Decimal`** — parity on a payload that was never at risk proves nothing.
 
@@ -574,17 +620,18 @@ catches a future surface regressing to an early encode. **The fixture must carry
 
 | File | Change |
 |---|---|
-| `tests/test_model.py` | `media_type` defaults to `None` and round-trips; `content` accepts a list; `__str__` parameterised — byte-identical for JSON-safe content, and the pinned new output for `datetime`/`Decimal`/`set`, and **raises** for `NaN`. |
+| `tests/test_model.py` | `media_type` defaults to `None` and round-trips; `content` accepts a list; `__str__` parameterised — byte-identical for JSON-safe content and for a `Decimal`, the pinned new output for `datetime`, `set` and a non-string key, and **raises** for `NaN`. |
 | `tests/test_chat_service_core.py` | `build_response` matrix: labelled → dict + `media_type`; unlabelled structured, text, image and the non-reply fallback → unchanged strings. Plus the regression test for the gap Copilot found: build a response for a reply whose content carried a `datetime`, then assert `json.dumps(response_body)` succeeds — reproducing `agent_runner._send_to_output`'s exact call. |
-| `tests/test_api_http.py:412` | `TestResponseBuilderStructuredResult.test_structured_result_serialized_as_json_string` pins `response["result"] == json.dumps(content)` today. It becomes a matrix — **that exact assertion must keep passing** for the unlabelled case, with a labelled sibling asserting the dict. This is the back-compat guarantee, tested directly. |
+| `tests/test_api_http.py:400` | `TestResponseBuilderStructuredResult.test_structured_result_serialized_as_json_string` pins `response["result"] == json.dumps(content)` today. It becomes a matrix — **that exact assertion must keep passing** for the unlabelled case, with a labelled sibling asserting the dict. This is the back-compat guarantee, tested directly. |
 | `tests/test_chat_service_streaming.py` | A `DataMessage` chunk serialises; `stream_chunk` in JSON mode is byte-identical for existing event types. |
 | `tests/test_stream_events.py` | `DataMessage` round-trips through the discriminated union on `type`. |
 | `tests/test_agui_mapping.py` | `data_message` → AG-UI custom event; an unknown type still returns `None`. |
-| `tests/test_pipeline_agent_runner.py` | A labelled reply reaches the output queue (the bare `json.dumps` no longer raises), and thread recording stores valid JSON, not a Python repr. |
-| `tests/test_thread_runner.py` | The queue path and the direct path record the **same bytes** for the same labelled reply. |
+| `tests/test_pipeline_agent_runner.py` | A labelled reply reaches the output queue carrying a `datetime` and a `Decimal` (the bare `json.dumps` no longer raises), and so does an array payload. The thread half of the same path lives in `tests/test_thread_pipeline_recording.py`, beside the thread-manager fixtures it needs: a labelled reply is recorded as JSON, not a Python repr. |
+| `tests/test_thread_integration.py` | The queue path and the direct path record the **same bytes** for the same labelled reply. (Planned for `test_thread_runner.py`; it belongs with the other `_as_thread_content` cases.) |
 | `tests/test_shared_drivers.py` — plus `DynamoDecimalCodec` round-trip cases of its own | A payload carrying a float is stored without raising **and reads back as a `float`, not a `Decimal`** — asserted by a `json.dumps` on the polled record, which is what `rest_lambda.py:288` does and what would fail if only the write side were fixed. |
-| `tests/test_api_mcp.py` | A labelled reply produces `structuredContent` plus `_meta`; an unlabelled one produces today's string. |
+| `tests/test_api_mcp.py` | A labelled reply produces `structuredContent` plus `_meta`; an **array** payload produces `{"result": [...]}` with the `fastmcp.wrap_result` flag, asserted both on the `ToolResult` and through a real client whose `.data` is the array again; an unlabelled structured reply, a text reply and an image reply each produce today's string. |
 | `tests/test_config.py` | The `a2ui` block loads, defaults to disabled, and accepts `AK_A2UI__*`. |
+| `tests/test_runtime.py` | The capability through `Runtime.run`, which is where the registration in `_get_system_post_hooks` is the thing under test: a JSON reply arrives labelled with no application hook anywhere, prose and an out-of-scope agent are left alone, `enabled: false` changes nothing, and the output guardrail receives the reply **before** the label is applied. |
 
 **Riskiest consumer.** `pipeline/agent_runner.py` changes shape the most for a labelled reply — it
 feeds the output queue *and* thread recording from the same value. `tests/test_pipeline_agent_runner.py`

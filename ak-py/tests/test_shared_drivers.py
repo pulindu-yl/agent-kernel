@@ -334,6 +334,39 @@ class TestDynamoDBDriver:
         assert driver._table.query.call_count == 2
         assert driver._table.query.call_args.kwargs["ExclusiveStartKey"] == {"pk": "p", "sk": "b"}
 
+    def test_a_payload_carrying_a_float_survives_the_round_trip(self):
+        """The driver's own use of the codec, not the codec in isolation.
+
+        boto3 refuses a float on the way in and returns a Decimal on the way out, and a Decimal is
+        no more serialisable than a float was storable — so a consumer doing ``json.dumps`` on a
+        polled record (``rest_lambda.py:288``) fails unless both halves are wired up here.
+        """
+        driver = self._driver()
+        body = {"pk": "p", "sk": "s", "body": {"result": {"score": 0.5, "count": 3}}}
+
+        driver.put(body)
+
+        stored = driver._table.put_item.call_args.kwargs["Item"]["body"]["result"]
+        assert stored == {"score": decimal.Decimal("0.5"), "count": 3}
+
+        driver._table.get_item.return_value = {"Item": {"pk": "p", "sk": "s", "body": {"result": stored}}}
+        read = driver.get("p", "s")["body"]["result"]
+
+        assert read == {"score": 0.5, "count": 3}
+        assert isinstance(read["score"], float)
+        assert isinstance(read["count"], int)
+        assert json.dumps(read)
+
+    def test_query_items_converts_on_the_way_out_too(self):
+        """The paginating read path is a separate call site; a refactor can drop it on its own."""
+        driver = self._driver()
+        driver._table.query.return_value = {"Items": [{"sk": "a", "score": decimal.Decimal("0.5")}]}
+
+        items = driver.query_items("p")
+
+        assert items == [{"sk": "a", "score": 0.5}]
+        assert json.dumps(items)
+
     def test_sort_key_less_mode(self):
         driver = self._driver(sort_key=None)
         driver._table.get_item.return_value = {"Item": {"pk": "p", "body": "b"}}

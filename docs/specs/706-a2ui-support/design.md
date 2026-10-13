@@ -185,7 +185,7 @@ is the application's job, not the framework's.
 | Conversation threads | **the live reply, yes** | same function — but stored history is not labelled; see Non-goals |
 | Streaming / AG-UI | **yes, with your own hook** | needs the new stream event; the config block does not reach a streamed run, and a labelling stream hook gives up incremental delivery — see piece 3 |
 | A2A | **not yet** | untouched here; it does not import today, and both that fix and carrying A2UI over it go with the 1.x port — see piece 4 |
-| MCP | **yes** | three-line fix; carries the label in `_meta`, verified — see piece 4 |
+| MCP | **yes** | small fix; carries the label in `_meta`, verified — an array payload is reshaped because MCP requires an object, see piece 4 |
 
 A2A, MCP and the CLI lose structure one layer lower than the rest, in `AgentService.run`. Piece 4
 makes that change for MCP. A2A needs the same one and does not get it here — it does not import
@@ -443,8 +443,11 @@ plain REST with no UI framework involved.
   `str | dict | list`, one shape more than Decision 3 originally weighed. Accepted because the
   alternative is an Agent Kernel envelope around the list, which is the same wrapper this design
   rejects for MCP: it would change the payload a client receives.
-  - `from_output`'s `isinstance(value, dict)` branch gains `list`; a pydantic model still dumps to a
-    dict, so that half is untouched. `__str__` is already `json.dumps`, which serialises either.
+  - `from_output` is **not** widened. A framework returning a bare list has always produced a text
+    reply, and promoting it would change `result` for an agent that never opted in — ungated, which
+    contradicts Decision 3's guarantee. A caller that means to send an array builds the reply
+    itself. A pydantic model still dumps to a dict, so that half is untouched either way, and
+    `__str__` is already `json.dumps`, which serialises both shapes.
 
 **`content` becomes JSON-safe by construction.** Once `result` can carry the object rather than a
 string, *something* has to guarantee that object can be serialised — and today nothing does. This
@@ -534,7 +537,7 @@ Non-goals with the reasoning.
 **Breaks silently — the dangerous one:**
 
 - `pipeline/agent_runner.py:61` passes the response body into thread recording, which stores
-  `str(result)` into `ThreadMessage.content` (`integration/thread/recorder.py:66`). The **direct**
+  `str(result)` into `ThreadMessage.content` (`integration/thread/recorder.py:67`). The **direct**
   thread handler stores proper JSON for the same reply. So the same agent, in the same thread store,
   is recorded one way in single-process mode and another way through the queue — **permanently**,
   and served back that way by the thread read routes. This is the hardest consequence to notice in
@@ -550,7 +553,7 @@ Non-goals with the reasoning.
   encoder. The ECS and Lambda twins need the same treatment
   (`deployment/aws/.../akagentrunner.py` → `pipeline/transport/sqs.py:52-67`,
   `deployment/aws/serverless/core/router/rest_lambda.py:288`, `deployment/azure/akfunction.py:53`).
-- **The DynamoDB response store rejects floats outright.** `core/util/driver/dynamodb.py:84` does no
+- **The DynamoDB response store rejects floats outright.** `core/util/driver/dynamodb.py:137` does no
   float-to-`Decimal` conversion, so boto3 raises `Float types are not supported` — inside the output
   consumer, burning the retry budget. Any payload carrying a price, a score or a coordinate trips
   it. Note piece 1's JSON-safe rule does **not** fix this: JSON-safe means the float stays a float.
@@ -561,7 +564,7 @@ Non-goals with the reasoning.
   (`pipeline/request_handler.py:117`), whose encoder copes, but the Lambda poll path does
   `json.dumps` on the polled record (`deployment/aws/serverless/core/router/rest_lambda.py:288`) and
   raises `TypeError` on a `Decimal` — the same class of break as the write side, one step later.
-- `pipeline/request_handler.py:116` renders the 202 path through `JSONResponse`, a bare `json.dumps`
+- `pipeline/request_handler.py:122` renders the 202 path through `JSONResponse`, a bare `json.dumps`
   with `allow_nan=False`. Direct REST survives the same payload because FastAPI's `jsonable_encoder`
   copes — so the two paths disagree, which is exactly the per-surface divergence §2 argues against.
 
@@ -761,11 +764,22 @@ real `FastMCP` instance and calling them through its in-memory client:
 | a JSON **string** — today's behaviour | **absent** |
 | a **dict**, annotated `-> Any` — the executor's current annotation | **the dict** |
 | a **dict**, annotated `-> dict` | the dict |
+| a **list** | **`ValueError`** — see below |
 
 Two things follow. The `-> Any` annotation is not an obstacle, so no signature change is needed. And
 fastmcp emits a `TextContent` block **alongside** the structured content in every case, so a client
 reading only text blocks keeps working — MCP carries both by protocol, which is why the duplication
 argument from §2 does not apply here.
+
+**An array payload is the one shape MCP cannot carry as it stands**, and that is the protocol's
+rule rather than a choice open to us: `structuredContent` is an object by specification, and fastmcp
+enforces it (`ValueError: structured_content must be a dict or None`). Decision 10 makes a v0.9.1
+message sequence a first-class payload, so this is reachable rather than theoretical. The array
+travels under `result` — fastmcp's own convention for a non-object return — with the
+`fastmcp.wrap_result` flag that a fastmcp client reads to undo it, so the caller still receives the
+array. That is not the envelope rejected above: the envelope would have relabelled every payload to
+suit us, where this reshapes the one payload MCP refuses, in MCP's own vocabulary, and hands back
+the original.
 
 - The renderer caveat stands: an MCP caller is a *model*, so this only becomes **useful** once a host
   app renders A2UI. It is included anyway because the inconsistency — one surface preserving
@@ -980,13 +994,22 @@ nothing else in the framework knows the format exists.
   `gmail/adapter.py:443`). So the output is malformed rather than merely unrendered, and nothing
   logs an error. Accepted deliberately: these integrations are for text, and an unlabelled reply —
   every reply they carry today — is unaffected.
+- **Image replies over MCP.** The executor's non-labelled branch reproduces the three-way mapping
+  `AgentService.run` applied before it switched to `run_multi` (piece 4), so an `AgentReplyImage`
+  still returns `"Non-text reply given"` and its `image_data` still reaches no client. Collapsing
+  that branch to `str(reply)` would have surfaced `AgentReplyImage.__str__` instead — the same
+  string REST already returns — and was rejected here only because it is an ungated change on a
+  surface this design promises is byte-identical without one. Worth doing, and bigger than the
+  string: MCP has an `ImageContent` block, so an image reply should travel as an image rather than
+  as prose describing one, and the two surfaces should stop disagreeing about the prose meanwhile.
+  Its own issue.
 - **Anything to do with A2A**, including fixing its broken import. The pin, the lockfile, A2A's
   first tests, the 1.x migration, the data part, its media-type label and the agent-card extension
   declaration all go to the `a2a-sdk` port issue (Decision 6). The groundwork is in
   [`research/a2a-datapart.md`](research/a2a-datapart.md).
 - **Replaying a labelled payload out of thread history.** `ThreadMessage.content` is a `str`
   (`integration/thread/model.py:33`) and `ThreadRecorder.post_run` records `str(result)`
-  (`integration/thread/recorder.py:66`), so the label is dropped on the way into the store. The live
+  (`integration/thread/recorder.py:67`), so the label is dropped on the way into the store. The live
   reply carries its media type; a conversation reloaded from history does not, and a client cannot
   tell an A2UI card from any other JSON. Piece 2 fixes the *encoding* on that path — the queue's
   Python repr — but not the label. A follow-up needs a `media_type` on `ThreadMessage`, a recorder
@@ -1011,7 +1034,7 @@ nothing else in the framework knows the format exists.
 | 6 | **Touch nothing about A2A — the pin, the lockfile, the tests and carrying A2UI over it all belong to the `a2a-sdk` 1.x port issue.** | An earlier draft capped the pin here to restore the import, justified as giving the port characterisation tests to migrate from. That argument does not survive its own evidence: **1.x replaces the pydantic types with protobuf**, so every assertion such a test could make is rewritten at the port anyway. What remained was a backwards relock (1.1.2 → 0.3.x) followed within days by a forwards one, and `pyproject.toml` churn in a payload-carriage PR. **Cost:** #706 ships without A2UI over A2A — A2UI's own canonical wrapping — and A2A stays broken until the port. Accepted: it has been broken since a2a-sdk 1.0 shipped, nothing here broke it, and the fix lands once instead of twice. |
 | 7 | **The payload layer #706 specified is built, minus the catalog.** An `a2ui` config block (`enabled`, `agents`) and a framework post-hook that labels A2UI payloads — yes. Catalog prompt injection, a bundled catalog, validation rules, an `a2ui` extra and an SDK dependency — no. | The split is drawn at one question: **is this the same for every application?** The media type is a protocol convention (Decision 11) and the detection rule is the operator's own declaration, so labelling is shared work and belongs in the framework — making an application write fifteen lines for it was the wrong call. A catalog is the opposite: it must match the components a given frontend implements, so any catalog Agent Kernel shipped would be wrong for somebody, and worse than wrong, because the model would confidently emit components that render as nothing. **Cost:** the framework owns a little A2UI knowledge and the config-driven path serves the prompt route only — on the `output_type` union the discriminator is the application's, so the application still writes the hook (§5). **Gain:** A2UI works from two config keys, and any other format still works through the same post-hook extension point with no framework change. |
 | 8 | **`NaN` and the infinities raise at construction rather than coercing to `null`.** | The one place this design prefers a loud failure. `null` is indistinguishable from an omitted field, so a client cannot tell a divide-by-zero from a value the agent chose not to send. A `NaN` almost always means a defect upstream, and raising puts the error next to the code that produced it. Cost: a reply that would previously have shipped a plausible-looking gap now fails at construction — accepted because it fails in the application's own code, not in the pipeline. |
-| 9 | **MCP carries the media type in `_meta`, and we assume a host reads it.** | `_meta` is optional in MCP, so a host may drop it and leave the client with a payload it cannot identify. Accepted: it is the protocol's own slot, it round-trips against the pinned fastmcp (3.4.7), and the alternative — an Agent Kernel envelope — changes the shape the client receives. A host that ignores `_meta` is a host integration problem, not a reason to invent a wrapper. |
+| 9 | **MCP carries the media type in `_meta`, and we assume a host reads it.** | `_meta` is optional in MCP, so a host may drop it and leave the client with a payload it cannot identify. Accepted: it is the protocol's own slot, it round-trips against the pinned fastmcp (3.4.7), and the alternative — an Agent Kernel envelope — changes the shape the client receives. A host that ignores `_meta` is a host integration problem, not a reason to invent a wrapper. An **array** payload is the one exception, reshaped under `result` with fastmcp's `wrap_result` flag because MCP's `structuredContent` is an object by specification. |
 | 10 | **Carry A2UI version-agnostically: whatever parses, one message or a list of them.** | v0.9.1 is Current but needs a *sequence* to build a UI; v1.0 can do it in one `createSurface` but is a release candidate its own page tells you not to ship. The detection rule sidesteps the choice entirely by not reading message names at all, so neither version is privileged and nothing here needs revising when 1.0 lands. Cost: `content` widens to `dict | list` (piece 1) and `result` gains a third shape, and Agent Kernel carries a sequence it cannot verify is coherent — which it could not do anyway, since whether a surface exists is client state. |
 | 11 | **Use `application/a2ui+json`, although v0.9.1 defines no media type.** | The string comes from the v1.0 release candidate ("standardizing on the `application/a2ui+json` MIME type"), so on the current protocol version this is a convention Agent Kernel adopts rather than one the spec mandates — which weakens Decision 7's "the media type is a protocol constant" argument, and that is worth saying out loud rather than hiding. Taken because it is the RFC-correct suffix form and the protocol's own stated direction. One constant to change if that becomes the wrong bet. A2UI's **v0.8 A2A binding** says `application/json+a2ui` instead; reconciling the two is the port issue's problem, since it owns A2A. |
 This answers "can an Agent Kernel agent serve A2UI to a client" with yes, and "does Agent Kernel

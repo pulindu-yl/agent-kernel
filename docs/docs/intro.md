@@ -8,6 +8,8 @@ slug: /
 **The Operating System for Scalable & Compliant Enterprise AI Agents.**
 
 :::tip What's New
+🎨 **A2UI** - Turn two config keys on and an agent's JSON reply reaches the client as an [A2UI](https://a2ui.org/) document: `result` carries the object and `media_type` names the format, over REST, MCP and AG-UI alike. [Learn more →](./advanced/a2ui.md)
+
 🙋 **Human in the Loop** - Let a run pause for a person's approval or answer, and resume from their decision minutes or hours later, on any replica. Works on OpenAI, LangGraph, Pydantic AI and Google ADK, over REST, streaming and AG-UI. [Learn more →](./advanced/human-in-the-loop.md)
 
 🎙️ **LiveKit Voice Integration** - Connect OpenAI Agents SDK and Google ADK agents to LiveKit WebRTC rooms through the realtime execution pipeline. [Learn more →](./integrations/livekit.md)
@@ -91,6 +93,7 @@ Agent Kernel provides pre-built execution capabilities:
 - **MCP Server** for Model Context Protocol tool publishing
 - **A2A Server** for Agent-to-Agent communication
 - **AG-UI Server** for streaming any agent (text, tool calls, reasoning, shared state) to an AG-UI-compliant frontend
+- **A2UI labelling** so a generative-UI document reaches the client as an object with its format named, not a JSON string to parse twice
 
 ### Multi-Cloud Architecture
 

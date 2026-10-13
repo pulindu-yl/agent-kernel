@@ -27,8 +27,9 @@ Per iteration: `cd ak-py && uv run pytest tests/<file>` for the named test, then
   1. Write `core/util/payload.py`: the **`PayloadCodec`** class — `normalise` (shape check, then the
      non-finite walk, then the round trip) and `encode` (used by iteration 3's gates) — plus the
      `JSONPayload` annotated type built from `normalise`. Spec § *`core/util/payload.py`*.
-  2. `AgentReplyAny`: `content: JSONPayload`, add `media_type: str | None = None`. Widen
-     `from_output`'s second branch to accept `list`. Do **not** touch `__str__`.
+  2. `AgentReplyAny`: `content: JSONPayload`, add `media_type: str | None = None`. Leave
+     `from_output` alone — `content` accepts a list, but promoting a bare list there would change
+     `result` for an agent that never opted in (spec § `core/model.py`). Do **not** touch `__str__`.
   3. `tests/test_payload.py` (new) — both halves of `PayloadCodec` — and the `tests/test_model.py`
      additions, including the convergence assertion and the two pinned bypasses.
 - **Verify:** `uv run pytest tests/test_payload.py tests/test_model.py` — and the whole suite, since
@@ -43,7 +44,7 @@ Per iteration: `cd ak-py && uv run pytest tests/<file>` for the named test, then
   1. Branch `ResponseBuilder.build_response` on `isinstance(result, AgentReplyAny) and
      result.media_type`. The `else` is the existing line, unmodified.
   2. Extend `tests/test_chat_service_core.py` into the labelled/unlabelled matrix.
-  3. Extend `tests/test_api_http.py:412` into a matrix — **the existing assertion must keep
+  3. Extend `tests/test_api_http.py:400` into a matrix — **the existing assertion must keep
      passing**. This is the back-compat guarantee.
 - **Verify:** `uv run pytest tests/test_chat_service_core.py tests/test_api_http.py`
 
@@ -57,7 +58,7 @@ Per iteration: `cd ak-py && uv run pytest tests/<file>` for the named test, then
 - **Steps:**
   1. All four serialisation gates call **`PayloadCodec.encode`** — one component, four call sites,
      not four independent fixes that can drift (spec § *Serialisation gates*).
-  2. `pipeline/request_handler.py:116`'s `JSONResponse` → the same `PayloadCodec.encode`.
+  2. `pipeline/request_handler.py:122`'s `JSONResponse` → the same `PayloadCodec.encode`.
   3. New **`DynamoDecimalCodec`** beside `DynamoDBDriver`: `to_dynamo` on write, `from_dynamo` on
      read — **both directions**; the read side is half the fix, not an afterthought.
   4. New **`ThreadRecorder._as_thread_content`** — the three call sites pass three different types,
@@ -118,8 +119,10 @@ Per-iteration tests land with their iteration. This iteration adds what spans th
   1. One labelled reply asserted to arrive with the same content and label on REST, WebSocket, MCP
      and AG-UI. **The fixture carries a `datetime` and a `Decimal`** — parity on a payload that was
      never at risk proves nothing. A2A joins when the port issue adds the data part.
-  2. Confirm `PayloadCodec.encode` is the only encoder at all six gate sites — the copy-drift the
-     single component exists to prevent.
+  2. Confirm `PayloadCodec.encode` is the only encoder at all **five** gate sites — the copy-drift
+     the single component exists to prevent. The thread recorder is the sixth candidate and
+     deliberately uses `json.dumps(default=str)` instead, to stay byte-identical to the direct
+     path's `AgentReplyAny.__str__` (spec § `integration/thread/recorder.py`).
   3. Confirm the back-compat matrix from iteration 2 still passes unchanged.
   4. Full suite green.
 - **Verify:** `cd ak-py && uv run pytest` and `make lint-check-all`
@@ -133,6 +136,15 @@ Per-iteration tests land with their iteration. This iteration adds what spans th
   - **Docs:** `docs/docs/api/rest-api.md` (the gated `result` contract and `media_type`),
     `mcp-server.md`, `agui-server.md`, and a new
     `docs/docs/advanced/a2ui.md` beside `sandbox.md` plus its sidebar entry.
+  - **Config reference — one section per capability, and A2UI needs its own in each:**
+    `ak-py/README.md` (`#### A2UI Configuration`, in the AG-UI section's Field/Default/Description/
+    Environment Variable shape, plus a `## Features` bullet) and
+    `docs/docs/core-concepts/configuration.md` (an `a2ui:` entry in the Basic Configuration File
+    sample and an `### A2UI` env-var subsection). Its "Complete Configuration Reference" is left
+    alone — it already omits six other blocks and is stale beyond this change.
+  - **Where the capability is announced:** `README.md`'s Open Standards row,
+    `docs/docs/intro.md`'s protocol bullet list and its What's New tip, and the `protocols` array in
+    `docs/src/pages/features.tsx`. All four list MCP / A2A / AG-UI and none mentions A2UI.
   - **Skills — named, with the line each invalidates:**
     - `.agents/skills/ak-dev-architecture/SKILL.md:275` — "`AgentReplyAny`: `content: dict` … `str(reply)`
       returns the JSON-serialized content" is wrong twice after iteration 1: `content` is
@@ -143,11 +155,24 @@ Per-iteration tests land with their iteration. This iteration adds what spans th
     - `.agents/skills/ak-dev-testing-conventions/SKILL.md` — the `test_stream_events.py` row gains
       `DataMessage`; add rows for `test_payload.py`, `test_a2ui_hook.py` and
       `test_cross_surface_parity.py`.
+    - `.agents/skills/ak-dev-architecture/SKILL.md:146` — "`OutputGuardrailFactory` as system
+      post-hook" names the only one there is; after iteration 6 there are two.
+    - `.agents/skills/ak-dev-architecture/SKILL.md:275` — the Key sections list of config blocks has
+      no `a2ui`. It belongs with `sandbox` (an `enabled` flag), not with the capability-gating
+      blocks on the line below.
+    - `.agents/skills/ak-dev-architecture/SKILL.md` directory tree — a new **top-level** `a2ui/`
+      branch under `agentkernel/`. It is not under `integration/`, where `agui/` lives.
+    - `ak-py/src/agentkernel/skills/ak-add-capabilities/SKILL.md` — the **user** skill, which
+      enumerates every capability twice: a numbered menu item and a `#### <Capability>` body. Both
+      need an A2UI entry, in the AG-UI entry's shape.
+  - **CI:** `.github/test-config.yaml` — the new example needs a two-line `type: api` entry beside
+    its siblings, or its `app_test.py` never runs.
 - **Verified as needing no update:** `ak-dev-new-framework-integration` (no `AgentReplyAny` mention —
-  adapters never set `media_type`), and the five other docs pages showing a `result`
-  (`advanced/scheduling.md`, `advanced/traceability.md`, `architecture/execution-flow.md`,
-  `deployment/aws-serverless.md`, `deployment/azure-serverless.md`) — every example there is a text
-  or unlabelled reply, so none becomes wrong.
+  adapters never set `media_type`), and four of the five other docs pages showing a `result`
+  (`advanced/scheduling.md`, `advanced/traceability.md`, `deployment/aws-serverless.md`,
+  `deployment/azure-serverless.md`) — every example there is a text or unlabelled reply, so none
+  becomes wrong. `architecture/execution-flow.md` **does** need one: it enumerates the system
+  post-hooks, which is a list this change adds to.
 - **Steps:** run `ak-dev-sync-skills-from-branch` and `ak-dev-sync-docs-from-branch` rather than
   editing by hand, then confirm the three skill edits above are present.
 - **Verify:** `make lint-check-all`; the example's own `uv run pytest`.
