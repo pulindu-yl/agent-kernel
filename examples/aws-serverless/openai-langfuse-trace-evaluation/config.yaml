@@ -24,7 +24,7 @@ execution:
     redis:
       prefix: "ak:openai-langfuse:response:"
       url: "redis://ak-openai-serverless-dev-examples-redis.rhjs7r.0001.use2.cache.amazonaws.com:6379"
-    # Poll every 3 s for up to 24 s: a reply is returned soon after it is stored, the store isn't read too
+    # Poll every 3 s for up to 27 s: a reply is returned soon after it is stored, the store isn't read too
     # often, and the wait stays under API Gateway's 29 s limit
     retry_count: 10
     delay: 3

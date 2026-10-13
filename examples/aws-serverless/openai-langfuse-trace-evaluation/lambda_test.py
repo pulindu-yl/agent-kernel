@@ -14,6 +14,7 @@ _log = logging.getLogger("ak.example.trace_evaluation.lambda_test")
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")  # uses a single session for all tests
 
+WARM_UP_WAIT = 120  # s: lets the warm-up run finish even if the gateway times out, so every Lambda is warm
 INITIAL_WAIT = 150  # s: the job's SETTLE_TIME (2 minutes) plus 30 s
 ROUNDS = 3  # /eval calls, the first one included
 ROUND_INTERVAL = 30  # s between rounds
@@ -88,6 +89,8 @@ async def test_every_request_is_graded(simulator, client):
     """Sends the questions, runs up to ROUNDS /eval calls, and expects every request graded."""
     _log.info("warming up the agent on a throwaway session")
     await asyncio.to_thread(simulator.warm_up)
+    _log.info("waiting %d s for the warm-up run to finish", WARM_UP_WAIT)
+    await asyncio.sleep(WARM_UP_WAIT)
     _log.info("session %s: sending %d questions", simulator.session_id, EXPECTED)
     replies = await asyncio.to_thread(simulator.send_questions)
     for question, reply in zip(TrafficSimulator.QUESTIONS, replies):

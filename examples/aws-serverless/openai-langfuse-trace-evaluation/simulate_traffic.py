@@ -43,8 +43,8 @@ class TrafficSimulator:
     def warm_up(self) -> None:
         """Sends one question under a throwaway session, so cold starts hit it rather than the graded requests.
 
-        Its reply and any failure are ignored: a cold start can make it time out at the gateway while the
-        Lambdas still start.
+        Its reply and any failure are ignored: a cold start can make it time out at the gateway while its queued
+        run still finishes.
         """
         payload = {"prompt": self.WARM_UP_QUESTION, "session_id": f"warm-up-{uuid.uuid4()}", "agent": "triage"}
         with httpx.Client(timeout=self.TIMEOUT, transport=self._transport) as client:
