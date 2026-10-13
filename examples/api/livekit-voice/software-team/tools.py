@@ -1,11 +1,16 @@
-"""The team's tools: short ones for the voice agents, and the background agents' own."""
+"""What the agents can do: every tool, voice and background."""
 
 import asyncio
 from typing import Callable
 
-from team.jobs import JobRefused
-from team.models import AcceptanceResult
-from team.state import TeamCall, TeamCalls
+from project import AcceptanceResult
+from team import JobRefused, TeamCall, TeamCalls
+
+# ====================================================================================================
+# The tools: one class, each role given its own set
+#
+# The team's tools: short ones for the voice agents, and the background agents' own.
+# ====================================================================================================
 
 
 class TeamTools:
@@ -55,6 +60,13 @@ class TeamTools:
             "settle_assumption",
         ],
     }
+    # Live: before saying hello, the PM recorded its own greeting question ("What would you like to build?") as an
+    # open question, which no one ever answered, so the client's board showed it all call long.
+    NOT_STARTED = (
+        "Not recorded: no project is started yet. Greet the client and ask what they want to build; once they have "
+        "said it, call start_project. A question you ask the client out loud is not an open question: record one "
+        "only when it stays unanswered."
+    )
     # Any voice agent may answer the Coder: the Architect a technical question, the PM a business one.
     SHARED_VOICE_TOOLS = ["get_project_state", "get_progress", "answer_coder"]
     BACKGROUND_TOOLS = {
@@ -215,6 +227,8 @@ class TeamTools:
         :param assumption: What the team assumed, in one sentence.
         """
         call = self._call()
+        if not call.store.started:
+            return self.NOT_STARTED
         # The Coder decided something no one in the call agreed, so it must be settled before delivery.
         by_coder = self.role == "coder"
         note = call.store.add_assumption(assumption, self.role, needs_settling=by_coder)
@@ -244,7 +258,10 @@ class TeamTools:
 
         :param question: The open question, in one sentence.
         """
-        note = self._call().store.add_question(question, self.role)
+        store = self._call().store
+        if not store.started:
+            return self.NOT_STARTED
+        note = store.add_question(question, self.role)
         return f"Recorded open question {note.id}."
 
     def confirm_requirements(self) -> str:

@@ -86,10 +86,12 @@ flowchart TB
 ### Example: `examples/api/livekit-voice/software-team/`
 
 - Labelled a showcase in its README, which points to `google/handoffs` for the handoffs it builds on.
-- Laid out for a first-time reader:
-  - `server.py`: start here;
-  - `members/`: who is on the team: `prompts.py` (plain-English instructions), `voice.py` (Worker, PM, Architect), `background.py` (Coder, Reviewer);
-  - `team/`: how the team works together, plain Python with no LLM (tools, project state, documents, rules, jobs, call link, progress).
+- Laid out for a first-time reader, in five Python files, each opening with a list of its sections:
+  - `server.py`: start here; registers the team and serves it, with the client's page and the project board;
+  - `agents.py`: who is on the team: the plain-English prompts, the voice agents (Worker, PM, Architect), the background agents (Coder, Reviewer);
+  - `tools.py`: what the agents can do;
+  - `team.py`: how the call is run, plain Python with no LLM (process rules, handoff guard, call link, jobs, activity, approval, call state);
+  - `project.py`: what the team knows (records, the shared store, documents, the project folder).
 
 #### Team
 
@@ -211,7 +213,7 @@ flowchart TB
 #### Project board and the client's page
 
 - Voice alone left the client blind: what was agreed, what is being built and what the team waits for were spoken once and gone. The client now follows the project on screen while talking.
-- **`ProjectBoard`** (`team/board.py`) joins the room as one more participant, `project-board` ("Project board"), with a token that publishes data only (`can_publish=False`, `can_subscribe=False`, `can_publish_data=True`).
+- **`ProjectBoard`** (`server.py`) joins the room as one more participant, `project-board` ("Project board"), with a token that publishes data only (`can_publish=False`, `can_subscribe=False`, `can_publish_data=True`).
   - It runs on a thread and event loop of its own, never the realtime pool's.
   - It sends a `BoardSnapshot` as JSON on the topic `ak.project` with LiveKit text streams (`send_text`): to every viewer (everyone but the `agent-*` participants, which run in the same process and would only log that they ignore the topic) after a project change, at most once a second (later changes coalesce into the next send), and to each participant that joins, so a page opened or reloaded mid-call starts full.
   - It never reaches the agents: the gateway takes only audio and the chat topics as the client's input, and the board sends neither. No core change: the example uses the LiveKit SDK Agent Kernel already installs.
@@ -223,7 +225,7 @@ flowchart TB
   - the client's token may publish data, so the page's message box sends to the room chat, which the gateway already passes to the agent with the call as the client's words;
   - `POST /project/share` saves a file in the project's `shared/` folder (`ProjectFiles`, a safe name, at most 10 MB), records it (`SharedFile`), announces it to the team (a short text file quoted, marked as data, not instructions), lists it in the Coder's brief, and a develop job uploads it to the sandbox under `shared/`;
   - `GET /project/files[/{path}]` and `GET /project/download` (a zip) read the project folder, never outside it; the board's Documents tab renders the live markdown (no HTML injected) with print-to-PDF, and its Files tab lists, views and downloads the files.
-- **Approval with a click** (`ClientApproval`, `team/approval.py`): checking the plan by ear is hard, so the client approves the requirements and the design together on the page:
+- **Approval with a click** (`ClientApproval`, `team.py`): checking the plan by ear is hard, so the client approves the requirements and the design together on the page:
   - `confirm_requirements` needs a written design (a `ProcessGates` check), so the approval stage is reliable: live, the PM had confirmed before the Architect wrote the design;
   - once the design is written and the requirements are not yet approved, the board's Project tab shows **Ready for your approval**: the live `requirements.md` and `design.md` in a scroll box, with **Looks good, build it** and **I'd like a change**; the page brings it into view once, when it appears;
   - `POST /project/approval?decision=approve|change&by=<name>`: an approval records the confirmation under the client's name, marks the question to the client answered, and tells the team it is recorded (not to call `confirm_requirements`) and to hand to the Worker; a change request tells the PM to ask what; either answers `409` when nothing waits for approval;
@@ -235,8 +237,8 @@ flowchart TB
 #### Classes
 
 - Example-local classes, one job each:
-  - `members/`: the prompts as plain constants (`MEETING_RULES`, `WORKER`, `PM`, `ARCHITECT`, `CODER`, `REVIEWER`); `VoiceTeam` (the three voice agents, written out one by one); `BackgroundTeam` (the Coder and the Reviewer);
-  - `team/`: `TeamTools` (the tool sets, bound per role), `ProjectStore`, `ProcessGates` and `HandoffGuard`, `ProjectDocuments`' `DocumentWriter`, `DevJobRunner`, `CallLink`, `ActivityFeed` and `ModelWaitWatcher` (with `ClientWordsWatcher` and `ClientQuestionWatcher`, on one `LogLineWatcher` base that warns when a watched logger is set above INFO), `ClientApproval`;
+  - `agents.py`: the prompts as plain constants (`MEETING_RULES`, `WORKER`, `PM`, `ARCHITECT`, `CODER`, `REVIEWER`); `VoiceTeam` (the three voice agents, written out one by one); `BackgroundTeam` (the Coder and the Reviewer);
+  - `tools.py`: `TeamTools` (the tool sets, bound per role); `project.py`: `ProjectStore` and `ProjectDocuments`' `DocumentWriter`; `team.py`: `ProcessGates` and `HandoffGuard`, `DevJobRunner`, `CallLink`, `ActivityFeed` and `ModelWaitWatcher` (with `ClientWordsWatcher` and `ClientQuestionWatcher`, on one `LogLineWatcher` base that warns when a watched logger is set above INFO), `ClientApproval`;
   - `TeamCall`: one call's state (its store, jobs, link, guard and the Coder's open question); `TeamCalls` finds it from the session a tool runs in (the call's session or its `-dev` session);
   - `ProjectBoard` and `BoardSnapshot`, `RoomAccess`, `ClientPage`: the board participant, its snapshot, LiveKit tokens, and the client's page;
   - `SoftwareTeamServer`: loads the voice team and the background agents, starts the board, and serves the room and the client's page.

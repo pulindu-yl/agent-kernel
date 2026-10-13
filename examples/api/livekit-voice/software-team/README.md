@@ -23,40 +23,23 @@ Every voice agent also has `get_project_state`, `get_progress` and `answer_coder
 
 ```
 software-team/
-├── server.py            START HERE: builds the team and serves it in the LiveKit room
-├── members/             WHO is on the team: the agent definitions
-│   ├── prompts.py         what each agent is told, in plain English
-│   ├── voice.py           Worker, PM and Architect (Gemini Live), and how they hand over
-│   └── background.py      Coder and Reviewer (a text model through LiteLLM)
-├── team/                HOW the team works together: plain Python, no LLM
-│   ├── tools.py           every agent's tools
-│   ├── project.py         what the team agreed and did (the shared state)
-│   ├── documents.py       the markdown documents written from it
-│   ├── models.py          the records: requirement, decision, task, finding, ...
-│   ├── rules.py           the process order, and the limit on handoffs
-│   ├── jobs.py            runs the Coder and the Reviewer, then the tests
-│   ├── call_link.py       speaks into the live call at quiet moments
-│   ├── progress.py        turns background activity into entries on the board
-│   ├── state.py           one call's state, found from the session a tool runs in
-│   ├── board.py           the project board: one more participant that shows the client the project
-│   ├── room_access.py     LiveKit tokens for the board and the client's page
-│   ├── approval.py        your approval of the requirements and the design, from a button on your page
-│   ├── client_questions.py  notices when an agent has asked you something, from its words
-│   ├── log_watch.py       reading a line another library logs: the example's shortcut for three events
-│   ├── project_files.py   the project's files for your page: view, download, share
-│   └── client_page.py     serves the client's page and its token on port 8000
-├── panel/               the client's screen: a small React app (the call + the project board)
-├── config.yaml          realtime mode, and the sandbox for the background agents
-└── demo_test.py         tests for the coordination code: no model, room or Docker needed
+├── server.py      START HERE: registers the team, serves it in the LiveKit room, the client's page and the project board
+├── agents.py      WHO is on the team: the prompts, the 3 voice agents (Gemini Live) and the 2 background agents (LiteLLM)
+├── tools.py       WHAT the agents can do: every tool, voice and background
+├── team.py        HOW the call is run: process rules, the handoff guard, speaking into the call, background jobs
+├── project.py     WHAT the team knows: the records, the shared store, the documents, the project folder
+├── panel/         the client's screen: a small React app (the call + the project board)
+├── config.yaml    realtime mode, and the sandbox for the background agents
+└── demo_test.py   tests for the coordination code: no model, room or Docker needed
 ```
 
-Read them in this order:
+Each file opens with a list of its sections. Read them in this order:
 
-1. **`server.py`**: `SoftwareTeamServer.load()` registers the voice team and the background agents with Agent Kernel, and `run()` serves the PM, the entry agent, in the LiveKit room.
-2. **`members/voice.py`**: `VoiceTeam.build()` defines the three voice agents as ordinary ADK agents. The PM opens the meeting, as a project manager does with a client, so the call does not begin with a handover. The Worker and the Architect are the PM's `sub_agents`, so any of the three can hand the call to another with ADK's `transfer_to_agent`.
-3. **`members/prompts.py`**: each voice agent's instruction is `MEETING_RULES` plus its role. The rules are where the behaviour lives: how to hand over, when to ask the client, how to report progress.
-4. **`members/background.py`**: `BackgroundTeam` defines the Coder and the Reviewer, ADK agents too, on `LiteLlm(model="openai/gpt-4.1")`, as in the `examples/api/adk` example.
-5. **`team/tools.py`**: what the agents can do. A voice agent's job tool (`start_development`, `request_review`, ...) queues a job in `team/jobs.py` and returns at once.
+1. **`server.py`** (section 4): `SoftwareTeamServer.load()` registers the voice team and the background agents with Agent Kernel, and `run()` serves the PM, the entry agent, in the LiveKit room.
+2. **`agents.py`**: `VoiceTeam.build()` defines the three voice agents as ordinary ADK agents. The PM opens the meeting, as a project manager does with a client, so the call does not begin with a handover. The Worker and the Architect are the PM's `sub_agents`, so any of the three can hand the call to another with ADK's `transfer_to_agent`. Each voice agent's instruction is `MEETING_RULES` plus its role: the rules are where the behaviour lives (how to hand over, when to ask the client, how to report progress). `BackgroundTeam` defines the Coder and the Reviewer, ADK agents too, on `LiteLlm(model="openai/gpt-4.1")`, as in the `examples/api/adk` example.
+3. **`tools.py`**: what the agents can do. A voice agent's job tool (`start_development`, `request_review`, ...) queues a job with `DevJobRunner` (`team.py`) and returns at once.
+4. **`team.py`**: the plain-Python rules that keep the call on track: `ProcessGates` (the SDLC order), `HandoffGuard` (no handoff loops), `CallLink` (speaks into the call at quiet moments), `DevJobRunner` (runs the Coder and the Reviewer, then the tests), and `TeamCall`, one call's state.
+5. **`project.py`**: `ProjectStore`, what the team agreed and did, and the documents written from it.
 
 ## How it works
 
@@ -207,5 +190,5 @@ uv run pytest demo_test.py
 - **About ten minutes.** Gemini Live session limits are not handled, and the client is expected to stay on the call until delivery. Project state lasts only as long as the process.
 - **Python projects only.** The Coder writes Python with pytest tests: a web API, or a website served by FastAPI with HTML pages. The voice agents know it and offer that when a client asks for another stack (React, Next.js, Node). The sandbox itself could run Node with an image that has it, but the team's test evidence (`DevJobRunner` runs and reads pytest) and the Coder's instructions are Python-only; other stacks, and previewing a built site, are follow-ups.
 - **A short gap on every handoff** (about 1 to 2 seconds while the new agent's socket opens), as in the `google/handoffs` example.
-- **Prompts drive the meeting.** How well the agents follow the meeting rules depends on the model; expect to tune `members/prompts.py`.
+- **Prompts drive the meeting.** How well the agents follow the meeting rules depends on the model; expect to tune the prompts at the top of `agents.py`.
 - **No pull request.** Delivery writes a folder; opening a pull request, merging and deploying are out of scope.

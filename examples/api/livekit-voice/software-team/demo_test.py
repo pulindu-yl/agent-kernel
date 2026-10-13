@@ -12,18 +12,21 @@ from types import SimpleNamespace
 import pytest
 from agentkernel.core.base import Session
 
-from members import prompts
-from members.background import BackgroundTeam
-from members.voice import VoiceTeam
-from team.call_link import CallLink
-from team.documents import ProjectDocuments
-from team.jobs import DevJobRunner, JobRefused
-from team.models import AcceptanceResult
-from team.progress import ActivityFeed, ModelWaitWatcher
-from team.project import ProjectStore
-from team.rules import HandoffGuard, ProcessGates
-from team.state import TeamCall, TeamCalls
-from team.tools import TeamTools
+import agents as prompts
+from agents import BackgroundTeam, VoiceTeam
+from project import AcceptanceResult, ProjectDocuments, ProjectStore
+from team import (
+    ActivityFeed,
+    CallLink,
+    DevJobRunner,
+    HandoffGuard,
+    JobRefused,
+    ModelWaitWatcher,
+    ProcessGates,
+    TeamCall,
+    TeamCalls,
+)
+from tools import TeamTools
 
 
 class FakeClock:
@@ -1026,6 +1029,7 @@ class TestTeamTools:
         """Review: after an unanswered question the Coder decides alone; a business rule must reach the client."""
         call = calls.get("room_01")
         call.link.stop()
+        call.store.start("salon booking", "Book appointments online", "pm")
         posted = []
         call.notify = posted.append
 
@@ -1039,6 +1043,20 @@ class TestTeamTools:
         assert "settle_assumption" in notice
         assumptions = call.store.state.assumptions
         assert [a.needs_settling for a in assumptions] == [True, False]
+
+    async def test_nothing_is_recorded_before_the_project_is_started(self, calls):
+        """Live: before saying hello the PM recorded its own greeting question, and the board showed it all call."""
+        call = calls.get("room_01")
+        pm = TeamTools(calls, "pm")
+
+        async with Session("room_01"):
+            question = pm.record_question("What would you like to build?")
+            assumption = pm.record_assumption("The client wants to hear how the team works.")
+            assert question == assumption == TeamTools.NOT_STARTED
+            assert call.store.state.questions == [] and call.store.state.assumptions == []
+
+            pm.start_project("salon booking", "Book appointments online")
+            assert pm.record_question("Do bookings need a deposit?") == "Recorded open question Q1."
 
     async def test_settling_an_assumption(self, calls):
         call = calls.get("room_01")
@@ -1173,14 +1191,14 @@ class TestClientQuestionWatcher:
 
     @staticmethod
     def _watch(tmp_path):
-        from team.client_questions import ClientQuestionWatcher
+        from team import ClientQuestionWatcher
 
         call = TeamCall("room_01", tmp_path)
         call.link.stop()
         return call, ClientQuestionWatcher(call)
 
     def test_a_question_to_the_client_leaves_the_team_waiting_for_the_answer(self, tmp_path):
-        from team.board import BoardSnapshot
+        from server import BoardSnapshot
 
         call, watcher = self._watch(tmp_path)
         # The turn from the live log, as the gateway logged it.
@@ -1332,7 +1350,7 @@ class TestCodeReview:
         assert third.startswith("Not handed over: the review findings have had 2 rounds of discussion")
         assert "findings F1 are to be fixed. The Worker fixes them with start_development" in to_fix
         assert "Code review: round 2" in ProjectDocuments.log(call.store.state)
-        from team.board import BoardSnapshot
+        from server import BoardSnapshot
 
         snapshot = BoardSnapshot.of(call, 0.0)
         assert snapshot.phase == "Code review" and not snapshot.code_approved
@@ -1708,9 +1726,8 @@ class TestTeams:
             )
             other = team.brief_handover(SimpleNamespace(name="get_progress"), {}, context(None), "ok")
 
-        assert brief.startswith(
-            "The Worker has the call. Where the project stands: the Architect is debating the design"
-        )
+        assert brief.startswith("The Worker has the call: you are the Worker now, so speak as yourself")
+        assert "Where the project stands: the Architect is debating the design" in brief
         assert "round" not in brief  # told rounds, the Worker acted out every round alone
         assert refused is None and other is None
 
@@ -1904,7 +1921,7 @@ class TestProjectBoard:
         return call
 
     def test_the_snapshot_shows_what_was_recorded(self, call):
-        from team.board import BoardSnapshot
+        from server import BoardSnapshot
 
         store = call.store
         store.start("Salon booking", "Customers book a stylist.", "pm")
@@ -1924,7 +1941,7 @@ class TestProjectBoard:
         assert snapshot.decisions[0].challenge == "Races: index"
 
     def test_the_snapshot_says_what_the_team_is_waiting_for(self, call):
-        from team.board import BoardSnapshot
+        from server import BoardSnapshot
 
         store = call.store
         store.add_progress("Asked the client: Can a customer cancel?", "pm")
@@ -1940,7 +1957,7 @@ class TestProjectBoard:
         ]
 
     def test_a_running_job_shows_its_latest_activity(self, call):
-        from team.board import BoardSnapshot
+        from server import BoardSnapshot
 
         job = call.store.add_job("develop", "T1")
         call.store.update_job(job.id, "running")
@@ -1957,7 +1974,7 @@ class TestProjectBoard:
         assert snapshot.job.activity == ["coder wrote app/a.py", "coder wrote app/b.py"]
 
     def test_the_steps_follow_the_process_and_the_recent_log_is_shown(self, call):
-        from team.board import BoardSnapshot
+        from server import BoardSnapshot
 
         def steps():
             return {s.name: s.state for s in BoardSnapshot.of(call, 0.0).steps}
@@ -2001,8 +2018,7 @@ class TestProjectBoard:
         assert store.state.requirements[0].title == "Booking"
 
     async def test_changes_are_sent_at_most_once_an_interval(self, call):
-        from team.board import ProjectBoard
-        from team.room_access import RoomAccess
+        from server import ProjectBoard, RoomAccess
 
         sent = []
 
@@ -2041,8 +2057,7 @@ class TestProjectBoard:
 
     async def test_the_clients_words_from_the_log_reach_their_page(self, call):
         """Agent Kernel logs each caller turn ("Caller said: ..."); the board passes it on, no core change needed."""
-        from team.board import ClientWordsWatcher, ProjectBoard
-        from team.room_access import RoomAccess
+        from server import ClientWordsWatcher, ProjectBoard, RoomAccess
 
         sent = []
 
@@ -2065,8 +2080,7 @@ class TestProjectBoard:
         assert sent == [({"text": "I need a booking system."}, "ak.client", ["Pulindu"])]
 
     def test_no_board_without_livekit_settings(self, call):
-        from team.board import ProjectBoard
-        from team.room_access import RoomAccess
+        from server import ProjectBoard, RoomAccess
 
         board = ProjectBoard(call, RoomAccess("room_01", "", "", ""))
         board.start()
@@ -2075,8 +2089,7 @@ class TestProjectBoard:
 
     def test_the_livekit_sdk_is_ready_before_the_board_thread_starts(self, call, monkeypatch):
         """Live: the board's and the gateway's threads first used the SDK at once, and the gateway's room never connected."""
-        from team.board import ProjectBoard
-        from team.room_access import RoomAccess
+        from server import ProjectBoard, RoomAccess
 
         order = []
         monkeypatch.setattr(ProjectBoard, "prepare_livekit", staticmethod(lambda: order.append("sdk ready")))
@@ -2097,7 +2110,7 @@ class TestClientPage:
     def test_the_tokens_grant_what_each_participant_needs(self):
         from livekit import api
 
-        from team.room_access import RoomAccess
+        from server import RoomAccess
 
         access = RoomAccess(*self.ACCESS)
         verify = api.TokenVerifier("key", "secret-of-at-least-32-characters-long").verify
@@ -2114,7 +2127,7 @@ class TestClientPage:
     def test_the_client_joins_under_their_name(self):
         from livekit import api
 
-        from team.room_access import RoomAccess
+        from server import RoomAccess
 
         access = RoomAccess(*self.ACCESS)
         verify = api.TokenVerifier("key", "secret-of-at-least-32-characters-long").verify
@@ -2131,8 +2144,7 @@ class TestClientPage:
     def test_the_token_route(self, tmp_path):
         from fastapi import HTTPException
 
-        from team.client_page import ClientPage
-        from team.room_access import RoomAccess
+        from server import ClientPage, RoomAccess
 
         reply = ClientPage(RoomAccess(*self.ACCESS), TeamCalls(tmp_path), tmp_path).token("Pulindu")
         assert reply["url"] == "wss://example.livekit.cloud" and reply["room"] == "room_01" and reply["token"]
@@ -2145,8 +2157,7 @@ class TestClientPage:
     def test_an_unbuilt_page_says_how_to_build_it(self, tmp_path):
         from fastapi import HTTPException
 
-        from team.client_page import ClientPage
-        from team.room_access import RoomAccess
+        from server import ClientPage, RoomAccess
 
         page = ClientPage(RoomAccess(*self.ACCESS), TeamCalls(tmp_path), tmp_path)
 
@@ -2248,8 +2259,7 @@ class TestProjectFiles:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
-        from team.client_page import ClientPage
-        from team.room_access import RoomAccess
+        from server import ClientPage, RoomAccess
 
         calls = TeamCalls(tmp_path / "output")
         call = calls.get("room_01")
@@ -2309,7 +2319,7 @@ class TestProjectFiles:
 
     def test_the_client_approves_the_plan_with_a_click(self, client):
         """Checking the plan by ear is hard: once the design is written, the page shows it with two buttons."""
-        from team.board import BoardSnapshot
+        from server import BoardSnapshot
 
         http, call = client
         assert http.post("/project/approval?decision=approve&by=Pulindu").status_code == 409  # no design yet
@@ -2411,7 +2421,8 @@ class TestHandoffChecks:
             connection.last_model_generated_at = connection.last_agent_change_at + 1  # now it speaks
             spoken = self._handover(team, "architect", "worker")
 
-        assert silent.startswith("Not handed over: you have said nothing since you got the call")
+        assert silent.startswith("Not handed over: you had said nothing yet when you called it")
+        assert "If you have just made it, do not say it again" in silent  # live, the Architect said its points twice
         assert spoken.startswith("The Worker has the call")
         assert call.store.state.design_rounds == 1
 
@@ -2479,8 +2490,7 @@ class TestRenewedConnection:
         assert call.link.tick() is None  # the earlier notices were dropped, not posted
 
     def test_the_clients_name_is_kept_when_their_page_joins(self, tmp_path):
-        from team.client_page import ClientPage
-        from team.room_access import RoomAccess
+        from server import ClientPage, RoomAccess
 
         calls = TeamCalls(tmp_path)
         calls.get("room_01").link.stop()
@@ -2717,7 +2727,7 @@ class TestDelivery:
 class TestLogWatchers:
     def test_a_silenced_logger_is_reported_at_install(self, tmp_path, caplog):
         """The example reads some events from log lines; a logger set above INFO would silence that without an error."""
-        from team.client_questions import ClientQuestionWatcher
+        from team import ClientQuestionWatcher
 
         logger = logging.getLogger(ClientQuestionWatcher.LOGGERS[0])
         level = logger.level
@@ -2742,3 +2752,35 @@ def test_the_server_listens_on_this_machine_only_and_buffers_enough_audio():
     config = yaml.safe_load((Path(__file__).parent / "config.yaml").read_text())
     assert config["api"]["host"] == "127.0.0.1"
     assert config["execution"]["realtime"]["playback_lead_ms"] >= 300
+
+
+class TestLayout:
+    """The example is five files, each made of several sections: a name a section defines at module level
+    must not be defined again by another, or the later one silently replaces it (live, every section of
+    team.py logged under the last section's logger)."""
+
+    FILES = ("server.py", "agents.py", "tools.py", "team.py", "project.py")
+
+    @pytest.mark.parametrize("name", FILES)
+    def test_no_module_level_name_is_defined_twice(self, name):
+        import ast
+
+        tree = ast.parse((Path(__file__).parent / name).read_text())
+        defined = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.append(node.name)
+            elif isinstance(node, ast.Assign):
+                defined += [target.id for target in node.targets if isinstance(target, ast.Name)]
+        assert sorted({n for n in defined if defined.count(n) > 1}) == []
+
+    def test_a_post_into_the_call_is_logged_as_the_call_link(self, caplog):
+        connection, clock = FakeConnection(), FakeClock()
+        connection.last_model_output_at = clock.now - 5
+        link = TestCallLink._link(connection, clock)
+        link.post("J1 (develop) finished.")
+
+        with caplog.at_level(logging.INFO, logger="software_team.call"):
+            link.tick()
+
+        assert [r.name for r in caplog.records if r.message.startswith("Posted into call")] == ["software_team.call"]
