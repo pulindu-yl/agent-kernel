@@ -145,7 +145,7 @@ def aws(monkeypatch):
     for name, value in {
         "AWS_ACCESS_KEY_ID": "testing",
         "AWS_SECRET_ACCESS_KEY": "testing",
-        "AWS_DEFAULT_REGION": "ap-southeast-2",
+        "AWS_DEFAULT_REGION": "us-east-2",
     }.items():
         monkeypatch.setenv(name, value)
     with mock_aws():

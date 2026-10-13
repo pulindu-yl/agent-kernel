@@ -1220,7 +1220,7 @@ class EvaluationAPI:
 ```hcl
 module "serverless_agents" {                       # queue mode, like aws-serverless/openai
   source  = "yaalalabs/ak-serverless/aws"
-  version = "0.9.4"                                # the siblings' pin
+  version = "0.9.5"                                # the siblings' pin
   providers            = { aws = aws, docker = docker }
   prefix               = var.prefix
   region               = var.region
@@ -1345,7 +1345,7 @@ resource "aws_lambda_function_event_invoke_config" "grading" {
   `run_single_test.py` `test_aws_deployment` reads), `results_table_name`.
 - `providers.tf`: the siblings' file. No `backend.tf`: like the siblings, the pipeline injects it and
   `.gitignore` excludes it.
-- `terraform.tfvars`: `region = "ap-southeast-2"`, `prefix = "ak-oai-lf-eval-dev-examples"`.
+- `terraform.tfvars`: `region = "us-east-2"`, `prefix = "ak-oai-lf-eval-dev-examples"`.
 - Packaging: the request handler (292 MB of dependencies with Opik) and the agent runner (OpenAI Agents
   SDK) are container images, being over Lambda's 250 MB unzipped zip limit; the response handler (51 MB)
   is a `LocalZip`, as in `schedule-openai`.
@@ -1365,12 +1365,12 @@ resource "aws_lambda_function_event_invoke_config" "grading" {
 dependencies = []
 
 [project.optional-dependencies]                    # one set per Lambda, like the queue-mode siblings
-request_handler = ["agentkernel[aws,redis,langfuse,opik]>=0.9.4", "boto3>=1.40.0", "langfuse>=4.7.0"]
-agent_runner = ["agentkernel[aws,openai,redis,langfuse]>=0.9.4", "langfuse>=4.7.0"]
-response_handler = ["agentkernel[aws,redis]>=0.9.4"]
+request_handler = ["agentkernel[aws,redis,langfuse,opik]>=0.9.5", "boto3>=1.40.0", "langfuse>=4.7.0"]
+agent_runner = ["agentkernel[aws,openai,redis,langfuse]>=0.9.5", "langfuse>=4.7.0"]
+response_handler = ["agentkernel[aws,redis]>=0.9.5"]
 
 [dependency-groups]
-dev = ["agentkernel[test]>=0.9.4", "httpx>=0.27.0", "moto[dynamodb]>=5.0.0", "black==26.5.1", "isort>=5.0.0"]
+dev = ["agentkernel[test]>=0.9.5", "httpx>=0.27.0", "moto[dynamodb]>=5.0.0", "black==26.5.1", "isort>=5.0.0"]
 ```
 
 - The request handler carries Opik and the evaluator; only the agent runner needs the OpenAI Agents SDK.
