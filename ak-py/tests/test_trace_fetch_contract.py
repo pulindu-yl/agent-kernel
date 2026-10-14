@@ -162,7 +162,7 @@ class _FakeWarehouse:
     def _passes(item, condition):
         value = item.get(condition["id"], item["span_attributes"].get(condition["id"]))
         if condition["operator"] == "in":
-            return value in condition["value"]
+            return value in condition["values"]  # the live API reads "in" lists from "values", not "value"
         return value == condition["value"]
 
 
