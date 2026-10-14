@@ -396,13 +396,13 @@ llm:
 ```
 
 - **score**: Deterministic, offline scoring via the configured `AKEvaluator`'s `evaluate_by_score` — the built-in `DeepevalAKEvaluator` uses `Scorer.quasi_exact_match_score` (normalised whole-string equality, no LLM call); the built-in `OpikAKEvaluator` uses Opik's `LevenshteinRatio` instead (graded fuzzy-similarity, not exact-match); the built-in `JevAKEvaluator` has no score mode (`AKMetricNotSupported`), so `evaluator: jev` needs `mode: llm`
-- **llm**: LLM-as-judge scoring via `evaluate_by_llm` — `deepeval` and `opik` use a `GEval` metric against the expected answer(s) (ground truth), while `jev` asks one TypeSafe Noul yes/no question (its probability is the score; comparison text is sent to `api.typesafe.ai`): `DeepevalAKEvaluator` via DeepEval's `GEval` and an `LLMTestCase`, `OpikAKEvaluator` via Opik's `GEval` and a single packed `output` string. Evaluation backends are pluggable (`agentkernel.test.core.evaluator.AKEvaluator`); see `ak-py/src/agentkernel/test/test.py`
+- **llm**: LLM-as-judge scoring via `evaluate_by_llm` — `deepeval` and `opik` use a `GEval` metric against the expected answer(s) (ground truth), while `jev` asks one TypeSafe Noul yes/no question (its probability is the score; comparison text is sent to `api.typesafe.ai`): `DeepevalAKEvaluator` via DeepEval's `GEval` and an `LLMTestCase`, `OpikAKEvaluator` via Opik's `GEval` and a single packed `output` string. Evaluation backends are pluggable (`agentkernel.test.AKEvaluator`, defined in `agentkernel.test.core.evaluator`); see `ak-py/src/agentkernel/test/test.py`
 - **fallback**: Tries score first, falls back to llm if score fails
 
 `evaluator` is resolved by `Test._resolve_evaluator` (`agentkernel/test/test.py`), the same
 bring-your-own-dotted-path pattern `resolve_dotted`/`require_extra` (`core/util/factory.py`) use
 for session stores, sandbox providers, and trace backends — a custom evaluator subclasses
-`AKEvaluator` (`agentkernel.test.core.evaluator`) and implements `evaluate_by_score`/
+`AKEvaluator` (imported from `agentkernel.test`) and implements `evaluate_by_score`/
 `evaluate_by_llm`, each returning an `AKEvaluationResult`. See
 `examples/cli/custom-evaluator/` for a full worked example, and
 `docs/specs/555-pluggable-test-evaluators/` for the design/spec behind this interface.
