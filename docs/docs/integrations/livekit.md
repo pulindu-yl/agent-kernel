@@ -243,7 +243,7 @@ waiting, and `call.withdraw(key)` drops one that no longer applies. Say whose wo
 `RealtimeCall` also tells what the call is doing: `connected`, `quiet_for()` (seconds the call has been quiet,
 or `None` while it is busy) and `agent_has_spoken` (whether the agent with the call has said anything since it
 got it, known as soon as the model generates the words: a handoff policy can refuse an agent that hands the call
-on without a word). See [Turn state](../architecture/realtime-internals.md#turn-ExecutionManagerstate) for how quiet is decided.
+on without a word). See [Turn state](../architecture/realtime-internals.md#turn-state) for how quiet is decided.
 
 ## Watching a live call
 
