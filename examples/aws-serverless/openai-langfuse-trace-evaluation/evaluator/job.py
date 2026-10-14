@@ -4,7 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable
 
-from agentkernel.test.core.evaluator import AKEvaluationResult
+from agentkernel.test import AKEvaluationResult
 from agentkernel.trace import FetchedSpan, Trace
 from pydantic import BaseModel
 

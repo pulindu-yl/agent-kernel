@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 
-from agentkernel.test.core.evaluator import AKEvaluationCase
+from agentkernel.test import AKEvaluationCase
 from agentkernel.trace import FetchedSpan, OTelSpanClassifier, SpanKind, SpanUsage
 from pydantic import BaseModel
 
@@ -28,6 +28,7 @@ class TraceCase(BaseModel):
     """The facts of one request (one trace), gathered from its spans."""
 
     trace_id: str
+    provider: str  # the tracer the spans came from
     session_id: str | None = None
     root_name: str | None = None
     started_at: datetime
@@ -88,6 +89,7 @@ class TraceCase(BaseModel):
         agent_names = [span.name for span in spans_oldest_first if cls._span_kind(span) == SpanKind.AGENT and span.name]
         return cls(
             trace_id=trace_id,
+            provider=root.provider,
             session_id=root.session_id,
             root_name=root.name,
             started_at=root.start_time,

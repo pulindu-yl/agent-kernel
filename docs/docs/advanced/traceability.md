@@ -695,8 +695,6 @@ class TestMyTraceFetch(TraceFetchContract):
 
 For an end-to-end use of `fetch` and `usage`, see the [`openai-langfuse-trace-evaluation` example](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/aws-serverless/openai-langfuse-trace-evaluation): an agent on
 AWS Lambda whose Langfuse traces are read back per session, graded by Opik LLM judges and stored in DynamoDB.
-The same evaluation runs on Logfire in [`pydanticai-logfire-trace-evaluation`](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/aws-serverless/pydanticai-logfire-trace-evaluation)
-and on CloudWatch in [`adk-cloudwatch-trace-evaluation`](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/aws-serverless/adk-cloudwatch-trace-evaluation).
 
 ## Integrate with Your Own Traceability Platform
 

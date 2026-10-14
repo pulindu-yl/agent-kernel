@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import Any
 
 import boto3
-from agentkernel.test.core.evaluator import AKEvaluationResult
+from agentkernel.test import AKEvaluationResult
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from pydantic import BaseModel
@@ -77,7 +77,9 @@ class EvaluationStore:
                 )
         return progress_by_id
 
-    def write_progress(self, case: TraceCase, progress: Progress, now: datetime, lease_expired_before: datetime) -> bool:
+    def write_progress(
+        self, case: TraceCase, progress: Progress, now: datetime, lease_expired_before: datetime
+    ) -> bool:
         """Writes the trace's summary row with ``progress``; returns False when the row may not be overwritten.
 
         Only a new row, a pending or failed one, or a grading one whose lease began before ``lease_expired_before``
@@ -191,7 +193,7 @@ class EvaluationStore:
             "progress": progress.value,
             "updated_at": self._to_utc_iso(now),
             "expires_at": int((now + self.ROW_TTL).timestamp()),
-            "provider": "langfuse",
+            "provider": case.provider,
             "root_name": case.root_name,
             "started_at": self._to_utc_iso(case.started_at),
             "latency_ms": case.latency_ms,

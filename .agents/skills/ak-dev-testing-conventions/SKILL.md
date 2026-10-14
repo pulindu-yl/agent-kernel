@@ -33,12 +33,13 @@ addopts = "--cov=src --cov-report=term --cov-report=html --html=report.html"
 
 Tests live in `ak-py/tests/` and follow the naming convention `test_<module>.py`.
 
-Three subsystems ship a **reusable contract suite** a new backend must be run against, rather than
+Four subsystems ship a **reusable contract suite** a new backend must be run against, rather than
 per-backend assertions written from scratch: `QueueTransportContract` (`pipeline/testing.py`),
-`SandboxProviderContract` (`sandbox/testing.py`), and `KnowledgeBaseContract` /
-`DocumentStoreContract` (`knowledgebase/testing.py`). All three ship next to the ABC they constrain,
+`SandboxProviderContract` (`sandbox/testing.py`), `KnowledgeBaseContract` /
+`DocumentStoreContract` (`knowledgebase/testing.py`), and `TraceFetchContract` (`trace/testing.py`,
+for tracers that implement `BaseTrace.fetch`). All four ship next to the ABC they constrain,
 so a bring-your-own backend author can import and subclass them out of tree; each module imports
-`pytest` and is therefore kept out of its package's exports. In all three cases the contract classes
+`pytest` and is therefore kept out of its package's exports. In all four cases the contract classes
 are deliberately not named `Test*`, so pytest collects them only through the subclasses that supply a
 fixture.
 
@@ -189,6 +190,9 @@ fixture.
 | `test_store_builders.py` | Session/thread/multimodal store builders: fail-loud on unknown type, BYO dotted-path subclass resolution |
 | `test_trace.py` | Trace factory built-in resolution, BYO dotted path, unknown-type error |
 | `test_trace_cloudwatch.py` | CloudWatch trace provider: provider installed once or an existing SDK provider reused, X-Ray endpoint and SigV4 selection from `AWS_REGION` / `OTEL_EXPORTER_OTLP_*`, resource defaults, SigV4 request signing, the run span's `session.id` / `input.value` / `output.value`, `session.id` stamped onto instrumentor child spans, and the per-run flush on Lambda. Records spans with a real SDK `TracerProvider` + `InMemorySpanExporter` and patches `trace.get_tracer_provider` / `set_tracer_provider`, never installing a global provider |
+| `test_trace_fetch.py` | `Trace.fetch` models and fetchers: `TraceQuery` window defaults/validation, strict `matches` and empty-filter rejection, `OTelSpanClassifier` kind/IO/session/usage reads, keyword-vs-`query` arguments, the shared `TraceFetcher` paging (span identity is `(trace_id, span_id)`, newest `limit` kept, cursor stop rules, time-window pages sized past the re-read boundary), and the Langfuse, Logfire, Traceloop and CloudWatch request translation and span mapping against fake clients |
+| `test_trace_fetch_contract.py` | The reusable `TraceFetchContract` (`trace/testing.py`) run against an in-memory tracer and the Langfuse and Traceloop fetchers behind fake APIs |
+| `test_trace_langfuse_flush.py` | Every Langfuse traced runner flushes after a successful and a failed run, only on Lambda, and a failing flush is logged rather than raised |
 
 ## Test Patterns
 

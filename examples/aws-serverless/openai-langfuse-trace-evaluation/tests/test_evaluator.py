@@ -9,8 +9,7 @@ from types import SimpleNamespace
 import boto3
 import httpx
 import pytest
-from agentkernel.test import AKTestConfig
-from agentkernel.test.core.evaluator import AKEvaluationResult, AKMetricNotSupported
+from agentkernel.test import AKEvaluationResult, AKMetricNotSupported, AKTestConfig
 from agentkernel.trace import FetchedSpan, SpanKind, SpanUsage
 from botocore.exceptions import ClientError
 from moto import mock_aws
@@ -184,6 +183,7 @@ class TestTraceCase:
         assert case.user_input == "Where is my order A-1001?"  # JSON string unwrapped
         assert case.output == "Your order A-1001 has shipped and arrives Friday."
         assert case.root_name == "Agent Kernel OpenAI"
+        assert case.provider == "langfuse"
         assert case.session_id == SESSION
         assert case.tool_calls == [
             ToolCall(name="get_order_status", input='{"order_id": "A-1001"}', output="Shipped, arriving Friday")
@@ -438,7 +438,9 @@ class TestEvaluationStore:
         later = T0 + timedelta(minutes=5)
         assert not store.write_progress(case, Progress.GRADING, later, later - lease)  # lease still held
         assert not store.write_progress(case, Progress.PENDING, later, later - lease)
-        assert table.get_item(Key={"trace_id": "trace-1"})["Item"]["updated_at"] == T0.isoformat(timespec="microseconds")
+        assert table.get_item(Key={"trace_id": "trace-1"})["Item"]["updated_at"] == T0.isoformat(
+            timespec="microseconds"
+        )
 
         expired = T0 + lease + timedelta(seconds=1)
         assert store.write_progress(case, Progress.GRADING, expired, expired - lease)  # lease taken over

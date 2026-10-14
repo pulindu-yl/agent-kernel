@@ -4,8 +4,7 @@ import os
 # Before any Opik metric is built, as AK's own Opik evaluator does: nothing is sent to Opik's cloud
 os.environ.setdefault("OPIK_TRACK_DISABLE", "True")
 
-from agentkernel.test import AKTestConfig
-from agentkernel.test.core.evaluator import AKEvaluationCase, AKEvaluationResult, AKEvaluator, AKMetricNotSupported
+from agentkernel.test import AKEvaluationCase, AKEvaluationResult, AKEvaluator, AKMetricNotSupported, AKTestConfig
 from opik.evaluation.metrics import AgentTaskCompletionJudge, AgentToolCorrectnessJudge, AnswerRelevance, Hallucination
 from opik.evaluation.metrics.base_metric import BaseMetric
 from opik.evaluation.metrics.score_result import ScoreResult

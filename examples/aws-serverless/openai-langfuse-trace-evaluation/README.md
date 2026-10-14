@@ -135,9 +135,7 @@ limit is 400 KB) by dropping tool calls and shortening `input`/`output`, so a la
   `mark_failed` and `count_session_progress` on `EvaluationStore` (`evaluator/store.py`); replace it with a
   class offering the same methods.
 - **Tracer:** `Trace.fetch` works for Langfuse, Logfire, OpenLLMetry and CloudWatch. This example is built
-  and tested on Langfuse, which sets the session id on every span. The same evaluation runs on Logfire in
-  [`pydanticai-logfire-trace-evaluation`](../pydanticai-logfire-trace-evaluation) and on CloudWatch in
-  [`adk-cloudwatch-trace-evaluation`](../adk-cloudwatch-trace-evaluation).
+  and tested on Langfuse, which sets the session id on every span.
 
 ## Prerequisites
 
