@@ -56,11 +56,15 @@ Nothing runs on a schedule: grading happens only when `/eval` is called.
    | Current row | Trace | New `progress` |
    |---|---|---|
    | `graded` or `unfinished` | any | unchanged |
-   | none, `pending`, `failed` or `grading` | the root span has no output | `unfinished` |
-   | none, `pending`, `failed` or `grading` | finished less than 2 minutes ago, or a span's parent isn't readable yet | `pending` |
-   | none, `pending`, `failed` or `grading` | ready | `grading` |
+   | `grading`, written less than 15 minutes ago | any | unchanged (an earlier `/eval`'s grading may still be running) |
+   | none, `pending`, `failed` or an older `grading` | the root span ended 2 minutes ago or more and has no output | `unfinished` |
+   | none, `pending`, `failed` or an older `grading` | the root span is still open or ended less than 2 minutes ago, or a span's parent isn't readable yet | `pending` |
+   | none, `pending`, `failed` or an older `grading` | ready | `grading` |
 
-4. When any trace is `grading`, invokes the request handler itself asynchronously with a `POST /grade`
+   Each write is conditional on the row still being in a state it may overwrite, so when two `/eval` calls race,
+   only one of them claims a trace for grading.
+
+4. When this call claimed any trace for grading, invokes the request handler itself asynchronously with a `POST /grade`
    request whose body is `{"session_id": ..., "trace_ids": [...]}`.
 
 `/grade` is registered like the other routes (`lambda_request_handler.py`), so the stock `Lambda.handler`
@@ -76,9 +80,10 @@ Fault handling:
 - Any other error while grading one trace marks only that row `failed` with the error. A fetch error marks
   every row of the call `failed`. The next `/eval` retries `failed` rows.
 - If the grading invocation is killed (timeout or out of memory), its rows stay `grading`. AWS's automatic retry is off,
-  so `/check` shows them as `grading` until you call `/eval` again, which queues them again.
-- Calling `/eval` while a grading is still running grades those traces twice. The rows stay correct (same
-  key, whole-row writes); only judge calls are wasted.
+  so `/check` shows them as `grading` until you call `/eval` again at least 15 minutes after they were queued
+  (longer than the 10-minute grading timeout), which queues them again.
+- Calling `/eval` while a grading is still running leaves those traces to it: they count as `grading` but are not
+  queued a second time, so no judge call is paid twice.
 
 ## Metrics
 
@@ -130,7 +135,9 @@ limit is 400 KB) by dropping tool calls and shortening `input`/`output`, so a la
   `mark_failed` and `count_session_progress` on `EvaluationStore` (`evaluator/store.py`); replace it with a
   class offering the same methods.
 - **Tracer:** `Trace.fetch` works for Langfuse, Logfire, OpenLLMetry and CloudWatch. This example is built
-  and tested on Langfuse, which sets the session id on every span.
+  and tested on Langfuse, which sets the session id on every span. The same evaluation runs on Logfire in
+  [`pydanticai-logfire-trace-evaluation`](../pydanticai-logfire-trace-evaluation) and on CloudWatch in
+  [`adk-cloudwatch-trace-evaluation`](../adk-cloudwatch-trace-evaluation).
 
 ## Prerequisites
 

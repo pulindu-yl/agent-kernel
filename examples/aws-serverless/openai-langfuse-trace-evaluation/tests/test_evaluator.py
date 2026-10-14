@@ -233,6 +233,13 @@ class TestTraceCase:
     def test_root_without_output_is_not_finished(self):
         assert not make_case(output=None).is_finished
 
+    def test_has_settled(self):
+        settle = timedelta(minutes=2)
+        ended = T0 + timedelta(seconds=3)
+        assert not make_case().has_settled(ended + settle - timedelta(seconds=1), settle)
+        assert make_case().has_settled(ended + settle, settle)
+        assert not make_case(root_end=None).has_settled(T0 + timedelta(hours=1), settle)  # still open
+
     def test_missing_parents_and_ready(self):
         settle = timedelta(minutes=2)
         case = make_case()
@@ -364,7 +371,7 @@ class TestEvaluationStore:
         store.save_results(case, self.RESULTS + [result("tool_correctness", score=None, passed=None)], T0)
         item = table.get_item(Key={"trace_id": "trace-1"})["Item"]
         assert item["progress"] == "graded" and item["session_id"] == SESSION and item["provider"] == "langfuse"
-        assert item["updated_at"] == item["evaluated_at"] == T0.isoformat()
+        assert item["updated_at"] == item["evaluated_at"] == T0.isoformat(timespec="microseconds")
         assert item["expires_at"] == int((T0 + timedelta(days=90)).timestamp())
         assert (
             item["latency_ms"] == Decimal(3000)
@@ -408,7 +415,7 @@ class TestEvaluationStore:
 
     def test_write_progress_writes_summary_and_never_downgrades_graded(self, store, table):
         case = make_case()
-        store.write_progress(case, Progress.PENDING, T0)
+        store.write_progress(case, Progress.PENDING, T0, T0)
         item = table.get_item(Key={"trace_id": "trace-1"})["Item"]
         assert (
             item["progress"] == "pending"
@@ -417,16 +424,30 @@ class TestEvaluationStore:
             and "passed" not in item
         )
 
-        store.write_progress(case, Progress.GRADING, T0 + timedelta(minutes=1))
+        store.write_progress(case, Progress.GRADING, T0 + timedelta(minutes=1), T0 + timedelta(minutes=1))
         assert table.get_item(Key={"trace_id": "trace-1"})["Item"]["progress"] == "grading"
 
         store.save_results(case, self.RESULTS, T0 + timedelta(minutes=2))
-        store.write_progress(case, Progress.GRADING, T0 + timedelta(minutes=3))
+        assert not store.write_progress(case, Progress.GRADING, T0 + timedelta(minutes=3), T0 + timedelta(minutes=3))
         assert table.get_item(Key={"trace_id": "trace-1"})["Item"]["progress"] == "graded"
+
+    def test_write_progress_claims_grading_once_per_lease(self, store, table):
+        case = make_case()
+        lease = timedelta(minutes=15)
+        assert store.write_progress(case, Progress.GRADING, T0, T0 - lease)
+        later = T0 + timedelta(minutes=5)
+        assert not store.write_progress(case, Progress.GRADING, later, later - lease)  # lease still held
+        assert not store.write_progress(case, Progress.PENDING, later, later - lease)
+        assert table.get_item(Key={"trace_id": "trace-1"})["Item"]["updated_at"] == T0.isoformat(timespec="microseconds")
+
+        expired = T0 + lease + timedelta(seconds=1)
+        assert store.write_progress(case, Progress.GRADING, expired, expired - lease)  # lease taken over
+        store.write_progress(make_case("u"), Progress.UNFINISHED, T0, T0)
+        assert not store.write_progress(make_case("u"), Progress.GRADING, expired, expired)  # unfinished is final
 
     def test_save_error_leaves_row_grading(self, store, table, monkeypatch):
         case = make_case()
-        store.write_progress(case, Progress.GRADING, T0)
+        store.write_progress(case, Progress.GRADING, T0, T0)
 
         def boom(**kwargs):
             raise ClientError(
@@ -484,7 +505,7 @@ class TestEvaluationStore:
     def test_progress_across_chunks(self, store):
         cases = [make_case(f"trace-{i}") for i in range(130)]
         for case in cases:
-            store.write_progress(case, Progress.PENDING, T0)
+            store.write_progress(case, Progress.PENDING, T0, T0)
         progress = store.read_progress([case.trace_id for case in cases] + ["unknown"])
         assert len(progress) == 130 and "unknown" not in progress
         assert progress["trace-129"].progress == Progress.PENDING and progress["trace-129"].updated_at == T0
@@ -496,10 +517,10 @@ class TestEvaluationStore:
             ("c", Progress.PENDING),
             ("d", Progress.UNFINISHED),
         ]:
-            store.write_progress(make_case(trace_id), progress, T0)
+            store.write_progress(make_case(trace_id), progress, T0, T0)
         store.mark_failed(["b"], "RuntimeError: boom", T0)
         other = make_case("e").model_copy(update={"session_id": "other"})
-        store.write_progress(other, Progress.GRADING, T0)
+        store.write_progress(other, Progress.GRADING, T0, T0)
 
         session = store.count_session_progress(SESSION)
         assert session.counts == {Progress.GRADING: 1, Progress.FAILED: 1, Progress.PENDING: 1, Progress.UNFINISHED: 1}
@@ -507,12 +528,12 @@ class TestEvaluationStore:
         assert store.count_session_progress("nobody").counts == {}
 
     def test_fail_only_touches_grading_rows(self, store, table):
-        store.write_progress(make_case("a"), Progress.GRADING, T0)
+        store.write_progress(make_case("a"), Progress.GRADING, T0, T0)
         store.save_results(make_case("b"), self.RESULTS, T0)
         store.mark_failed(["a", "b", "missing"], "x" * 5000, T0 + timedelta(minutes=1))
         a = table.get_item(Key={"trace_id": "a"})["Item"]
         assert a["progress"] == "failed" and a["error"].endswith("…[truncated]")
-        assert a["updated_at"] == (T0 + timedelta(minutes=1)).isoformat()
+        assert a["updated_at"] == (T0 + timedelta(minutes=1)).isoformat(timespec="microseconds")
         assert table.get_item(Key={"trace_id": "b"})["Item"]["progress"] == "graded"
         assert "Item" not in table.get_item(Key={"trace_id": "missing"})
 
@@ -567,19 +588,24 @@ class TestTraceEvaluationJob:
             Spans.request("new-ready")
             + Spans.request("new-settling", start=500)  # ends 1.5 minutes before NOW
             + Spans.request("new-no-output", output=None)
+            + Spans.request("new-settling-no-output", start=500, output=None)  # its output may still land
+            + Spans.request("new-open", root_end=None)  # still running, or its root not ingested in full
             + Spans.request("was-pending")
             + Spans.request("was-grading")
+            + Spans.request("was-grading-expired")
             + Spans.request("was-failed")
             + Spans.request("was-graded")
             + Spans.request("was-unfinished")
         )
         earlier = T0 + timedelta(minutes=1)
-        store.write_progress(make_case("was-pending"), Progress.PENDING, earlier)
-        store.write_progress(make_case("was-grading"), Progress.GRADING, earlier)
-        store.write_progress(make_case("was-failed"), Progress.GRADING, earlier)
+        store.write_progress(make_case("was-pending"), Progress.PENDING, earlier, earlier)
+        store.write_progress(make_case("was-grading"), Progress.GRADING, earlier, earlier)
+        long_ago = self.NOW - timedelta(minutes=20)  # its grading invocation died
+        store.write_progress(make_case("was-grading-expired"), Progress.GRADING, long_ago, long_ago)
+        store.write_progress(make_case("was-failed"), Progress.GRADING, earlier, earlier)
         store.mark_failed(["was-failed"], "boom", earlier)
         store.save_results(make_case("was-graded"), [result("task_completion")], earlier)
-        store.write_progress(make_case("was-unfinished"), Progress.UNFINISHED, earlier)
+        store.write_progress(make_case("was-unfinished"), Progress.UNFINISHED, earlier, earlier)
 
         summary = self.job(store, FakeTrace(spans), factory_calls).prepare_traces(SESSION)
         progress = store.read_progress(
@@ -589,8 +615,11 @@ class TestTraceEvaluationJob:
                     "new-ready",
                     "new-settling",
                     "new-no-output",
+                    "new-settling-no-output",
+                    "new-open",
                     "was-pending",
                     "was-grading",
+                    "was-grading-expired",
                     "was-failed",
                     "was-graded",
                     "was-unfinished",
@@ -601,24 +630,47 @@ class TestTraceEvaluationJob:
             "new-ready": Progress.GRADING,
             "new-settling": Progress.PENDING,
             "new-no-output": Progress.UNFINISHED,
+            "new-settling-no-output": Progress.PENDING,
+            "new-open": Progress.PENDING,
             "was-pending": Progress.GRADING,
             "was-grading": Progress.GRADING,
+            "was-grading-expired": Progress.GRADING,
             "was-failed": Progress.GRADING,
             "was-graded": Progress.GRADED,
             "was-unfinished": Progress.UNFINISHED,
         }
-        assert progress["was-grading"].updated_at == self.NOW  # queued again
+        assert progress["was-grading"].updated_at == earlier  # still within the earlier lease: not queued again
+        assert progress["was-grading-expired"].updated_at == self.NOW  # lease expired: queued again
         assert progress["was-graded"].updated_at == earlier and progress["was-unfinished"].updated_at == earlier
         assert (summary.found, summary.grading, summary.pending, summary.unfinished, summary.already_graded) == (
-            8,
-            4,
-            1,
+            11,
+            5,
+            3,
             2,
             1,
         )
-        assert sorted(summary.grading_ids) == ["new-ready", "was-failed", "was-grading", "was-pending"]
+        assert sorted(summary.grading_ids) == ["new-ready", "was-failed", "was-grading-expired", "was-pending"]
         assert summary.spans_fetched == len(spans)
         assert factory_calls == []  # prepare never builds the judges
+
+    def test_repeated_prepare_queues_a_trace_once(self, store, factory_calls):
+        trace = FakeTrace(Spans.request("a"))
+        assert self.job(store, trace, factory_calls).prepare_traces(SESSION).grading_ids == ["a"]
+        summary = self.job(store, trace, factory_calls).prepare_traces(SESSION)
+        assert summary.grading == 1 and summary.grading_ids == []
+
+    def test_prepare_losing_the_claim_race_does_not_queue(self, store, factory_calls, monkeypatch):
+        store.write_progress(make_case("a"), Progress.GRADING, self.NOW, self.NOW)  # another /eval claimed it
+        read_progress = store.read_progress
+        reads = []
+
+        def stale_first_read(trace_ids):
+            reads.append(trace_ids)
+            return {} if len(reads) == 1 else read_progress(trace_ids)  # read before the other /eval's write
+
+        monkeypatch.setattr(store, "read_progress", stale_first_read)
+        summary = self.job(store, FakeTrace(Spans.request("a")), factory_calls).prepare_traces(SESSION)
+        assert summary.grading == 1 and summary.grading_ids == []
 
     def test_no_root_gets_no_row(self, store, table, factory_calls):
         spans = [s for s in Spans.request("rootless") if s.parent_span_id is not None]
@@ -632,7 +684,7 @@ class TestTraceEvaluationJob:
             store, trace, factory_calls, [FakeEvaluator("task_completion"), FakeEvaluator("hallucination", score=None)]
         )
         job.prepare_traces(SESSION)
-        store.write_progress(make_case("c"), Progress.PENDING, self.NOW)  # moved on meanwhile
+        store.write_progress(make_case("c"), Progress.PENDING, self.NOW, self.NOW + timedelta(days=1))  # moved on
 
         summary = job.grade_traces(SESSION, ["a", "c"])
         assert (summary.graded, summary.failed, summary.metric_errors) == (1, 0, 1)
@@ -791,7 +843,7 @@ class TestEvaluationAPI:
 
     def test_check_mixed_session(self, parts, store):
         for trace_id in ("a", "b", "c"):
-            store.write_progress(make_case(trace_id), Progress.GRADING, T0)
+            store.write_progress(make_case(trace_id), Progress.GRADING, T0, T0)
         store.save_results(make_case("a"), [result("task_completion")], T0)
         store.save_results(make_case("b"), [result("task_completion")], T0)
         store.mark_failed(["c"], "boom", T0)

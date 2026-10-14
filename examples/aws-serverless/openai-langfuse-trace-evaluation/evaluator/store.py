@@ -77,19 +77,32 @@ class EvaluationStore:
                 )
         return progress_by_id
 
-    def write_progress(self, case: TraceCase, progress: Progress, now: datetime) -> None:
-        """Writes the trace's summary row with ``progress``; a graded row is never downgraded."""
+    def write_progress(self, case: TraceCase, progress: Progress, now: datetime, lease_expired_before: datetime) -> bool:
+        """Writes the trace's summary row with ``progress``; returns False when the row may not be overwritten.
+
+        Only a new row, a pending or failed one, or a grading one whose lease began before ``lease_expired_before``
+        is overwritten, atomically: graded and unfinished rows stay final, and only one /eval claims a trace.
+        """
         try:
             self._table.put_item(
                 Item=self._shrink_to_item_limit(self._build_trace_row(case, progress, now)),
-                ConditionExpression="attribute_not_exists(trace_id) OR #p <> :graded",
-                ExpressionAttributeNames={"#p": "progress"},
-                ExpressionAttributeValues={":graded": Progress.GRADED.value},
+                ConditionExpression=(
+                    "attribute_not_exists(trace_id) OR #p IN (:pending, :failed) OR (#p = :grading AND #u < :expired)"
+                ),
+                ExpressionAttributeNames={"#p": "progress", "#u": "updated_at"},
+                ExpressionAttributeValues={
+                    ":pending": Progress.PENDING.value,
+                    ":failed": Progress.FAILED.value,
+                    ":grading": Progress.GRADING.value,
+                    ":expired": self._to_utc_iso(lease_expired_before),
+                },
             )
         except ClientError as e:
             if not self._is_condition_check_failure(e):
                 raise
-            _log.info(f"trace {case.trace_id} is already graded; left as is")
+            _log.info(f"trace {case.trace_id} is final or claimed by another /eval; left as is")
+            return False
+        return True
 
     def save_results(self, case: TraceCase, results: list[AKEvaluationResult], now: datetime) -> None:
         """Writes the whole graded row in one PutItem, so every metric column lands at once."""
@@ -262,8 +275,8 @@ class EvaluationStore:
 
     @staticmethod
     def _to_utc_iso(value: datetime) -> str:
-        """Formats a datetime as an ISO 8601 string in UTC."""
-        return value.astimezone(timezone.utc).isoformat()
+        """Formats a datetime as an ISO 8601 string in UTC, always with microseconds so strings sort by time."""
+        return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
     @classmethod
     def _item_bytes(cls, row: dict) -> int:

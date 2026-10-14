@@ -86,6 +86,11 @@ class TestTraceQuery:
         query = TraceQuery(kinds=["tool"])
         assert query.accepts(SpanKind.TOOL) and not query.accepts(SpanKind.LLM)
 
+    @pytest.mark.parametrize("filters", [{"kinds": []}, {"trace_ids": []}, {"session_id": ""}, {"name": ""}])
+    def test_rejects_empty_filters(self, filters):
+        with pytest.raises(ValueError, match="non-empty"):
+            TraceQuery(**filters)
+
 
 # --- OTelSpanClassifier (attribute shapes taken from captured AK runs) ------------------------------------
 

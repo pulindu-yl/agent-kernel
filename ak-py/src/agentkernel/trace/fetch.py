@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, ClassVar, Iterable, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SpanKind(str, Enum):
@@ -39,6 +39,14 @@ class TraceQuery(BaseModel):
     trace_ids: Optional[list[str]] = Field(default=None, description="Only return spans of these traces")
     name: Optional[str] = Field(default=None, description="Only return spans with exactly this name")
     limit: int = Field(default=1000, gt=0, description="Maximum number of spans to return; when more match, the most recent ones are kept")
+
+    @field_validator("kinds", "session_id", "trace_ids", "name")
+    @classmethod
+    def _reject_empty_filter(cls, value: Any) -> Any:
+        """An empty filter matches nothing, and providers would otherwise read it as an invalid or unfiltered query."""
+        if value is not None and len(value) == 0:
+            raise ValueError("must be non-empty, or None to not filter on it")
+        return value
 
     def window(self) -> tuple[datetime, datetime]:
         """Resolve the time window to timezone-aware UTC datetimes."""

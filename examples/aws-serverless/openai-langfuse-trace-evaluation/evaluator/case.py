@@ -46,9 +46,13 @@ class TraceCase(BaseModel):
         """The run itself ended: the root span has an end time and an output."""
         return self.ended_at is not None and self.output != ""
 
+    def has_settled(self, now: datetime, settle_time: timedelta) -> bool:
+        """The root span ended at least ``settle_time`` ago, so its output and late spans have had time to land."""
+        return self.ended_at is not None and self.ended_at <= now - settle_time
+
     def is_ready_to_grade(self, now: datetime, settle_time: timedelta) -> bool:
-        """Finished, ended at least ``settle_time`` ago, and every span's parent is readable."""
-        return self.is_finished and self.ended_at <= now - settle_time and self.spans_missing_parent == 0
+        """Finished, settled, and every span's parent is readable."""
+        return self.is_finished and self.has_settled(now, settle_time) and self.spans_missing_parent == 0
 
     @property
     def latency_ms(self) -> int | None:

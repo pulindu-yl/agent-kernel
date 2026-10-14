@@ -23,10 +23,10 @@ class PrepareSummary(BaseModel):
     found: int = 0  # traces with exactly one root span
     no_root: int = 0  # traces with no root span (or several): no row
     already_graded: int = 0  # row already graded
-    grading: int = 0  # marked grading now
+    grading: int = 0  # claimed by this call, or still within an earlier call's lease
     pending: int = 0
     unfinished: int = 0
-    grading_ids: list[str] = []  # sent to grade in the invoke payload
+    grading_ids: list[str] = []  # claimed by this call; sent to grade in the invoke payload
 
 
 class GradeSummary(BaseModel):
@@ -42,6 +42,7 @@ class TraceEvaluationJob:
     FETCH_WINDOW = timedelta(hours=24)
     FETCH_LIMIT = 5_000
     SETTLE_TIME = timedelta(minutes=2)
+    GRADING_LEASE = timedelta(minutes=15)  # above the grading invocation's 10-minute Lambda timeout
 
     def __init__(
         self,
@@ -80,16 +81,14 @@ class TraceEvaluationJob:
         )
         progress_by_id = self._store.read_progress([case.trace_id for case in cases])
         for case in cases:
-            current_progress = progress_by_id.get(case.trace_id)
-            next_progress = self._next_progress(case, current_progress, now)
-            if next_progress is not None:
-                self._store.write_progress(case, next_progress, now)
-            match next_progress or current_progress.progress:
+            progress, claimed = self._advance_progress(case, progress_by_id.get(case.trace_id), now)
+            match progress:
                 case Progress.GRADED:
                     summary.already_graded += 1
                 case Progress.GRADING:
                     summary.grading += 1
-                    summary.grading_ids.append(case.trace_id)
+                    if claimed:
+                        summary.grading_ids.append(case.trace_id)
                 case Progress.PENDING:
                     summary.pending += 1
                 case Progress.UNFINISHED:
@@ -164,14 +163,27 @@ class TraceEvaluationJob:
                 cases.append(case)
         return sorted(cases, key=lambda case: case.started_at), rootless_traces
 
+    def _advance_progress(self, case: TraceCase, current: TraceProgress | None, now: datetime) -> tuple[Progress, bool]:
+        """Writes the trace's next progress; returns its progress and whether this call claimed it for grading."""
+        next_progress = self._next_progress(case, current, now)
+        if next_progress is None:
+            return current.progress, False
+        if self._store.write_progress(case, next_progress, now, now - self.GRADING_LEASE):
+            return next_progress, next_progress == Progress.GRADING
+        # a concurrent /eval wrote the row between the read and this write; report what it wrote
+        return self._store.read_progress([case.trace_id])[case.trace_id].progress, False
+
     def _next_progress(self, case: TraceCase, current: TraceProgress | None, now: datetime) -> Progress | None:
         """The progress to write for the trace, or None to leave its row as it is."""
-        if current is not None and current.progress in (Progress.GRADED, Progress.UNFINISHED):
-            return None
-        if not case.is_finished:
-            return Progress.UNFINISHED
+        if current is not None:
+            if current.progress in (Progress.GRADED, Progress.UNFINISHED):
+                return None
+            if current.progress == Progress.GRADING and current.updated_at >= now - self.GRADING_LEASE:
+                return None  # an earlier /eval's grading invocation may still be running
+        if case.has_settled(now, self.SETTLE_TIME) and not case.is_finished:
+            return Progress.UNFINISHED  # the root ended long enough ago and still has no output
         if not case.is_ready_to_grade(now, self.SETTLE_TIME):
-            return Progress.PENDING
+            return Progress.PENDING  # still running, recently ended, or partly ingested
         return Progress.GRADING
 
     def _run_evaluators(self, case: TraceCase) -> list[AKEvaluationResult]:
