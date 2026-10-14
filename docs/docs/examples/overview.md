@@ -113,6 +113,8 @@ AWS Lambda serverless deployment examples:
 - **`schedule-openai/`** - Deferred and recurring chats on AWS Lambda: EventBridge Scheduler delivers each occurrence into the Input Queue for the agent-runner Lambda, backed by a DynamoDB schedule store
 - **`slack-openai/`** - Slack messaging integration on AWS Lambda: webhooks are served by the request-handler Lambda and replies are delivered by the response-handler Lambda
 - **`openai-langfuse-trace-evaluation/`** - Evaluation on production traffic: an OpenAI agent on AWS Lambda (queue mode) traced to Langfuse, whose traces are read back with `Trace.fetch()`, graded by Opik LLM judges behind `/eval` and `/check` routes, and stored in DynamoDB
+- **`pydanticai-logfire-trace-evaluation/`** - The same evaluation on production traffic for a Pydantic AI agent traced to Logfire
+- **`adk-cloudwatch-trace-evaluation/`** - The same evaluation on production traffic for a Google ADK agent traced to AWS CloudWatch (Transaction Search)
 
 ### 📁 Azure Containerized Examples (`/examples/azure-containerized`)
 

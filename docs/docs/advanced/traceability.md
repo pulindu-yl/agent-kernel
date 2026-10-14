@@ -651,7 +651,8 @@ Provider limits to keep in mind:
 - **Logfire:** spans are readable ~5 minutes after ingestion; queries return at most 10,000 rows, so larger
   fetches are paged automatically.
 - **Traceloop:** fetching is best effort. The free plan keeps spans for 24 hours only, and the warehouse
-  API's filter ids haven't been verified against a live account. `kinds` is applied only after the spans
+  API is undocumented beyond its basics; its session, trace id and time filters and its cursor paging have
+  been checked against a live account (LangGraph spans). `kinds` is applied only after the spans
   arrive (a span's kind can come from either of two attributes, and the API can't OR them), so a
   kind-filtered fetch pages through every span in the window.
 - **CloudWatch:** only spans ingested through Transaction Search are readable, since they are what lands in
@@ -694,6 +695,8 @@ class TestMyTraceFetch(TraceFetchContract):
 
 For an end-to-end use of `fetch` and `usage`, see the [`openai-langfuse-trace-evaluation` example](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/aws-serverless/openai-langfuse-trace-evaluation): an agent on
 AWS Lambda whose Langfuse traces are read back per session, graded by Opik LLM judges and stored in DynamoDB.
+The same evaluation runs on Logfire in [`pydanticai-logfire-trace-evaluation`](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/aws-serverless/pydanticai-logfire-trace-evaluation)
+and on CloudWatch in [`adk-cloudwatch-trace-evaluation`](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/aws-serverless/adk-cloudwatch-trace-evaluation).
 
 ## Integrate with Your Own Traceability Platform
 
