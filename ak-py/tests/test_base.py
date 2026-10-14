@@ -6,6 +6,7 @@ import pytest
 
 from agentkernel.core.base import Agent, Runner, Session
 from agentkernel.core.model import AgentReply, AgentRequest, AgentRequestText, SystemTool
+from agentkernel.core.session.serde import BinarySerde
 from agentkernel.core.tool import SystemToolFactory
 
 
@@ -139,6 +140,52 @@ def test_get_framework_session_scoped_to_current_agents_runner_name():
     session.set("openai", "native-openai-session")
     with agent._activate():
         assert session.get_framework_session() is None
+
+
+class TestSessionLogging:
+    """Session debug logs name the key, never the value, under one configurable logger."""
+
+    def test_get_and_set_log_the_key_but_not_the_value(self, caplog):
+        session = Session("test-session")
+        with caplog.at_level(logging.DEBUG):
+            session.get_non_volatile_cache().set("walledai_pii_mapping", {"[PERSON_1]": "Jane Doe"})
+            session.set("custom", "secret-value")
+            session.get("custom")
+            session.get("missing")
+
+        assert "Jane Doe" not in caplog.text
+        assert "secret-value" not in caplog.text
+        assert "[test-session] Retrieved session data object for key nv_cache (found=True)" in caplog.text
+        assert "[test-session] Setting session data object for key custom" in caplog.text
+        assert "[test-session] Retrieved session data object for key missing (found=False)" in caplog.text
+
+    def test_serde_logs_the_type_but_not_the_value(self, caplog):
+        session = Session("test-session")
+        session.get_non_volatile_cache().set("walledai_pii_mapping", {"[PERSON_1]": "Jane Doe"})
+        with caplog.at_level(logging.DEBUG):
+            for _, value in session.get_all():
+                BinarySerde.loads(BinarySerde.dumps(value))
+
+        assert "Jane Doe" not in caplog.text
+        assert "dumped: KeyValueCache" in caplog.text
+
+    def test_logger_is_not_named_per_session(self, caplog):
+        session = Session("test-session")
+        with caplog.at_level(logging.DEBUG, logger="ak.core.session"):
+            session.get("custom")
+
+        assert {record.name for record in caplog.records} == {"ak.core.session"}
+
+    def test_raising_the_session_logger_level_silences_it(self, caplog):
+        session = Session("test-session")
+        # set_level also sets the capture handler's level, so lower it to DEBUG last.
+        caplog.set_level(logging.INFO, logger="ak.core.session")
+        caplog.set_level(logging.DEBUG)
+        session.get("custom")
+        logging.getLogger("ak.core.runner").debug("runner debug still flows")
+
+        assert not [record for record in caplog.records if record.name.startswith("ak.core.session")]
+        assert "runner debug still flows" in caplog.text
 
 
 class ToolCarryingAgent(MockAgent):

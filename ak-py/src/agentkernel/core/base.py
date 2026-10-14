@@ -70,7 +70,7 @@ class Session:
         Initializes a Session instance.
         :param id: Unique identifier for the session.
         """
-        self._log: logging.Logger = logging.getLogger(f"ak.core.session [{id}]")
+        self._log: logging.Logger = logging.getLogger("ak.core.session")
         self._id: str = id
         self._data: dict[str, Any] = {}
         self._lock: asyncio.Lock = asyncio.Lock()
@@ -145,7 +145,7 @@ class Session:
         if there is no data object with the specified key.
         """
         result = self._data.get(key)
-        self._log.debug(f"Retrieved session data object for key {key}: {result}")
+        self._log.debug(f"[{self._id}] Retrieved session data object for key {key} (found={key in self._data})")
         return result
 
     def get_all(self, durable: bool = True, volatile: bool = True) -> Iterator[tuple[str, Any]]:
@@ -227,7 +227,7 @@ class Session:
         :param key: The key of the session data object.
         :param value: The session data object.
         """
-        self._log.debug(f"Setting session data object for key {key}: {value}")
+        self._log.debug(f"[{self._id}] Setting session data object for key {key}")
         self._data[key] = value
         return value
 
@@ -237,14 +237,14 @@ class Session:
         :param key: The key of the session data object to be deleted.
         """
         if key in self._data:
-            self._log.debug(f"Deleting session data object for key {key}")
+            self._log.debug(f"[{self._id}] Deleting session data object for key {key}")
             del self._data[key]
 
     def clear(self) -> None:
         """
         Clears all session data objects.
         """
-        self._log.debug(f"Clearing all session data objects")
+        self._log.debug(f"[{self._id}] Clearing all session data objects")
         self._data = {
             Session.Keys.VOLATILE_CACHE.value: self.get_volatile_cache(),
             Session.Keys.NON_VOLATILE_CACHE.value: self.get_non_volatile_cache(),
