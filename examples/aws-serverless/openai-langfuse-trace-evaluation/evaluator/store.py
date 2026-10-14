@@ -77,7 +77,9 @@ class EvaluationStore:
                 )
         return progress_by_id
 
-    def write_progress(self, case: TraceCase, progress: Progress, now: datetime, lease_expired_before: datetime) -> bool:
+    def write_progress(
+        self, case: TraceCase, progress: Progress, now: datetime, lease_expired_before: datetime
+    ) -> bool:
         """Writes the trace's summary row with ``progress``; returns False when the row may not be overwritten.
 
         Only a new row, a pending or failed one, or a grading one whose lease began before ``lease_expired_before``

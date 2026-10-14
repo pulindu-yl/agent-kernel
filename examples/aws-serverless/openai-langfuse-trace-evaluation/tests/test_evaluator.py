@@ -438,7 +438,9 @@ class TestEvaluationStore:
         later = T0 + timedelta(minutes=5)
         assert not store.write_progress(case, Progress.GRADING, later, later - lease)  # lease still held
         assert not store.write_progress(case, Progress.PENDING, later, later - lease)
-        assert table.get_item(Key={"trace_id": "trace-1"})["Item"]["updated_at"] == T0.isoformat(timespec="microseconds")
+        assert table.get_item(Key={"trace_id": "trace-1"})["Item"]["updated_at"] == T0.isoformat(
+            timespec="microseconds"
+        )
 
         expired = T0 + lease + timedelta(seconds=1)
         assert store.write_progress(case, Progress.GRADING, expired, expired - lease)  # lease taken over
