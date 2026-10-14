@@ -1051,9 +1051,9 @@ ak-py/src/agentkernel/
 │   ├── bedrock.py           # AWS Bedrock guardrails
 │   └── walledai.py          # Walled AI guardrails (safety + PII redaction)
 ├── trace/                   # Observability
-│   ├── base.py              # BaseTrace (+ optional, non-abstract fetch(query))
-│   ├── trace.py             # Trace factory (+ Trace.fetch facade: TraceQuery or keyword filters)
-│   ├── fetch.py             # SpanKind, TraceQuery, SpanUsage, FetchedSpan, OTelSpanClassifier (provider-neutral read model); TraceFetcher (internal base of the built-in fetchers)
+│   ├── base.py              # BaseTrace (+ optional, non-abstract fetch_spans(query))
+│   ├── trace.py             # Trace factory (+ Trace.fetch_spans + fetch_traces facade: TraceQuery or keyword filters)
+│   ├── fetch.py             # SpanKind, SpanStatus, TraceQuery, SpanUsage, FetchedSpan, FetchedTrace, OTelSpanClassifier (provider-neutral read model); TraceFetcher (internal base of the built-in fetchers)
 │   ├── testing.py           # TraceFetchContract conformance suite (imports pytest; test code only)
 │   ├── langfuse/            # Langfuse adapter (+ fetch.py: v2 observations API; runners flush on AWS Lambda)
 │   ├── openllmetry/         # OpenLLMetry adapter (+ fetch.py: Traceloop warehouse REST API)

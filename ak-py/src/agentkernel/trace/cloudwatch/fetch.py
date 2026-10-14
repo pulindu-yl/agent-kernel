@@ -9,7 +9,7 @@ from functools import partial
 from typing import Any, Iterable, Optional
 
 from ...core.util.factory import AKConfigError
-from ..fetch import FetchedSpan, OTelSpanClassifier, SpanKind, TraceFetcher, TraceQuery
+from ..fetch import FetchedSpan, OTelSpanClassifier, SpanKind, SpanStatus, TraceFetcher, TraceQuery
 
 
 class CloudWatchTraceFetcher(TraceFetcher):
@@ -142,6 +142,7 @@ class CloudWatchTraceFetcher(TraceFetcher):
             parent_span_id=record.get("parentSpanId") or None,
             name=record.get("name"),
             kind=OTelSpanClassifier.classify(attributes, record.get("name")),
+            status=SpanStatus.of((record.get("status") or {}).get("code") if isinstance(record.get("status"), dict) else record.get("status")),
             start_time=self._nanos(record.get("startTimeUnixNano")),
             end_time=self._nanos(record.get("endTimeUnixNano")),
             session_id=OTelSpanClassifier.session_id(attributes),

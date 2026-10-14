@@ -93,10 +93,10 @@ class LangFuse(BaseTrace):
 
         return LangFusePydanticAIRunner(self._client)
 
-    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+    def fetch_spans(self, query: TraceQuery) -> list[FetchedSpan]:
         """
         Fetches observations back from Langfuse with the same client used for sending.
         """
         from .fetch import LangfuseTraceFetcher
 
-        return LangfuseTraceFetcher(self._client).fetch(query)
+        return LangfuseTraceFetcher(self._client).fetch_spans(query)

@@ -16,7 +16,7 @@ import pytest
 from agentkernel.core.config import AKConfig
 from agentkernel.core.util.factory import AKConfigError
 from agentkernel.secret import SecretManager
-from agentkernel.trace import FetchedSpan, SpanKind, SpanUsage, TraceQuery
+from agentkernel.trace import FetchedSpan, FetchedTrace, SpanKind, SpanStatus, SpanUsage, TraceQuery
 from agentkernel.trace.base import BaseTrace
 from agentkernel.trace.cloudwatch.fetch import CloudWatchTraceFetcher
 from agentkernel.trace.fetch import OTelSpanClassifier, TraceFetcher
@@ -163,7 +163,7 @@ class _FetchingTrace(BaseTrace):
 
     langgraph = crewai = adk = smolagents = pydanticai = openai
 
-    def fetch(self, query):
+    def fetch_spans(self, query):
         self.queries.append(query)
         return []
 
@@ -174,32 +174,130 @@ class TestTraceFetch:
         cfg.trace.enabled = False
         with patch.object(AKConfig, "get", return_value=cfg):
             with pytest.raises(AKConfigError):
-                Trace.get().fetch()
+                Trace.get().fetch_spans()
 
     def test_keyword_filters_build_a_query(self):
         tracer = _FetchingTrace()
-        Trace(tracer).fetch(last=timedelta(hours=6), kinds=[SpanKind.TOOL], session_id="s-1")
+        Trace(tracer).fetch_spans(last=timedelta(hours=6), kinds=[SpanKind.TOOL], session_id="s-1")
         (query,) = tracer.queries
         assert query.last == timedelta(hours=6) and query.kinds == [SpanKind.TOOL] and query.session_id == "s-1"
 
     def test_explicit_query_is_passed_through(self):
         tracer = _FetchingTrace()
         query = TraceQuery(limit=5)
-        Trace(tracer).fetch(query)
+        Trace(tracer).fetch_spans(query)
         assert tracer.queries == [query]
 
     def test_query_with_keyword_filters_raises(self):
         tracer = _FetchingTrace()
         with pytest.raises(ValueError, match="not both"):
-            Trace(tracer).fetch(TraceQuery(limit=5), session_id="s-1")
+            Trace(tracer).fetch_spans(TraceQuery(limit=5), session_id="s-1")
         assert tracer.queries == []
 
     def test_base_trace_without_fetch_raises_not_implemented(self):
         class SendOnly(_FetchingTrace):
-            fetch = BaseTrace.fetch
+            fetch_spans = BaseTrace.fetch_spans
 
         with pytest.raises(NotImplementedError):
-            Trace(SendOnly()).fetch()
+            Trace(SendOnly()).fetch_spans()
+
+
+class TestSpanStatus:
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            ("ERROR", SpanStatus.ERROR),
+            ("STATUS_CODE_ERROR", SpanStatus.ERROR),
+            (2, SpanStatus.ERROR),
+            ("OK", SpanStatus.OK),
+            (1, SpanStatus.OK),
+            ("UNSET", SpanStatus.UNSET),
+            (0, SpanStatus.UNSET),
+            (None, SpanStatus.UNSET),
+            (True, SpanStatus.UNSET),
+            ("weird", SpanStatus.UNSET),
+        ],
+    )
+    def test_of(self, value, expected):
+        assert SpanStatus.of(value) is expected
+
+
+def _tspan(span_id, minute, parent=None, kind=SpanKind.SPAN, trace_id="t1", usage=None, **extra):
+    return FetchedSpan(
+        provider="fake", trace_id=trace_id, span_id=span_id, parent_span_id=parent, start_time=_ts(minute), kind=kind, usage=usage, **extra
+    )
+
+
+class TestFetchedTrace:
+    def test_group_keeps_span_order_and_orders_traces_by_first_span(self):
+        spans = [_tspan("a1", 1, trace_id="a"), _tspan("b1", 2, trace_id="b"), _tspan("a2", 3, parent="a1", trace_id="a")]
+
+        traces = FetchedTrace.group(spans)
+
+        assert [trace.trace_id for trace in traces] == ["a", "b"]
+        assert [span.span_id for span in traces[0].spans] == ["a1", "a2"]
+
+    def test_root_inputs_and_times(self):
+        root = _tspan("root", 1, input="question", output="answer", end_time=_ts(5), session_id="s-1")
+        (trace,) = FetchedTrace.group([root, _tspan("child", 2, parent="root")])
+
+        assert trace.root is root and trace.user_input == "question" and trace.output == "answer"
+        assert trace.started_at == _ts(1) and trace.ended_at == _ts(5) and trace.session_id == "s-1"
+
+    def test_no_root_when_every_span_has_a_parent(self):
+        (trace,) = FetchedTrace.group([_tspan("child", 2, parent="lost")])
+
+        assert trace.root is None and trace.user_input is None and trace.output is None
+        assert trace.started_at is None and trace.ended_at is None
+
+    def test_no_root_when_two_spans_have_no_parent(self):
+        (trace,) = FetchedTrace.group([_tspan("one", 1), _tspan("two", 2)])
+
+        assert trace.root is None
+
+    def test_tool_spans_and_agent_names(self):
+        spans = [
+            _tspan("root", 1),
+            _tspan("a1", 2, "root", SpanKind.AGENT, name="Triage"),
+            _tspan("t1", 3, "a1", SpanKind.TOOL, name="get_weather"),
+            _tspan("a2", 4, "root", SpanKind.AGENT, name="Triage"),
+            _tspan("a3", 5, "root", SpanKind.AGENT, name="Weather"),
+        ]
+        (trace,) = FetchedTrace.group(spans)
+
+        assert [span.span_id for span in trace.tool_spans] == ["t1"]
+        assert trace.agent_names == ["Triage", "Weather"]
+
+    def test_usage_sums_and_leaves_unreported_fields_none(self):
+        spans = [
+            _tspan("a", 1, usage=SpanUsage(input_tokens=10, output_tokens=2, total_tokens=12, cost=0.5)),
+            _tspan("b", 2, usage=SpanUsage(input_tokens=5, total_tokens=5)),
+            _tspan("c", 3),
+        ]
+        (trace,) = FetchedTrace.group(spans)
+
+        assert trace.usage == SpanUsage(input_tokens=15, output_tokens=2, total_tokens=17, cost=0.5)
+        assert FetchedTrace.group([_tspan("x", 1)])[0].usage == SpanUsage()
+
+
+class TestTraceFetchTraces:
+    def test_groups_the_fetched_spans(self):
+        class Tracer(_FetchingTrace):
+            def fetch_spans(self, query):
+                return [_tspan("r", 1), _tspan("c", 2, "r")]
+
+        (trace,) = Trace(Tracer()).fetch_traces(session_id="s-1")
+
+        assert trace.root.span_id == "r" and len(trace.spans) == 2
+
+    @pytest.mark.parametrize("filters", [{"kinds": [SpanKind.TOOL]}, {"name": "x"}])
+    def test_rejects_per_span_filters(self, filters):
+        with pytest.raises(ValueError, match="kinds or name"):
+            Trace(_FetchingTrace()).fetch_traces(**filters)
+
+    def test_disabled_tracing_raises(self):
+        with pytest.raises(AKConfigError):
+            Trace().fetch_traces()
 
 
 # --- TraceFetcher (the built-ins' shared paging and merge) ---------------------------------------------------
@@ -241,7 +339,7 @@ class TestTraceFetcher:
                 windows.extend([query.window(), query.window()])
                 return [_span("edge", 59)] if query.matches(_span("edge", 59)) else []
 
-        spans = WindowRecorder().fetch(TraceQuery(last=timedelta(minutes=5)))
+        spans = WindowRecorder().fetch_spans(TraceQuery(last=timedelta(minutes=5)))
         # the clock moved on every now() call, yet every window seen inside the fetch is the first one
         assert windows[0] == windows[1] == (END - timedelta(minutes=5) + timedelta(seconds=1), END + timedelta(seconds=1))
         assert AdvancingClock.ticks == 1 and [span.span_id for span in spans] == ["edge"]
@@ -249,13 +347,13 @@ class TestTraceFetcher:
     def test_fetch_keeps_the_first_span_per_id_and_the_newest_limit(self):
         first_a = _span("a", 1)
         fetcher = _ScriptedFetcher([_span("c", 3), first_a, _span("b", 2), _span("a", 9)])
-        spans = fetcher.fetch(TraceQuery(start=START, end=END, limit=2))
+        spans = fetcher.fetch_spans(TraceQuery(start=START, end=END, limit=2))
         assert [span.span_id for span in spans] == ["b", "c"]
-        assert fetcher.fetch(TraceQuery(start=START, end=END))[0] is first_a
+        assert fetcher.fetch_spans(TraceQuery(start=START, end=END))[0] is first_a
 
     def test_fetch_keeps_spans_sharing_an_id_across_traces(self):
         fetcher = _ScriptedFetcher([_span("a", 1, trace_id="t1"), _span("a", 2, trace_id="t2")])
-        spans = fetcher.fetch(TraceQuery(start=START, end=END))
+        spans = fetcher.fetch_spans(TraceQuery(start=START, end=END))
         assert [span.trace_id for span in spans] == ["t1", "t2"]
 
     @pytest.mark.parametrize(
@@ -390,7 +488,7 @@ class TestLangfuseFetcher:
         client = MagicMock()
         client.api.observations.get_many.side_effect = [_page([_observation("b", minute=5)], cursor="c1"), _page([_observation("a", minute=1)])]
 
-        spans = LangfuseTraceFetcher(client).fetch(TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL], session_id="s-1"))
+        spans = LangfuseTraceFetcher(client).fetch_spans(TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL], session_id="s-1"))
 
         assert [span.span_id for span in spans] == ["a", "b"]  # oldest first
         first = spans[0]
@@ -400,11 +498,19 @@ class TestLangfuseFetcher:
         assert calls[0].kwargs["from_start_time"] == START and calls[0].kwargs["to_start_time"] == END
         assert calls[1].kwargs["cursor"] == "c1"
 
+    def test_maps_level_error_to_status(self):
+        client = MagicMock()
+        client.api.observations.get_many.return_value = _page([_observation("bad", level="ERROR"), _observation("fine", minute=2, level="DEFAULT")])
+
+        spans = LangfuseTraceFetcher(client).fetch_spans(TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL]))
+
+        assert {span.span_id: span.status for span in spans} == {"bad": SpanStatus.ERROR, "fine": SpanStatus.UNSET}
+
     def test_requests_full_attribute_metadata(self):
         client = MagicMock()
         client.api.observations.get_many.return_value = _page([])
 
-        LangfuseTraceFetcher(client).fetch(TraceQuery(start=START, end=END))
+        LangfuseTraceFetcher(client).fetch_spans(TraceQuery(start=START, end=END))
 
         assert client.api.observations.get_many.call_args.kwargs["expand_metadata"] == "attributes"
 
@@ -413,7 +519,7 @@ class TestLangfuseFetcher:
         client = MagicMock()
         client.api.observations.get_many.return_value = _page([observation, _observation("t")])
 
-        spans = LangfuseTraceFetcher(client).fetch(TraceQuery(start=START, end=END))
+        spans = LangfuseTraceFetcher(client).fetch_spans(TraceQuery(start=START, end=END))
 
         usage = {span.span_id: span.usage for span in spans}
         assert usage["g"] == SpanUsage(input_tokens=42, output_tokens=7, total_tokens=49, cost=1.05e-05)
@@ -423,7 +529,7 @@ class TestLangfuseFetcher:
         client = MagicMock()
         client.api.observations.get_many.return_value = _page([])
 
-        LangfuseTraceFetcher(client).fetch(TraceQuery(kinds=[SpanKind.TOOL, SpanKind.LLM], trace_ids=["t1", "t2"]))
+        LangfuseTraceFetcher(client).fetch_spans(TraceQuery(kinds=[SpanKind.TOOL, SpanKind.LLM], trace_ids=["t1", "t2"]))
 
         requested = {(c.kwargs["type"], c.kwargs["trace_id"]) for c in client.api.observations.get_many.call_args_list}
         assert requested == {("TOOL", "t1"), ("TOOL", "t2"), ("GENERATION", "t1"), ("GENERATION", "t2")}
@@ -432,7 +538,7 @@ class TestLangfuseFetcher:
         client = MagicMock()
         client.api.observations.get_many.return_value = _page([_observation("tool"), _observation("chain", type_="CHAIN")])
 
-        spans = LangfuseTraceFetcher(client).fetch(TraceQuery(start=START, end=END, kinds=[SpanKind.SPAN]))
+        spans = LangfuseTraceFetcher(client).fetch_spans(TraceQuery(start=START, end=END, kinds=[SpanKind.SPAN]))
 
         assert client.api.observations.get_many.call_args.kwargs["type"] is None
         assert [span.span_id for span in spans] == ["chain"]
@@ -441,7 +547,7 @@ class TestLangfuseFetcher:
         client = MagicMock()
         client.api.observations.get_many.return_value = _page([_observation("new", minute=9), _observation("old", minute=1)], cursor="more")
 
-        spans = LangfuseTraceFetcher(client).fetch(TraceQuery(start=START, end=END, limit=1))
+        spans = LangfuseTraceFetcher(client).fetch_spans(TraceQuery(start=START, end=END, limit=1))
 
         assert [span.span_id for span in spans] == ["new"]
         assert client.api.observations.get_many.call_count == 1
@@ -451,7 +557,7 @@ class TestLangfuseFetcher:
         client = MagicMock()
         client.api.observations.get_many.return_value = _page([_observation("old", minute=-30)], cursor="same")
 
-        assert LangfuseTraceFetcher(client).fetch(TraceQuery(start=START, end=END)) == []
+        assert LangfuseTraceFetcher(client).fetch_spans(TraceQuery(start=START, end=END)) == []
         assert client.api.observations.get_many.call_count == 2
 
 
@@ -496,7 +602,7 @@ class TestLogfireFetcher:
     def test_queries_window_and_maps_rows(self, fake_query_client):
         fake_query_client.query_json_rows.return_value = {"rows": [_row("b", 5), _row("a", 1, session_id="s-1")]}
 
-        spans = LogfireTraceFetcher(read_token="tok").fetch(TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL], session_id="s-1"))
+        spans = LogfireTraceFetcher(read_token="tok").fetch_spans(TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL], session_id="s-1"))
 
         assert [span.span_id for span in spans] == ["a", "b"]
         assert all(span.kind == SpanKind.TOOL and span.session_id == "s-1" for span in spans)
@@ -508,17 +614,25 @@ class TestLogfireFetcher:
         monkeypatch.setattr(LogfireTraceFetcher, "_MAX_ROWS", 2)
         fake_query_client.query_json_rows.side_effect = [{"rows": [_row("d", 4), _row("c", 3)]}, {"rows": [_row("c", 3), _row("b", 2)]}, {"rows": []}]
 
-        spans = LogfireTraceFetcher(read_token="tok").fetch(TraceQuery(start=START, end=END, limit=10))
+        spans = LogfireTraceFetcher(read_token="tok").fetch_spans(TraceQuery(start=START, end=END, limit=10))
 
         assert [span.span_id for span in spans] == ["b", "c", "d"]
         second_sql = fake_query_client.query_json_rows.call_args_list[1].kwargs["sql"]
         assert f"start_timestamp <= '{_ts(3).isoformat()}'" in second_sql
 
+    def test_maps_otel_status_code(self, fake_query_client):
+        failed = {**_row("bad", 1), "otel_status_code": "ERROR"}
+        fake_query_client.query_json_rows.return_value = {"rows": [failed, _row("fine", 2)]}
+
+        spans = LogfireTraceFetcher(read_token="tok").fetch_spans(TraceQuery(start=START, end=END))
+
+        assert [span.status for span in spans] == [SpanStatus.ERROR, SpanStatus.UNSET]
+
     def test_maps_usage_from_attributes(self, fake_query_client):
         row = _row("llm", 1, span_name="chat gpt-4o-mini", **{"gen_ai.usage.input_tokens": 42, "gen_ai.usage.output_tokens": 7})
         fake_query_client.query_json_rows.return_value = {"rows": [row]}
 
-        (span,) = LogfireTraceFetcher(read_token="tok").fetch(TraceQuery(start=START, end=END))
+        (span,) = LogfireTraceFetcher(read_token="tok").fetch_spans(TraceQuery(start=START, end=END))
 
         assert span.usage == SpanUsage(input_tokens=42, output_tokens=7, total_tokens=49)
 
@@ -531,7 +645,7 @@ class TestLogfireFetcher:
         # an inclusive max_timestamp would return it; matches() applies the exclusive end
         fake_query_client.query_json_rows.return_value = {"rows": [_row("end", 60), _row("a", 1)]}
 
-        spans = LogfireTraceFetcher(read_token="tok").fetch(TraceQuery(start=START, end=END))
+        spans = LogfireTraceFetcher(read_token="tok").fetch_spans(TraceQuery(start=START, end=END))
 
         assert [span.span_id for span in spans] == ["a"]
 
@@ -571,7 +685,7 @@ class TestTraceloopFetcher:
             return httpx.Response(200, json={"spans": {"data": [_item("a", 1), _item("other", 2, session="s-2")], "next_cursor": None}})
 
         fetcher = TraceloopTraceFetcher(api_key="key", base_url="https://tl.test", transport=httpx.MockTransport(handler))
-        spans = fetcher.fetch(TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL], session_id="s-1"))
+        spans = fetcher.fetch_spans(TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL], session_id="s-1"))
 
         # the LLM span and the other session's span are dropped client side even if the server returns them
         assert [span.span_id for span in spans] == ["a", "b"]
@@ -587,6 +701,14 @@ class TestTraceloopFetcher:
         assert params["sort_order"] == "DESC" and "sort_by" not in params
         assert requests[1].url.params["cursor"] == "c1"
 
+    def test_maps_status(self):
+        data = [{**_item("bad", 1), "status_code": "STATUS_CODE_ERROR"}, _item("fine", 2)]
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"spans": {"data": data, "next_cursor": None}}))
+
+        spans = TraceloopTraceFetcher(api_key="key", transport=transport).fetch_spans(TraceQuery(start=START, end=END))
+
+        assert [span.status for span in spans] == [SpanStatus.ERROR, SpanStatus.UNSET]
+
     def test_trace_ids_filter_uses_values(self):
         # verified live: "in" rejects a "value" array ("cannot unmarshal array") and needs "values"
         requests: list[httpx.Request] = []
@@ -596,7 +718,7 @@ class TestTraceloopFetcher:
             return httpx.Response(200, json={"spans": {"data": [], "next_cursor": None}})
 
         fetcher = TraceloopTraceFetcher(api_key="key", transport=httpx.MockTransport(handler))
-        fetcher.fetch(TraceQuery(start=START, end=END, trace_ids=["t-1", "t-2"]))
+        fetcher.fetch_spans(TraceQuery(start=START, end=END, trace_ids=["t-1", "t-2"]))
 
         assert json.loads(requests[0].url.params["filters"]) == [{"id": "trace_id", "operator": "in", "values": ["t-1", "t-2"]}]
 
@@ -608,7 +730,7 @@ class TestTraceloopFetcher:
             return httpx.Response(200, json={"spans": {"data": [_item("decorated", 1, attributes=attributes)], "next_cursor": None}})
 
         fetcher = TraceloopTraceFetcher(api_key="key", transport=httpx.MockTransport(handler))
-        (span,) = fetcher.fetch(TraceQuery(start=START, end=END, kinds=["tool"]))
+        (span,) = fetcher.fetch_spans(TraceQuery(start=START, end=END, kinds=["tool"]))
 
         assert span.span_id == "decorated" and span.kind == SpanKind.TOOL
 
@@ -625,15 +747,15 @@ class TestTraceloopFetcher:
         secrets = _SecretStub(TRACELOOP_API_KEY="from-store")
         with (
             patch.object(SecretManager, "current", return_value=secrets),
-            patch.object(TraceloopTraceFetcher, "fetch", autospec=True, return_value=[]) as fetch,
+            patch.object(TraceloopTraceFetcher, "fetch_spans", autospec=True, return_value=[]) as fetch,
         ):
-            OpenLLMetry.fetch(MagicMock(), TraceQuery())
+            OpenLLMetry.fetch_spans(MagicMock(), TraceQuery())
             fetcher = fetch.call_args.args[0]
             assert fetcher._api_key == "from-store" and fetcher._base_url == "https://tl.test"
 
             secrets.values.clear()
             with pytest.raises(AKConfigError, match="TRACELOOP_API_KEY"):
-                OpenLLMetry.fetch(MagicMock(), TraceQuery())
+                OpenLLMetry.fetch_spans(MagicMock(), TraceQuery())
         monkeypatch.delitem(sys.modules, "agentkernel.trace.openllmetry.openllmetry", raising=False)
 
     @pytest.mark.parametrize("value", ["2026-10-08T11:00:00Z", 1791457200, 1791457200000, 1791457200000000, 1791457200000000000])
@@ -670,12 +792,12 @@ class TestCloudWatchFetcher:
         monkeypatch.delenv("AWS_REGION", raising=False)
         monkeypatch.setattr("agentkernel.trace.cloudwatch.cloudwatch.CloudWatch.region", staticmethod(lambda session: None))
         with pytest.raises(AKConfigError, match="AWS_REGION"):
-            CloudWatchTraceFetcher().fetch(TraceQuery())
+            CloudWatchTraceFetcher().fetch_spans(TraceQuery())
 
     def test_queries_window_and_maps_records(self):
         client = _logs_client([_cw_row("b", 5), _cw_row("llm", 4, kind="LLM"), _cw_row("a", 1)])
 
-        spans = CloudWatchTraceFetcher(client=client).fetch(TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL], session_id="s-1"))
+        spans = CloudWatchTraceFetcher(client=client).fetch_spans(TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL], session_id="s-1"))
 
         # the LLM span is dropped client side even if the server returns it
         assert [span.span_id for span in spans] == ["a", "b"]
@@ -689,26 +811,36 @@ class TestCloudWatchFetcher:
         assert 'attributes.openinference.span.kind = "TOOL"' in kwargs["queryString"]
         assert 'attributes.session.id = "s-1"' in kwargs["queryString"]
 
+    def test_maps_status_code(self):
+        row = _cw_row("bad", 1)
+        record = json.loads(row[1]["value"])
+        record["status"] = {"code": "ERROR"}
+        row[1]["value"] = json.dumps(record)
+
+        spans = CloudWatchTraceFetcher(client=_logs_client([row, _cw_row("fine", 2)])).fetch_spans(TraceQuery(start=START, end=END))
+
+        assert [span.status for span in spans] == [SpanStatus.ERROR, SpanStatus.UNSET]
+
     def test_maps_usage_from_nested_attributes(self):
         row = _cw_row("llm", 1, kind="LLM")
         record = json.loads(row[1]["value"])
         record["attributes"]["llm"] = {"token_count": {"prompt": 42, "completion": 7, "total": 49}}
         row[1]["value"] = json.dumps(record)
 
-        (span,) = CloudWatchTraceFetcher(client=_logs_client([row])).fetch(TraceQuery(start=START, end=END))
+        (span,) = CloudWatchTraceFetcher(client=_logs_client([row])).fetch_spans(TraceQuery(start=START, end=END))
 
         assert span.usage == SpanUsage(input_tokens=42, output_tokens=7, total_tokens=49)
 
     def test_drops_spans_started_outside_the_window(self):
         client = _logs_client([_cw_row("late", 70, stamp_minute=50), _cw_row("a", 1)])
-        spans = CloudWatchTraceFetcher(client=client).fetch(TraceQuery(start=START, end=END))
+        spans = CloudWatchTraceFetcher(client=client).fetch_spans(TraceQuery(start=START, end=END))
         assert [span.span_id for span in spans] == ["a"]
 
     def test_pages_backwards_past_row_cap(self, monkeypatch):
         monkeypatch.setattr(CloudWatchTraceFetcher, "_MAX_ROWS", 2)
         client = _logs_client([_cw_row("d", 4), _cw_row("c", 3)], [_cw_row("c", 3), _cw_row("b", 2)], [])
 
-        spans = CloudWatchTraceFetcher(client=client).fetch(TraceQuery(start=START, end=END, limit=10))
+        spans = CloudWatchTraceFetcher(client=client).fetch_spans(TraceQuery(start=START, end=END, limit=10))
 
         assert [span.span_id for span in spans] == ["b", "c", "d"]
         assert client.start_query.call_args_list[1].kwargs["endTime"] == int(_ts(3).timestamp())
@@ -719,7 +851,7 @@ class TestCloudWatchFetcher:
         client = MagicMock()
         client.start_query.side_effect = ClientError({"Error": {"Code": "ResourceNotFoundException", "Message": "nope"}}, "StartQuery")
         with pytest.raises(AKConfigError, match="Transaction Search"):
-            CloudWatchTraceFetcher(client=client).fetch(TraceQuery())
+            CloudWatchTraceFetcher(client=client).fetch_spans(TraceQuery())
 
     def test_other_client_errors_propagate(self):
         from botocore.exceptions import ClientError
@@ -727,14 +859,14 @@ class TestCloudWatchFetcher:
         client = MagicMock()
         client.start_query.side_effect = ClientError({"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "StartQuery")
         with pytest.raises(ClientError):
-            CloudWatchTraceFetcher(client=client).fetch(TraceQuery())
+            CloudWatchTraceFetcher(client=client).fetch_spans(TraceQuery())
 
     def test_failed_query_raises(self):
         client = MagicMock()
         client.start_query.return_value = {"queryId": "q"}
         client.get_query_results.return_value = {"status": "Failed"}
         with pytest.raises(RuntimeError, match="Failed"):
-            CloudWatchTraceFetcher(client=client).fetch(TraceQuery())
+            CloudWatchTraceFetcher(client=client).fetch_spans(TraceQuery())
 
     def test_slow_query_is_stopped(self, monkeypatch):
         monkeypatch.setattr(CloudWatchTraceFetcher, "_POLL_INTERVAL", 0)
@@ -742,7 +874,7 @@ class TestCloudWatchFetcher:
         client.start_query.return_value = {"queryId": "q"}
         client.get_query_results.return_value = {"status": "Running"}
         with pytest.raises(TimeoutError):
-            CloudWatchTraceFetcher(client=client, timeout=0).fetch(TraceQuery())
+            CloudWatchTraceFetcher(client=client, timeout=0).fetch_spans(TraceQuery())
         client.stop_query.assert_called_once_with(queryId="q")
 
     def test_insights_escapes_literals_and_handles_span_kind(self):

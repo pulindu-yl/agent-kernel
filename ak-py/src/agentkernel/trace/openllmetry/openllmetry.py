@@ -150,7 +150,7 @@ class OpenLLMetry(BaseTrace):
 
         return OpenLLMetryPydanticAIRunner()
 
-    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+    def fetch_spans(self, query: TraceQuery) -> list[FetchedSpan]:
         """
         Fetches spans back from Traceloop through the warehouse REST API (same ``TRACELOOP_API_KEY``, resolved
         through the secret manager).
@@ -159,4 +159,4 @@ class OpenLLMetry(BaseTrace):
         from .fetch import TraceloopTraceFetcher
 
         api_key = SecretManager.current().get("TRACELOOP_API_KEY", None)
-        return TraceloopTraceFetcher(api_key, base_url=os.environ.get("TRACELOOP_BASE_URL")).fetch(query)
+        return TraceloopTraceFetcher(api_key, base_url=os.environ.get("TRACELOOP_BASE_URL")).fetch_spans(query)

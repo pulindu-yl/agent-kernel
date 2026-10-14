@@ -73,6 +73,23 @@ evaluator, the test passes if the actual response's normalised text exactly equa
 expected values (score `1.0`) — there is no partial credit. With the Opik evaluator, `LevenshteinRatio`
 gives a graded similarity score instead, so a close-but-not-exact match can still clear the threshold.
 
+### Reference-free Opik metrics
+
+Grading a production trace has no expected answer. For that, build an `AKEvaluationCase` with `metric` set to one of
+`OpikAKEvaluator.METRICS` and call `evaluate_by_llm` on the Opik evaluator directly (`Test.compare` always judges
+against `expected`):
+
+| `metric` | Reads | Passes when |
+|---|---|---|
+| `task_completion` | `transcript` | score ≥ `threshold` |
+| `tool_correctness` | `transcript` (needs `tool_call_count` ≠ 0; check `OpikAKEvaluator.applies_to(case)`) | score ≥ `threshold` |
+| `answer_relevance` | `user_input`, `actual` | score ≥ `threshold` |
+| `hallucination` | `user_input`, `actual`, `context` | score < `threshold` (a high score means hallucinated) |
+
+`transcript` is the whole run as text (the request, each tool call with its result, the final answer); the two agent
+judges fall back to the input and answer when it is not set. Each judge is tried twice, and a failure comes back as a
+result with `score=None` and the reason instead of raising.
+
 ### Llm Mode
 
 Uses LLM-as-judge evaluation for semantic similarity. DeepEval and Opik use a `GEval` metric here —

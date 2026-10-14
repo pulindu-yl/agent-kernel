@@ -205,10 +205,10 @@ class CloudWatch(BaseTrace):
 
         return CloudWatchPydanticAIRunner(self)
 
-    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+    def fetch_spans(self, query: TraceQuery) -> list[FetchedSpan]:
         """
         Fetches spans back from the aws/spans log group through CloudWatch Logs Insights (needs Transaction Search).
         """
         from .fetch import CloudWatchTraceFetcher
 
-        return CloudWatchTraceFetcher().fetch(query)
+        return CloudWatchTraceFetcher().fetch_spans(query)

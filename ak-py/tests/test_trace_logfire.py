@@ -79,14 +79,14 @@ def test_fetch_resolves_the_read_token_through_the_secret_manager(fake_logfire, 
     secrets.get.side_effect = lambda key, default=None: "from-store" if key == "LOGFIRE_READ_TOKEN" else default
     with (
         patch.object(SecretManager, "current", return_value=secrets),
-        patch.object(LogfireTraceFetcher, "fetch", autospec=True, return_value=[]) as fetch,
+        patch.object(LogfireTraceFetcher, "fetch_spans", autospec=True, return_value=[]) as fetch,
     ):
-        Logfire().fetch(TraceQuery())
+        Logfire().fetch_spans(TraceQuery())
         assert fetch.call_args.args[0]._read_token == "from-store"
 
         secrets.get.side_effect = lambda key, default=None: default
         with pytest.raises(AKConfigError, match="LOGFIRE_READ_TOKEN"):
-            Logfire().fetch(TraceQuery())
+            Logfire().fetch_spans(TraceQuery())
 
 
 def test_init_configures_once(fake_logfire):

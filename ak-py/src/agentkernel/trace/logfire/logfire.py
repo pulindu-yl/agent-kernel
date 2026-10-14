@@ -94,7 +94,7 @@ class Logfire(BaseTrace):
 
         return LogfirePydanticAIRunner()
 
-    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+    def fetch_spans(self, query: TraceQuery) -> list[FetchedSpan]:
         """
         Fetches spans back from Logfire through the SQL Query API (needs ``LOGFIRE_READ_TOKEN``, resolved
         through the secret manager).
@@ -102,4 +102,4 @@ class Logfire(BaseTrace):
         from ...secret import SecretManager
         from .fetch import LogfireTraceFetcher
 
-        return LogfireTraceFetcher(SecretManager.current().get(LogfireTraceFetcher.READ_TOKEN_ENV, None)).fetch(query)
+        return LogfireTraceFetcher(SecretManager.current().get(LogfireTraceFetcher.READ_TOKEN_ENV, None)).fetch_spans(query)

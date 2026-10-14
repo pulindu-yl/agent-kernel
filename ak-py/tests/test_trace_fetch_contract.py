@@ -44,7 +44,7 @@ class InMemoryTrace(BaseTrace):
     def pydanticai(self):
         return None
 
-    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+    def fetch_spans(self, query: TraceQuery) -> list[FetchedSpan]:
         return FetchedSpan.oldest_first(span for span in self.spans if query.matches(span))[-query.limit :]
 
 
@@ -136,7 +136,7 @@ class _FakeWarehouse:
                 {
                     "trace_id": span.trace_id,
                     "span_id": span.span_id,
-                    "parent_span_id": "",
+                    "parent_span_id": span.parent_span_id or "",
                     "span_name": span.name,
                     "timestamp": int(span.start_time.timestamp() * 1000),
                     "duration_ms": 30_000,

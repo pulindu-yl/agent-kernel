@@ -54,7 +54,7 @@ class BaseTrace(ABC):
         """
         raise NotImplementedError
 
-    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+    def fetch_spans(self, query: TraceQuery) -> list[FetchedSpan]:
         """
         Fetch spans back from the tracing provider's cloud, oldest first.
 

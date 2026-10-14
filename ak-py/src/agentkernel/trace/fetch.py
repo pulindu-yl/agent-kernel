@@ -28,8 +28,30 @@ class SpanKind(str, Enum):
     SPAN = "span"  # anything else: AK wrapper spans, turns, chains, workflows
 
 
+class SpanStatus(str, Enum):
+    """Whether a span failed, following the OpenTelemetry span status."""
+
+    UNSET = "unset"
+    OK = "ok"
+    ERROR = "error"
+
+    @classmethod
+    def of(cls, value: Any) -> SpanStatus:
+        """Maps a provider's status code (``"ERROR"``, ``"STATUS_CODE_ERROR"``, OTLP ``2``, ...) onto the enum; anything unknown is ``UNSET``."""
+        if isinstance(value, bool) or value is None:
+            return cls.UNSET
+        if isinstance(value, int):
+            return {1: cls.OK, 2: cls.ERROR}.get(value, cls.UNSET)
+        text = str(value).strip().upper()
+        if text.endswith("ERROR"):
+            return cls.ERROR
+        if text.endswith("OK"):
+            return cls.OK
+        return cls.UNSET
+
+
 class TraceQuery(BaseModel):
-    """Generic filter for ``Trace.fetch()``; each tracer translates it to its provider's API."""
+    """Generic filter for ``Trace.fetch_spans()`` and ``Trace.fetch_traces()``; each tracer translates it to its provider's API."""
 
     start: Optional[datetime] = Field(default=None, description="Inclusive lower bound on span start time; defaults to end - last")
     end: Optional[datetime] = Field(default=None, description="Exclusive upper bound on span start time; defaults to now")
@@ -133,6 +155,7 @@ class FetchedSpan(BaseModel):
     parent_span_id: Optional[str] = None
     name: Optional[str] = None
     kind: SpanKind = SpanKind.SPAN
+    status: SpanStatus = SpanStatus.UNSET
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     session_id: Optional[str] = None
@@ -146,6 +169,76 @@ class FetchedSpan(BaseModel):
     def oldest_first(spans: Iterable[FetchedSpan]) -> list[FetchedSpan]:
         floor = datetime.min.replace(tzinfo=timezone.utc)
         return sorted(spans, key=lambda span: span.start_time or floor)
+
+
+class FetchedTrace(BaseModel):
+    """The spans of one trace, assembled from the spans a fetch returned.
+
+    A trace can be partial: the fetch window filters on span start time, so spans just outside it are missing, and
+    a tracer may not have stored every span yet. ``root`` is ``None`` when the trace has no single parentless span
+    (the root is missing or not stored yet, or the trace has several).
+    """
+
+    trace_id: str
+    session_id: Optional[str] = Field(default=None, description="The first session id found on the trace's spans")
+    spans: list[FetchedSpan] = Field(default_factory=list, description="The trace's spans, oldest first")
+
+    @property
+    def root(self) -> Optional[FetchedSpan]:
+        """The single span with no parent, or None when there is none or more than one."""
+        roots = [span for span in self.spans if span.parent_span_id is None]
+        return roots[0] if len(roots) == 1 else None
+
+    @property
+    def user_input(self) -> Any:
+        """The root span's input (empty on Traceloop, whose root span carries none)."""
+        return self.root.input if self.root else None
+
+    @property
+    def output(self) -> Any:
+        """The root span's output (empty on Traceloop, whose root span carries none)."""
+        return self.root.output if self.root else None
+
+    @property
+    def started_at(self) -> Optional[datetime]:
+        return self.root.start_time if self.root else None
+
+    @property
+    def ended_at(self) -> Optional[datetime]:
+        return self.root.end_time if self.root else None
+
+    @property
+    def tool_spans(self) -> list[FetchedSpan]:
+        return [span for span in self.spans if span.kind == SpanKind.TOOL]
+
+    @property
+    def agent_names(self) -> list[str]:
+        """The names of the agent spans, de-duplicated, in the order they started."""
+        return list(dict.fromkeys(span.name for span in self.spans if span.kind == SpanKind.AGENT and span.name))
+
+    @property
+    def usage(self) -> SpanUsage:
+        """Tokens and cost summed over the spans; a field stays ``None`` when no span reports it."""
+        totals: dict[str, Any] = {}
+        for span in self.spans:
+            if span.usage is None:
+                continue
+            for field in ("input_tokens", "output_tokens", "total_tokens", "cost"):
+                value = getattr(span.usage, field)
+                if value is not None:
+                    totals[field] = totals.get(field, 0) + value
+        return SpanUsage(**totals)
+
+    @classmethod
+    def group(cls, spans: Iterable[FetchedSpan]) -> list[FetchedTrace]:
+        """Groups spans by trace id; each trace's spans keep the input order and traces are ordered by their first span."""
+        by_trace: dict[str, list[FetchedSpan]] = {}
+        for span in spans:
+            by_trace.setdefault(span.trace_id, []).append(span)
+        return [
+            cls(trace_id=trace_id, session_id=next((span.session_id for span in trace_spans if span.session_id), None), spans=trace_spans)
+            for trace_id, trace_spans in by_trace.items()
+        ]
 
 
 class OTelSpanClassifier:
@@ -234,13 +327,13 @@ class TraceFetcher(ABC):
     """The base of the built-in fetchers: the pinned window, the merge and the two paging loops they share.
 
     Subclasses implement only their provider's requests (``_query_provider``) and their ``_to_span`` mapping.
-    Not exported: bring-your-own tracers override ``BaseTrace.fetch`` and only have to pass ``TraceFetchContract``.
+    Not exported: bring-your-own tracers override ``BaseTrace.fetch_spans`` and only have to pass ``TraceFetchContract``.
     """
 
     provider: ClassVar[str]  # the tracer's trace.type short name, written to every FetchedSpan.provider
     _log = logging.getLogger("ak.trace.fetch")
 
-    def fetch(self, query: TraceQuery) -> list[FetchedSpan]:
+    def fetch_spans(self, query: TraceQuery) -> list[FetchedSpan]:
         """
         Fetches the spans matching the query, oldest first. When more than ``limit`` match, the most
         recent ones are kept.

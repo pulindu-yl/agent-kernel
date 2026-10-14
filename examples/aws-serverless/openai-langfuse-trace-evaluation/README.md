@@ -2,10 +2,10 @@
 
 This example evaluates an agent on its real traffic. An OpenAI Agents SDK agent runs on AWS Lambda in queue
 mode with Langfuse tracing. On request, the request-handler Lambda reads a session's traces back with
-`Trace.get().fetch(...)`, grades each request with four Opik LLM judges, and stores one row per trace in DynamoDB.
+`Trace.get().fetch_traces(...)`, grades each request with four Opik LLM judges, and stores one row per trace in DynamoDB.
 
-It uses only public Agent Kernel API: `Trace.fetch`, `FetchedSpan`, `SpanUsage`, the `AKEvaluator` ABC,
-`Lambda`, `ServerlessAgentRunner` and `ResponseHandler`.
+It uses only public Agent Kernel API: `Trace.fetch_traces`, `FetchedTrace`, `FetchedSpan`, `SpanStatus`, `SpanUsage`,
+`OpikAKEvaluator`, `Lambda`, `ServerlessAgentRunner` and `ResponseHandler`.
 
 ## Architecture
 
@@ -15,7 +15,7 @@ client ──▶ request handler ──▶ SQS input ──▶ agent runner ─�
                  ▲                               │ reply                                            │
                  └── response store ◀── response handler ◀── SQS output                             │
                                                                                                     │
-              POST /eval  {"session_id"}                                                            │ Trace.fetch(session_id=...)
+              POST /eval  {"session_id"}                                                            │ Trace.fetch_traces(session_id=...)
 client ──▶ request handler: EvaluationAPI.start ── prepare ◀────────────────────────────────────────┤
                               │                      │ one row per trace, with its progress         │
                               │                      ▼                                              │
@@ -48,9 +48,11 @@ Nothing runs on a schedule: grading happens only when `/eval` is called.
 
 `/eval` runs `TraceEvaluationJob.prepare_traces`, inside the request:
 
-1. Fetches every span of the session from the last 24 hours (`Trace.get().fetch(session_id=..., limit=5000)`).
-   A full result is an error, so a truncated session is never graded.
-2. Groups the spans by trace. A trace with exactly one parentless root span is one request (`TraceCase`).
+1. Fetches the session's traces from the last 24 hours (`Trace.get().fetch_traces(session_id=..., last=...)`).
+   Agent Kernel groups the spans by trace and finds each trace's root span. The fetch keeps at most the newest 1,000
+   spans, which a demo session never reaches.
+2. A trace with a root span is one request (`TraceCase`); a trace without one gets no row, and the next `/eval` fetches it
+   again.
 3. Sets each trace's `progress`:
 
    | Current row | Trace | New `progress` |
@@ -58,7 +60,7 @@ Nothing runs on a schedule: grading happens only when `/eval` is called.
    | `graded` or `unfinished` | any | unchanged |
    | `grading`, written less than 15 minutes ago | any | unchanged (an earlier `/eval`'s grading may still be running) |
    | none, `pending`, `failed` or an older `grading` | the root span ended 2 minutes ago or more and has no output | `unfinished` |
-   | none, `pending`, `failed` or an older `grading` | the root span is still open or ended less than 2 minutes ago, or a span's parent isn't readable yet | `pending` |
+   | none, `pending`, `failed` or an older `grading` | the root span is still open or ended less than 2 minutes ago, | `pending` |
    | none, `pending`, `failed` or an older `grading` | ready | `grading` |
 
    Each write is conditional on the row still being in a state it may overwrite, so when two `/eval` calls race,
@@ -128,14 +130,16 @@ limit is 400 KB) by dropping tool calls and shortening `input`/`output`, so a la
 
 ## Changing the metrics or the store
 
-- **Metrics:** add an entry to `OpikTraceEvaluator.METRICS` and `_JUDGE_CLASSES`
-  (`evaluator/opik_evaluator.py`). For another judge library, write another `AKEvaluator` subclass with
-  `applies_to` and `evaluate_by_llm`, and return it from the factory in `TraceEvaluationJob.from_env`.
+- **Metrics:** `TraceEvaluationJob` runs every metric in `OpikAKEvaluator.METRICS` (`task_completion`,
+  `tool_correctness`, `answer_relevance`, `hallucination`), each by setting `AKEvaluationCase.metric`. For another judge
+  library, write an `AKEvaluator` subclass with `METRICS`, `applies_to` and `evaluate_by_llm`, and return it from the
+  factory in `TraceEvaluationJob.from_env`.
 - **Store:** `TraceEvaluationJob` and `EvaluationAPI` only call `read_progress`, `write_progress`, `save_results`,
   `mark_failed` and `count_session_progress` on `EvaluationStore` (`evaluator/store.py`); replace it with a
   class offering the same methods.
-- **Tracer:** `Trace.fetch` works for Langfuse, Logfire, OpenLLMetry and CloudWatch. This example is built
-  and tested on Langfuse, which sets the session id on every span.
+- **Tracer:** `Trace.fetch_traces` works for Langfuse, Logfire, OpenLLMetry and CloudWatch. This example is built
+  and tested on Langfuse, which sets the session id on every span. On Traceloop the root span carries no input or output,
+  so `trace.user_input` and `trace.output` are empty there.
 
 ## Prerequisites
 

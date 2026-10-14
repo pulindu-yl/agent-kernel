@@ -7,7 +7,7 @@ from functools import partial
 from typing import Any, Iterable, Optional
 
 from ...core.util.factory import AKConfigError
-from ..fetch import FetchedSpan, OTelSpanClassifier, SpanKind, TraceFetcher, TraceQuery
+from ..fetch import FetchedSpan, OTelSpanClassifier, SpanKind, SpanStatus, TraceFetcher, TraceQuery
 
 
 class LogfireTraceFetcher(TraceFetcher):
@@ -22,7 +22,9 @@ class LogfireTraceFetcher(TraceFetcher):
     provider = "logfire"
     READ_TOKEN_ENV = "LOGFIRE_READ_TOKEN"
     _MAX_ROWS = 10_000
-    _COLUMNS = "trace_id, span_id, parent_span_id, span_name, message, start_timestamp, end_timestamp, attributes, tags, otel_scope_name"
+    _COLUMNS = (
+        "trace_id, span_id, parent_span_id, span_name, message, start_timestamp, end_timestamp, attributes, tags, otel_status_code, otel_scope_name"
+    )
 
     # SQL equivalents of OTelSpanClassifier, so kind filtering happens server side
     _KIND_SQL = {
@@ -107,6 +109,7 @@ class LogfireTraceFetcher(TraceFetcher):
             parent_span_id=row.get("parent_span_id"),
             name=row.get("message") or row.get("span_name"),
             kind=OTelSpanClassifier.classify(classify_attributes, row.get("span_name")),
+            status=SpanStatus.of(row.get("otel_status_code")),
             start_time=row.get("start_timestamp"),
             end_time=row.get("end_timestamp"),
             session_id=OTelSpanClassifier.session_id(attributes),

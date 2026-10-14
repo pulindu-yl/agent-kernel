@@ -6,15 +6,16 @@ import pytest
 
 from .base import BaseTrace
 from .fetch import FetchedSpan, SpanKind, TraceQuery
+from .trace import Trace
 
 _END = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
 _START = _END - timedelta(hours=1)
 
 
 class TraceFetchContract:
-    """Conformance suite for ``BaseTrace.fetch``. Override the ``tracer`` fixture and ``seed``.
+    """Conformance suite for ``BaseTrace.fetch_spans``. Override the ``tracer`` fixture and ``seed``.
 
-    Built-in fetchers and bring-your-own tracers that override ``fetch`` subclass it, so every one of them
+    Built-in fetchers and bring-your-own tracers that override ``fetch_spans`` subclass it, so every one of them
     honours the same result contract: spans oldest first, unique span ids, the window applied to span start
     time (start inclusive, end exclusive), the most recent spans kept when more than ``limit`` match, and the
     kind, session, trace-id and name filters, including that a span missing the filtered value is excluded.
@@ -61,7 +62,7 @@ class TraceFetchContract:
     def test_contract_returns_spans_oldest_first(self, tracer):
         self.seed(tracer, [self.contract_span("b", 20), self.contract_span("a", 10), self.contract_span("c", 30)])
 
-        spans = tracer.fetch(self.window())
+        spans = tracer.fetch_spans(self.window())
 
         assert [span.span_id for span in spans] == ["a", "b", "c"]
         assert len({span.span_id for span in spans}) == len(spans)
@@ -77,14 +78,14 @@ class TraceFetchContract:
             ],
         )
 
-        spans = tracer.fetch(self.window())
+        spans = tracer.fetch_spans(self.window())
 
         assert [span.span_id for span in spans] == ["at-start", "inside"]
 
     def test_contract_limit_keeps_the_most_recent(self, tracer):
         self.seed(tracer, [self.contract_span(f"s{minute:02d}", minute) for minute in range(10, 15)])
 
-        spans = tracer.fetch(self.window(limit=2))
+        spans = tracer.fetch_spans(self.window(limit=2))
 
         assert [span.span_id for span in spans] == ["s13", "s14"]
 
@@ -99,9 +100,9 @@ class TraceFetchContract:
             ],
         )
 
-        assert [span.span_id for span in tracer.fetch(self.window(kinds=[SpanKind.TOOL]))] == ["tool"]
-        assert [span.span_id for span in tracer.fetch(self.window(kinds=[SpanKind.LLM, SpanKind.AGENT]))] == ["llm", "agent"]
-        assert [span.span_id for span in tracer.fetch(self.window(kinds=[SpanKind.SPAN]))] == ["plain"]
+        assert [span.span_id for span in tracer.fetch_spans(self.window(kinds=[SpanKind.TOOL]))] == ["tool"]
+        assert [span.span_id for span in tracer.fetch_spans(self.window(kinds=[SpanKind.LLM, SpanKind.AGENT]))] == ["llm", "agent"]
+        assert [span.span_id for span in tracer.fetch_spans(self.window(kinds=[SpanKind.SPAN]))] == ["plain"]
 
     def test_contract_session_filter(self, tracer):
         self.seed(
@@ -113,7 +114,7 @@ class TraceFetchContract:
             ],
         )
 
-        spans = tracer.fetch(self.window(session_id="s1"))
+        spans = tracer.fetch_spans(self.window(session_id="s1"))
 
         assert [span.span_id for span in spans] == ["mine"]
         assert spans[0].session_id == "s1"
@@ -128,7 +129,7 @@ class TraceFetchContract:
             ],
         )
 
-        spans = tracer.fetch(self.window(trace_ids=["t1", "t3"]))
+        spans = tracer.fetch_spans(self.window(trace_ids=["t1", "t3"]))
 
         assert [span.span_id for span in spans] == ["one", "three"]
 
@@ -142,11 +143,22 @@ class TraceFetchContract:
             ],
         )
 
-        spans = tracer.fetch(self.window(name="get_weather"))
+        spans = tracer.fetch_spans(self.window(name="get_weather"))
 
         assert [span.span_id for span in spans] == ["wanted"]
 
     def test_contract_empty_backend_returns_nothing(self, tracer):
         self.seed(tracer, [])
 
-        assert tracer.fetch(self.window()) == []
+        assert tracer.fetch_spans(self.window()) == []
+
+    def test_contract_fetch_traces_groups_spans_by_trace(self, tracer):
+        root = self.contract_span("root", 10, trace_id="t1")
+        child = self.contract_span("child", 11, SpanKind.TOOL, trace_id="t1").model_copy(update={"parent_span_id": "root"})
+        self.seed(tracer, [child, root, self.contract_span("other", 12, trace_id="t2")])
+
+        traces = Trace(tracer).fetch_traces(self.window())
+
+        assert [trace.trace_id for trace in traces] == ["t1", "t2"]
+        assert [span.span_id for span in traces[0].spans] == ["root", "child"]
+        assert traces[0].root is not None and traces[0].root.span_id == "root"

@@ -10,7 +10,7 @@ from typing import Any, Iterable, Optional
 import httpx
 
 from ...core.util.factory import AKConfigError
-from ..fetch import FetchedSpan, OTelSpanClassifier, TraceFetcher, TraceQuery
+from ..fetch import FetchedSpan, OTelSpanClassifier, SpanStatus, TraceFetcher, TraceQuery
 
 
 class TraceloopTraceFetcher(TraceFetcher):
@@ -93,6 +93,8 @@ class TraceloopTraceFetcher(TraceFetcher):
             parent_span_id=item.get("parent_span_id") or None,
             name=item.get("span_name"),
             kind=OTelSpanClassifier.classify(attributes, item.get("span_name")),
+            # the warehouse's status field name is undocumented: accept the OTel-style names
+            status=SpanStatus.of(item.get("status_code") or item.get("status")),
             start_time=start_time,
             end_time=start_time + timedelta(milliseconds=float(duration_ms)) if start_time and duration_ms is not None else None,
             session_id=OTelSpanClassifier.session_id(attributes),

@@ -1,18 +1,19 @@
 import logging
 import os
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable
 
 from agentkernel.test import AKEvaluationResult
-from agentkernel.trace import FetchedSpan, Trace
+from agentkernel.trace import FetchedTrace, Trace
 from pydantic import BaseModel
 
 from .case import TraceCase
 from .store import EvaluationStore, Progress, TraceProgress
 
 if TYPE_CHECKING:
-    from .opik_evaluator import OpikTraceEvaluator  # imported on first grade only: Opik and litellm load slowly
+    from agentkernel.test.core.evaluator.opik import (
+        OpikAKEvaluator,
+    )  # imported on first grade only: Opik and litellm load slowly
 
 _log = logging.getLogger("ak.example.trace_evaluation")
 
@@ -20,8 +21,8 @@ _log = logging.getLogger("ak.example.trace_evaluation")
 class PrepareSummary(BaseModel):
     session_id: str
     spans_fetched: int = 0
-    found: int = 0  # traces with exactly one root span
-    no_root: int = 0  # traces with no root span (or several): no row
+    found: int = 0  # traces with a root span
+    no_root: int = 0  # traces with no single root span: no row
     already_graded: int = 0  # row already graded
     grading: int = 0  # claimed by this call, or still within an earlier call's lease
     pending: int = 0
@@ -40,7 +41,7 @@ class TraceEvaluationJob:
     """Decides each of a session's traces' progress (prepare) and judges the ready ones (grade)."""
 
     FETCH_WINDOW = timedelta(hours=24)
-    FETCH_LIMIT = 5_000
+    PASS_THRESHOLD = 0.5  # the score a metric must reach to pass
     SETTLE_TIME = timedelta(minutes=2)
     GRADING_LEASE = timedelta(minutes=15)  # above the grading invocation's 10-minute Lambda timeout
 
@@ -48,36 +49,38 @@ class TraceEvaluationJob:
         self,
         trace: Trace,
         store: EvaluationStore,
-        evaluator_factory: Callable[[], list["OpikTraceEvaluator"]],
+        evaluator_factory: Callable[[], "OpikAKEvaluator"],
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         self._trace = trace
         self._store = store
         self._evaluator_factory = evaluator_factory
-        self._evaluators: list["OpikTraceEvaluator"] | None = None  # built on the first grade
+        self._evaluator: "OpikAKEvaluator | None" = None  # built on the first grade
         self._clock = clock
 
     @classmethod
     def from_env(cls) -> "TraceEvaluationJob":
-        """Builds the job on the configured tracer and the RESULTS_TABLE table, with the Opik judges."""
+        """Builds the job on the configured tracer and the RESULTS_TABLE table, with AK's Opik evaluator."""
 
-        def build_opik_evaluators() -> list["OpikTraceEvaluator"]:
-            """Builds one Opik evaluator per metric, from the AK_TEST__LLM__* settings."""
+        def build_opik_evaluator() -> "OpikAKEvaluator":
+            """Builds the evaluator from the AK_TEST__LLM__* settings."""
             from agentkernel.test import AKTestConfig
+            from agentkernel.test.core.evaluator.opik import OpikAKEvaluator
 
-            from .opik_evaluator import OpikTraceEvaluator
+            return OpikAKEvaluator(AKTestConfig.get())
 
-            return OpikTraceEvaluator.for_all_metrics(AKTestConfig.get())
-
-        return cls(Trace.get(), EvaluationStore.for_table(os.environ["RESULTS_TABLE"]), build_opik_evaluators)
+        return cls(Trace.get(), EvaluationStore.for_table(os.environ["RESULTS_TABLE"]), build_opik_evaluator)
 
     def prepare_traces(self, session_id: str) -> PrepareSummary:
         """Gives every found trace of the session its row and progress; returns the traces to grade."""
         now = self._clock()
-        spans = self._fetch_session_spans(session_id)
-        cases, rootless_traces = self._build_cases(spans)
+        traces = self._fetch_session_traces(session_id)
+        cases, rootless_traces = self._build_cases(traces)
         summary = PrepareSummary(
-            session_id=session_id, spans_fetched=len(spans), found=len(cases), no_root=rootless_traces
+            session_id=session_id,
+            spans_fetched=sum(len(trace.spans) for trace in traces),
+            found=len(cases),
+            no_root=rootless_traces,
         )
         progress_by_id = self._store.read_progress([case.trace_id for case in cases])
         for case in cases:
@@ -110,7 +113,7 @@ class TraceEvaluationJob:
             return summary
 
         try:
-            cases, _ = self._build_cases(self._fetch_session_spans(session_id))
+            cases, _ = self._build_cases(self._fetch_session_traces(session_id))
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             _log.exception(f"grade: fetching session {session_id} failed")
@@ -138,30 +141,15 @@ class TraceEvaluationJob:
         _log.info(f"grade: {summary.model_dump_json()}")
         return summary
 
-    def _fetch_session_spans(self, session_id: str) -> list[FetchedSpan]:
-        """Fetches the session's spans from the last FETCH_WINDOW; raises when the result may be truncated."""
-        spans = self._trace.fetch(session_id=session_id, last=self.FETCH_WINDOW, limit=self.FETCH_LIMIT)
-        if len(spans) >= self.FETCH_LIMIT:
-            # fetch keeps the newest spans, so older requests would be silently missing
-            raise RuntimeError(
-                f"session {session_id} has at least {self.FETCH_LIMIT} spans; refusing to grade a truncated session"
-            )
-        return spans
+    def _fetch_session_traces(self, session_id: str) -> list[FetchedTrace]:
+        """Fetches the session's traces from the last FETCH_WINDOW."""
+        return self._trace.fetch_traces(session_id=session_id, last=self.FETCH_WINDOW)
 
     @staticmethod
-    def _build_cases(spans: list[FetchedSpan]) -> tuple[list[TraceCase], int]:
-        """Groups the spans by trace into cases, oldest first; also returns how many traces were not requests."""
-        spans_by_trace: dict[str, list[FetchedSpan]] = defaultdict(list)
-        for span in spans:
-            spans_by_trace[span.trace_id].append(span)
-        cases, rootless_traces = [], 0
-        for trace_id, trace_spans in spans_by_trace.items():
-            case = TraceCase.from_spans(trace_id, trace_spans)
-            if case is None:
-                rootless_traces += 1
-            else:
-                cases.append(case)
-        return sorted(cases, key=lambda case: case.started_at), rootless_traces
+    def _build_cases(traces: list[FetchedTrace]) -> tuple[list[TraceCase], int]:
+        """Builds a case per trace that has a root span, oldest first; also returns how many traces had none."""
+        cases = [TraceCase.from_trace(trace) for trace in traces if trace.root is not None]
+        return sorted(cases, key=lambda case: case.started_at), len(traces) - len(cases)
 
     def _advance_progress(self, case: TraceCase, current: TraceProgress | None, now: datetime) -> tuple[Progress, bool]:
         """Writes the trace's next progress; returns its progress and whether this call claimed it for grading."""
@@ -187,19 +175,13 @@ class TraceEvaluationJob:
         return Progress.GRADING
 
     def _run_evaluators(self, case: TraceCase) -> list[AKEvaluationResult]:
-        """Runs every evaluator that applies to the trace and returns their results."""
-        if self._evaluators is None:
-            self._evaluators = self._evaluator_factory()
-        evaluation_case = case.to_evaluation_case(self._pass_threshold())
+        """Runs every metric that applies to the trace and returns the results."""
+        if self._evaluator is None:
+            self._evaluator = self._evaluator_factory()
+        evaluation_case = case.to_evaluation_case(self.PASS_THRESHOLD)
+        metric_cases = [evaluation_case.model_copy(update={"metric": metric}) for metric in self._evaluator.METRICS]
         return [
-            evaluator.evaluate_by_llm(evaluation_case)
-            for evaluator in self._evaluators
-            if evaluator.applies_to(evaluation_case)
+            self._evaluator.evaluate_by_llm(metric_case)
+            for metric_case in metric_cases
+            if self._evaluator.applies_to(metric_case)
         ]
-
-    @staticmethod
-    def _pass_threshold() -> float:
-        """The score a metric must reach to pass, imported lazily so Opik loads only when grading."""
-        from .opik_evaluator import OpikTraceEvaluator
-
-        return OpikTraceEvaluator.THRESHOLD

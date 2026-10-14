@@ -4,7 +4,7 @@ import logging
 from functools import partial
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
-from ..fetch import FetchedSpan, SpanKind, SpanUsage, TraceFetcher, TraceQuery
+from ..fetch import FetchedSpan, SpanKind, SpanStatus, SpanUsage, TraceFetcher, TraceQuery
 
 if TYPE_CHECKING:
     from langfuse import Langfuse
@@ -91,6 +91,7 @@ class LangfuseTraceFetcher(TraceFetcher):
             parent_span_id=observation.parent_observation_id,
             name=observation.name,
             kind=self._KINDS.get(observation.type, SpanKind.SPAN),
+            status=SpanStatus.ERROR if str(getattr(observation, "level", None)).upper().endswith("ERROR") else SpanStatus.UNSET,
             start_time=observation.start_time,
             end_time=observation.end_time,
             session_id=getattr(observation, "session_id", None),
