@@ -57,6 +57,18 @@ def serialize_message_body(message_body: Any) -> str:
     holding a value that never passed payload validation still serializes instead of raising and
     losing the message to retry exhaustion.
 
+    **This is the only explicit ``PayloadCodec`` call left in the tree, and the only reason it is
+    here is the second caller.** Everywhere else the rule sits on a field — ``QueueMessage.body``
+    is a ``JSONText``, so a sender hands it an object and the envelope encodes — which is why
+    ``nats.py``, ``kafka.py`` and ``in_memory.py`` have nothing like this. ``SQSTransport.send``
+    does not need it either: it arrives with ``message.body``, already a ``str``, and falls through
+    the first branch. The dict branch exists for ``SQSHandler``, which ``ECSAgentRunner`` and
+    ``ServerlessAgentRunner`` use to write the output queue **without** building a ``QueueMessage``.
+
+    So: do not delete this as dead code because the transports look symmetric, and do not copy it
+    into a new transport. If those two runners are ever converged onto the envelope, this whole
+    function goes with them and ``PayloadCodec.encode`` drops to one internal caller.
+
     :param message_body: The message payload to serialize.
     :return: A string representation suitable for the SQS MessageBody field.
     """

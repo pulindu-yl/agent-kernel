@@ -47,16 +47,19 @@ class PayloadCodec:
     @classmethod
     def normalise(cls, value: Any) -> dict | list: ...      # the validator body
     @classmethod
-    def encode(cls, body: Any) -> str: ...                  # the serialisation gates
+    def encode(cls, body: Any) -> str: ...                  # lenient; the queue boundary
+    @classmethod
+    def as_text(cls, value: Any) -> Any: ...                # the JSONText validator body
     @classmethod
     def _require_finite(cls, value: Any, path: str = "content") -> None: ...  # private
 
 
 JSONPayload = Annotated[dict | list, BeforeValidator(PayloadCodec.normalise)]
+JSONText = Annotated[str, BeforeValidator(PayloadCodec.as_text)]
 ```
 
-`JSONPayload` is a module-level name because a pydantic annotated type cannot be anything else; it is
-a type alias, not a component. `PayloadCodec` holds no instance state and is used as a namespace with
+`JSONPayload` and `JSONText` are module-level names because a pydantic annotated type cannot be
+anything else; they are type aliases, not components. `PayloadCodec` holds no instance state and is used as a namespace with
 behaviour, so every method is a `@classmethod` — the house rules' stated form for a class needing no
 instance.
 
@@ -75,6 +78,23 @@ instance.
 4. **Re-raises a serializer failure as `ValueError`**, which pydantic wraps into a `ValidationError`
    naming the `content` field. (`PydanticSerializationError` is itself a `ValueError` subclass, so it
    would be wrapped anyway; re-raising is for the message, which otherwise names no field.)
+
+**`normalise` runs twice for a labelled reply**, once on the field and once in
+`ResponseBuilder.build_response`. Not redundant: the second run is the only thing that sees a
+payload replaced by `model_copy` or mutated in place after validation (§ *Serialisation gates*).
+
+**`encode` — the one lenient method, and only because of where it runs.** The same round trip,
+then `json.dumps`, with a non-finite float rendered as `null` rather than raised on. That is right
+at a queue boundary and nowhere else: a raise there loses the message to retry exhaustion and tells
+the caller only `"Failed to process message after N retries"`. A reply being assembled in-process
+has no such problem, which is why `ResponseBuilder` re-runs `normalise` instead of reaching for
+this (§ *Serialisation gates*).
+
+**`as_text` — used by `QueueMessage.body`:** `encode` for a dict or a list, pass-through for
+anything else, so a `str` body keeps its exact bytes and a scalar still fails the field's own `str`
+validation. Deliberately thin. It exists so the encoding rule can live on a *field* rather than in
+the memory of whoever writes the next transport, which is the same reason `normalise` lives on
+`content` rather than at each reply's construction site.
 
 Two surprises worth documenting rather than discovering, both verified: a `Decimal` becomes a
 **quoted string** while a `float` stays a number, and `bytes` coerce **only when UTF-8 decodable** —
@@ -257,7 +277,7 @@ else:
 - This one function serves REST, WebSocket, async mode and conversation threads. No per-surface
   change is needed for any of them.
 
-**`ResponseBuilder.stream_chunk` (`core/chat_service.py:384`)** changes `chunk.model_dump(exclude_none=True)`
+**`ResponseBuilder.stream_chunk` (`core/chat_service.py:400`)** changes `chunk.model_dump(exclude_none=True)`
 (`:397`) to `chunk.model_dump(mode="json", exclude_none=True)`. Today's events are all
 `str`/`int`/`bool`,
 so this is byte-identical for them; without it a `DataMessage` reaches the bare `json.dumps` at
@@ -265,25 +285,67 @@ so this is byte-identical for them; without it a `DataMessage` reaches the bare 
 
 ### Serialisation gates
 
-Four sites serialise a response body with a bare `json.dumps`. A value arriving through one of
+Several sites serialise a response body with a bare `json.dumps`. A value arriving through one of
 `normalise`'s two bypasses raises `TypeError` there, the message is lost to retry exhaustion, and the
 caller is told `"Failed to process message after N retries"` — naming neither cause nor fix.
 
-**All four call `PayloadCodec.encode(body)`.** They do *not* each grow their own encoder call: the
-whole thesis is that every surface emits the same bytes, and four independent fixes are four chances
-to drift. One component, four call sites.
+**The fix is not a call at each site.** That was the first shape of this work: `PayloadCodec.encode`
+wherever a body becomes text. It is a rule somebody has to remember, and the person adding the next
+deployment target or queue transport has no way to learn it exists. Worse, it misdirects: a reader
+who finds `encode` at a seam concludes the seam owns the rule. Both deployment adapters disprove
+that on sight — each writes its own error body with a bare `json.dumps` two lines away.
 
-| Site | Current |
+So the rule goes where it cannot be skipped, in two forms, and the call sites mostly disappear.
+
+**First: the producer guarantees it.** Every value in a response body is already a `str` or a
+`model_dump(mode="json")` except one — the object form, which is the point of this change and the
+only way a payload reaches a client untouched. So that branch alone re-normalises:
+
+```python
+elif isinstance(result, AgentReplyAny) and result.media_type:
+    response_dict = {"result": PayloadCodec.normalise(result.content), "media_type": result.media_type}
+```
+
+which buys the invariant everything else rests on: **anything `ResponseBuilder.build_response`
+returns survives a bare `json.dumps`.** The obvious code is the correct code, for surfaces that do
+not exist yet. An unlabelled reply pays nothing, since `result` is a string there.
+
+**`normalise`, not a lenient variant.** It raises on a `NaN`, where the lenient path renders
+`null` — indistinguishable from a field the agent chose to omit, which is the whole reason
+Decision 8 refuses it at construction. Refusing it here too costs a caller nothing it wants: the
+error names the key path and is reported, where `null` ships wrong data quietly. The leniency
+argument belongs to the queue boundary, where a raise loses the message instead of reporting
+anything; a reply assembled in-process is not in that position.
+
+**Second: where the boundary has a model, the field carries it.** `QueueMessage.body` takes a
+`JSONText` annotation — the same trick `JSONPayload` plays on `content` — and encodes a dict or list
+on validation, passing a `str` through byte for byte. Not cosmetic: SQS, Kafka and NATS all call
+`.encode()` on the body and raise `AttributeError` on a dict, while the in-memory transport stores
+the envelope as an object and never notices. Left to each sender, the rule would hold in
+development and break in production.
+
+**What remains is one gate.** `serialize_message_body` (`pipeline/transport/sqs.py:52-67`) keeps it,
+because it also serves `SQSHandler`'s direct callers, whose bodies passed through neither a
+`QueueMessage` nor the response builder. Everywhere else writes a plain `json.dumps`:
+
+| Site | Why no gate |
 |---|---|
-| `pipeline/agent_runner.py:198` | `json.dumps(response_body)` |
-| `pipeline/transport/sqs.py:52-67` | ECS twin |
-| `deployment/aws/serverless/core/router/rest_lambda.py:288` | `json.dumps(res_body)` |
-| `deployment/azure/akfunction.py:53` | `json.dumps(res_body)` |
+| `deployment/aws/serverless/core/router/rest_lambda.py:288` | Body is `build_response`'s, already normalised |
+| `deployment/azure/akfunction.py:53` | Same |
+| `deployment/aws/core/websocket_service.py:167` | Direct routes push `build_response`'s body; every other caller holds one it just read back with `json.loads` |
+| `pipeline/request_handler.py:122` | Record came off the wire as text |
 
-`pipeline/request_handler.py` renders the 202 path through `JSONResponse`, which is
-`json.dumps(..., allow_nan=False)`. Direct REST survives the same payload because FastAPI's
-`jsonable_encoder` copes, so the two paths disagree — the per-surface divergence §2 argues against.
-It changes to the same `PayloadCodec.encode`, wrapped in a plain `Response` (`:122`).
+`pipeline/request_handler.py:122` still builds a plain `Response` rather than a `JSONResponse`, for
+a reason unrelated to payloads. `JSONResponse` encodes with `allow_nan=False`, and a `NaN` reaches a
+stored record the ordinary way — stdlib `json.dumps` writes the token `NaN` onto the queue and
+`json.loads` reads it back as a float — so the 202 path would 500 where FastAPI's own return path
+writes it through. That is the per-surface divergence §2 argues against, and it is pinned by a test.
+
+**The WebSocket push is the one found late.** Only the *direct* (non-queue) routes reach it with a
+freshly built body: ECS `_process_chat_direct` and `ws_lambda._process_chat` call `ChatService`
+in-process and broadcast the reply. That body is `build_response`'s, so it is safe for the same
+reason the rest are. `pipeline/ws/push.py` was checked and needs nothing: the pipeline's WebSocket
+gateway always enqueues (`ws/handler.py:231`), so nothing reaches it without crossing the wire.
 
 ### `core/util/driver/dynamodb.py` — float ↔ Decimal
 
@@ -394,7 +456,7 @@ AG-UI client on an older mapper degrades rather than breaks.
 
 `ThreadRecorder.post_run` (`:60`) stores `str(result)` into `ThreadMessage.content` (`:67`). Through
 the queue, `AgentRunner` passes the already-built response body's `result` value
-(`pipeline/agent_runner.py:56`), which for a labelled reply is now a **dict**, and `str()` on a dict
+(`pipeline/agent_runner.py:55`), which for a labelled reply is now a **dict**, and `str()` on a dict
 yields a Python repr — single quotes, `None`, `True`. The direct thread handler stores proper JSON
 for the same reply. So the same agent, in the same thread store, would be recorded one way in
 single-process mode and another through the queue, permanently.
@@ -405,7 +467,7 @@ single-process mode and another through the queue, permanently.
 |---|---|---|
 | `integration/thread/thread_chat.py:136` (direct) | an `AgentReply` **object** | `json.dumps(content)` — already correct |
 | `integration/thread/thread_chat.py:178` (direct, streamed) | a `str` of joined deltas | itself — correct |
-| `pipeline/agent_runner.py:56` (queue) | the response body's `result` **value** — a `dict` once labelled | a Python **repr** — the defect |
+| `pipeline/agent_runner.py:55` (queue) | the response body's `result` **value** — a `dict` once labelled | a Python **repr** — the defect |
 
 So the fix cannot be "always `json.dumps`": that would raise `TypeError` on the direct path's model
 object. The normalisation becomes a method on the recorder — `ThreadRecorder._as_thread_content` —
@@ -429,7 +491,7 @@ paths must agree with each other before they agree with anything else: the direc
 and `default=str` produce identical bytes, so the choice only shows on a value that reached
 `content` through one of the documented bypasses — there, thread history holds `str()`'s form while
 the live reply carries ISO 8601. That divergence is accepted; two encodings of the same reply inside
-one store is not. **Five gate sites use `PayloadCodec.encode`, not six.**
+one store is not. **It is not one of the gate sites, and that is the only deliberate exception.**
 
 `ThreadMessage.content` stays `str` (`integration/thread/model.py:33`) — **labelling stored history
 is a Non-goal**; this fixes the encoding only.
@@ -543,7 +605,7 @@ Numbered, exhaustive. Every one is intentional.
 - `ThreadMessage.content`'s type (`str`) and the thread read routes.
 - `pipeline/response_handler.py`'s messaging path.
 - The response dict for any reply without a `media_type` — byte for byte, including the
-  deferred-schedule 202 acknowledgement (`core/chat_service.py:551` builds an `AgentReplyAny` with no
+  deferred-schedule 202 acknowledgement (`core/chat_service.py:567` builds an `AgentReplyAny` with no
   media type).
 - Every `result` example in the published docs (six files) and every `["result"]` read in the example
   test suites (seven, across four files) — all text or unlabelled.
@@ -589,7 +651,16 @@ Run with `cd ak-py && uv run pytest`.
   normalise, and neither does in-place mutation. Pin them so nobody builds on a guarantee that is
   not there.
 - **`encode` separately from `normalise`:** a body holding a `datetime` that bypassed the validator
-  still encodes rather than raising — the property the four gates depend on.
+  still encodes rather than raising — the property every gate depends on.
+- **`QueueMessage.body` is JSON text**, asserted on the envelope itself: a dict and a list encode on
+  validation, a `str` is byte-identical to what the sender passed, an empty default stays `""`, and
+  a scalar is still a `ValidationError`. Plus `_send_to_output` handing the envelope a dict, which
+  is what makes dropping its own `encode` call safe.
+- **The response body is JSON-safe**, which is the invariant the seams rest on: a reply whose
+  `content` was replaced by `model_copy` still comes back out of `build_response` normalised, so
+  `json.dumps(body)` equals `PayloadCodec.encode(body)` — written that way deliberately, because
+  what a new seam's author is allowed to assume is the thing worth pinning. An unlabelled reply is
+  untouched, so the coercion costs nothing on the common path.
 
 **`tests/test_a2ui_hook.py`** — the capability, with `AKConfig.get` monkeypatched per the
 `test_sessions_redis.py` fake-config pattern.
@@ -631,6 +702,7 @@ catches a future surface regressing to an early encode. **The fixture must carry
 | `tests/test_shared_drivers.py` — plus `DynamoDecimalCodec` round-trip cases of its own | A payload carrying a float is stored without raising **and reads back as a `float`, not a `Decimal`** — asserted by a `json.dumps` on the polled record, which is what `rest_lambda.py:288` does and what would fail if only the write side were fixed. |
 | `tests/test_api_mcp.py` | A labelled reply produces `structuredContent` plus `_meta`; an **array** payload produces `{"result": [...]}` with the `fastmcp.wrap_result` flag, asserted both on the `ToolResult` and through a real client whose `.data` is the array again; an unlabelled structured reply, a text reply and an image reply each produce today's string. |
 | `tests/test_config.py` | The `a2ui` block loads, defaults to disabled, and accepts `AK_A2UI__*`. |
+| `tests/test_websocket_service_broadcast.py` | The AWS push serialises through the codec: a reply body carrying a `datetime` and a `Decimal` pushes as JSON, and an ordinary body is byte-identical to `json.dumps`. The gate runs on every push, so it may not change the bytes for anyone else. |
 | `tests/test_runtime.py` | The capability through `Runtime.run`, which is where the registration in `_get_system_post_hooks` is the thing under test: a JSON reply arrives labelled with no application hook anywhere, prose and an out-of-scope agent are left alone, `enabled: false` changes nothing, and the output guardrail receives the reply **before** the label is applied. |
 
 **Riskiest consumer.** `pipeline/agent_runner.py` changes shape the most for a labelled reply — it

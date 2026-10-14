@@ -101,7 +101,7 @@ serialised exactly as it is today — string in `result`, byte for byte:
 
 So `result` is `string | object`, discriminated by whether a media type is present. Nobody who has
 not opted in sees any change: not a text agent, not an agent already using structured output, not
-the deferred-schedule acknowledgement (`core/chat_service.py:496` builds an `AgentReplyAny` with no
+the deferred-schedule acknowledgement (`core/chat_service.py:567` builds an `AgentReplyAny` with no
 media type, which is what keeps that contract stable).
 
 ### Why one field, switched by the label — and not a second field

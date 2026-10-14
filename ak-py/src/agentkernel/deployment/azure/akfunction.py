@@ -6,7 +6,6 @@ import azure.functions as func
 
 from ...core.chat_service import ChatService
 from ...core.model import BaseRunRequest
-from ...core.util.payload import PayloadCodec
 
 
 class AzureFunctions:
@@ -51,7 +50,7 @@ class AzureFunctions:
             status_code, res_body = cls._get_chat_service().process_chat_request(body)
 
             return func.HttpResponse(
-                body=PayloadCodec.encode(res_body),
+                body=json.dumps(res_body),
                 status_code=status_code,
                 mimetype="application/json",
             )

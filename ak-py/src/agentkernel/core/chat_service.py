@@ -24,6 +24,7 @@ from .model import (
 )
 from .service import AgentService
 from .util.async_bridge import iterate_async_sync, run_async_sync
+from .util.payload import PayloadCodec
 
 
 class RequestBuilder:
@@ -338,6 +339,21 @@ class ResponseBuilder:
         there because a resume has to name the agent that paused, and a request that named none was
         served by the default agent — without this the client cannot answer its own pause.
 
+        **The dict this returns is JSON-safe, and that is a guarantee rather than a coincidence.**
+        Every other value it holds is a `str` or a `model_dump(mode="json")`; the object form is
+        the one way a payload reaches a client untouched, so that branch re-runs
+        ``PayloadCodec.normalise`` to close the two bypasses the field validator cannot see
+        (`model_copy` over `content`, and in-place mutation). The point is what it buys downstream:
+        a deployment adapter can serialise this body with a bare ``json.dumps`` and be correct,
+        instead of having to know that a codec exists.
+
+        `normalise` rather than a lenient variant, deliberately. It raises on a `NaN`, which the
+        lenient path would render as `null` — indistinguishable from a field the agent chose to
+        omit, which is the whole reason Decision 8 refuses it at construction. Refusing it here too
+        costs nothing a caller wants: the error names the key path and is reported, where `null`
+        would ship wrong data quietly. Leniency belongs at a queue boundary, where a raise loses
+        the message instead of reporting anything.
+
         :param status_code: HTTP status code
         :param session_id: Session identifier for the response
         :param rest_api_mode: If True, return dict only on success or raise HTTPException on error; if False, return tuple
@@ -349,7 +365,7 @@ class ResponseBuilder:
         if error:
             response_dict = {"error": str(error)}
         elif isinstance(result, AgentReplyAny) and result.media_type:
-            response_dict = {"result": result.content, "media_type": result.media_type}
+            response_dict = {"result": PayloadCodec.normalise(result.content), "media_type": result.media_type}
         else:
             response_dict = {
                 "result": str(result) if isinstance(result, (AgentReplyText, AgentReplyImage, AgentReplyAny)) else "Non textual result received"

@@ -60,23 +60,41 @@ class PayloadCodec:
     @classmethod
     def encode(cls, body: Any) -> str:
         """
-        Serialise a response body to JSON, coping with values that never passed `normalise`.
+        Serialise a message body to JSON, coping with values that never passed `normalise`.
 
         Deliberately two passes rather than one. Pydantic converts whatever bare ``json.dumps``
         would have refused, and ``json.dumps`` then writes it out — so a body that was already
-        JSON-safe produces the bytes it produced before this gate existed, down to the spacing. The
-        gates run on every queue message and every serverless response, not only on labelled ones,
-        and changing their bytes for everybody would be exactly the kind of untargeted change this
-        work promises not to make.
+        JSON-safe produces the bytes it produced before this gate existed, down to the spacing.
+        Changing those bytes for everybody would be exactly the kind of untargeted change this work
+        promises not to make.
 
-        Unlike `normalise` this is lenient: a non-finite float becomes ``null`` here rather than
-        raising, because a gate's job is to get the message out, not to re-litigate a payload that
-        already passed validation or bypassed it.
+        **Lenient where `normalise` is strict, and only here.** A non-finite float becomes ``null``
+        rather than raising. That is right at a queue boundary and wrong anywhere else: a raise here
+        loses the message to retry exhaustion and tells the caller only "Failed to process message
+        after N retries", so a payload that already passed validation, or bypassed it, is better
+        delivered imperfectly than not at all. A reply being built in-process has no such problem,
+        which is why ``ResponseBuilder`` calls `normalise` instead.
 
-        :param body: The response body, usually a dict built by `ResponseBuilder`.
+        :param body: The message body.
         :return: The JSON text.
         """
         return json.dumps(json.loads(cls._adapter.dump_json(body)))
+
+    @classmethod
+    def as_text(cls, value: Any) -> Any:
+        """
+        Encode a structured value to JSON text, and leave anything else alone.
+
+        The validator behind `JSONText`. A field annotated with it accepts the object a caller
+        happens to be holding as readily as the string, which is what moves the encoding rule from
+        "every sender must remember" to "the envelope does it". A value that is already a string is
+        returned untouched, so a sender that encoded for itself produces identical bytes.
+
+        :param value: The value assigned to the field.
+        :return: JSON text for a dict or list; the value unchanged otherwise, leaving the field's
+            own `str` validation to reject what does not belong there.
+        """
+        return cls.encode(value) if isinstance(value, (dict, list)) else value
 
     @classmethod
     def _require_finite(cls, value: Any, path: str = "content") -> None:
@@ -101,3 +119,6 @@ class PayloadCodec:
 
 JSONPayload = Annotated[dict | list, BeforeValidator(PayloadCodec.normalise)]
 """A payload object or array, normalised to plain JSON types on validation."""
+
+JSONText = Annotated[str, BeforeValidator(PayloadCodec.as_text)]
+"""JSON text for a transport that carries a string body, encoded on validation if handed an object."""

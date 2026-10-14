@@ -6,7 +6,6 @@ from typing import Any, Callable, Dict, Optional
 from ......core.chat_service import ChatService
 from ......core.config import AKConfig
 from ......core.model import BaseRequest, ExecutionMode
-from ......core.util.payload import PayloadCodec
 from ....core.response_store import ResponseStoreFactory
 from ....core.sqs_handler import SQSHandler
 from .common import BaseLambdaRouter
@@ -286,7 +285,7 @@ class DefaultEndpointsHandler:
 
             return {
                 "statusCode": status_code,
-                "body": PayloadCodec.encode(res_body),
+                "body": json.dumps(res_body),
             }
 
         except Exception as e:

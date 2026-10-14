@@ -52,12 +52,17 @@ Per iteration: `cd ak-py && uv run pytest tests/<file>` for the named test, then
 
 - **Goal:** every path that would break on a dict `result` is fixed **before** anything can produce
   one. Nothing here is observable yet.
-- **Files:** `pipeline/agent_runner.py`, `pipeline/transport/sqs.py`,
+- **Files:** `pipeline/envelope.py`, `pipeline/transport/sqs.py`,
   `deployment/aws/serverless/core/router/rest_lambda.py`, `deployment/azure/akfunction.py`,
-  `pipeline/request_handler.py`, `core/util/driver/dynamodb.py`, `integration/thread/recorder.py`
+  `deployment/aws/core/websocket_service.py`, `pipeline/request_handler.py`,
+  `core/util/driver/dynamodb.py`, `integration/thread/recorder.py`
 - **Steps:**
-  1. All four serialisation gates call **`PayloadCodec.encode`** — one component, four call sites,
-     not four independent fixes that can drift (spec § *Serialisation gates*).
+  1. Put the rule where it cannot be skipped rather than at each seam (spec § *Serialisation
+     gates*): `ResponseBuilder.build_response` re-normalises the one value that can reach a client as an
+     object, so anything it returns survives a bare `json.dumps`, and `QueueMessage.body` takes
+     `JSONText` so no sender or future transport has to know the rule exists. One explicit
+     `PayloadCodec.encode` remains, in `serialize_message_body`, which also serves callers that
+     passed through neither.
   2. `pipeline/request_handler.py:122`'s `JSONResponse` → the same `PayloadCodec.encode`.
   3. New **`DynamoDecimalCodec`** beside `DynamoDBDriver`: `to_dynamo` on write, `from_dynamo` on
      read — **both directions**; the read side is half the fix, not an afterthought.
@@ -119,10 +124,12 @@ Per-iteration tests land with their iteration. This iteration adds what spans th
   1. One labelled reply asserted to arrive with the same content and label on REST, WebSocket, MCP
      and AG-UI. **The fixture carries a `datetime` and a `Decimal`** — parity on a payload that was
      never at risk proves nothing. A2A joins when the port issue adds the data part.
-  2. Confirm `PayloadCodec.encode` is the only encoder at all **five** gate sites — the copy-drift
-     the single component exists to prevent. The thread recorder is the sixth candidate and
-     deliberately uses `json.dumps(default=str)` instead, to stay byte-identical to the direct
-     path's `AgentReplyAny.__str__` (spec § `integration/thread/recorder.py`).
+  2. Confirm `PayloadCodec.encode` is the only encoder at every gate site — the copy-drift the
+     single component exists to prevent — and that `QueueMessage.body` carries the rule on the
+     field (`JSONText`) rather than leaving it to each sender, so a transport added later inherits
+     it. The thread recorder is the one deliberate exception and uses `json.dumps(default=str)`, to
+     stay byte-identical to the direct path's `AgentReplyAny.__str__`
+     (spec § `integration/thread/recorder.py`).
   3. Confirm the back-compat matrix from iteration 2 still passes unchanged.
   4. Full suite green.
 - **Verify:** `cd ak-py && uv run pytest` and `make lint-check-all`
