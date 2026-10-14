@@ -110,7 +110,7 @@
       "name": "Fetch recorded spans back",
       "input": "Fetch the tool-call spans my agent recorded in the last 6 hours so I can evaluate them",
       "expected_outputs": [
-        "Trace.get().fetch(",
+        "Trace.get().fetch_spans(",
         "from agentkernel.trace import",
         "SpanKind.TOOL",
         "last=timedelta(",

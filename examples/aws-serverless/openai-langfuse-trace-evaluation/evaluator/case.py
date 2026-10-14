@@ -14,6 +14,13 @@ class ToolCall(BaseModel):
     failed: bool = False
 
 
+class TraceEvaluationCase(AKEvaluationCase):
+    """What the judges read: the AK evaluation case plus the trace's transcript."""
+
+    transcript: str
+    tool_call_count: int = 0
+
+
 class TraceCase(BaseModel):
     """The facts of one request (one trace), gathered from its spans."""
 
@@ -94,10 +101,10 @@ class TraceCase(BaseModel):
             tool_call_lines = "(none)"
         return f"User request:\n{self.user_input}\n\nTool calls:\n{tool_call_lines}\n\nFinal answer:\n{self.output}"
 
-    def to_evaluation_case(self, threshold: float) -> AKEvaluationCase:
+    def to_evaluation_case(self, threshold: float) -> TraceEvaluationCase:
         """Builds the case the judges score, with the tool results as context."""
         tool_results = [call.output for call in self.tool_calls if call.output]
-        return AKEvaluationCase(
+        return TraceEvaluationCase(
             user_input=self.user_input,
             actual=self.output,
             context=tool_results or None,

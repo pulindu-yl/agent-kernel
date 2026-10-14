@@ -5,7 +5,7 @@ mode with Langfuse tracing. On request, the request-handler Lambda reads a sessi
 `Trace.get().fetch_traces(...)`, grades each request with four Opik LLM judges, and stores one row per trace in DynamoDB.
 
 It uses only public Agent Kernel API: `Trace.fetch_traces`, `FetchedTrace`, `FetchedSpan`, `SpanStatus`, `SpanUsage`,
-`OpikAKEvaluator`, `Lambda`, `ServerlessAgentRunner` and `ResponseHandler`.
+the `AKEvaluator` ABC, `Lambda`, `ServerlessAgentRunner` and `ResponseHandler`.
 
 ## Architecture
 
@@ -130,10 +130,9 @@ limit is 400 KB) by dropping tool calls and shortening `input`/`output`, so a la
 
 ## Changing the metrics or the store
 
-- **Metrics:** `TraceEvaluationJob` runs every metric in `OpikAKEvaluator.METRICS` (`task_completion`,
-  `tool_correctness`, `answer_relevance`, `hallucination`), each by setting `AKEvaluationCase.metric`. For another judge
-  library, write an `AKEvaluator` subclass with `METRICS`, `applies_to` and `evaluate_by_llm`, and return it from the
-  factory in `TraceEvaluationJob.from_env`.
+- **Metrics:** add an entry to `OpikTraceEvaluator.METRICS` and `_JUDGE_CLASSES`
+  (`evaluator/opik_evaluator.py`). For another judge library, write another `AKEvaluator` subclass with
+  `applies_to` and `evaluate_by_llm`, and return it from the factory in `TraceEvaluationJob.from_env`.
 - **Store:** `TraceEvaluationJob` and `EvaluationAPI` only call `read_progress`, `write_progress`, `save_results`,
   `mark_failed` and `count_session_progress` on `EvaluationStore` (`evaluator/store.py`); replace it with a
   class offering the same methods.

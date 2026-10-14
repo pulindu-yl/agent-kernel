@@ -268,16 +268,21 @@ export AWS_REGION="us-east-1"
 5. No code changes needed — tracing is automatically applied to all agent executions.
 
 **Fetching spans back (any of the four backends):** to read recorded spans into Python (e.g. to evaluate
-recent runs), call `Trace.get().fetch(...)` with provider-neutral filters; results are `FetchedSpan`s, oldest first:
+recent runs), call `Trace.get().fetch_spans(...)` with provider-neutral filters; results are `FetchedSpan`s, oldest first (each has a `status` of `UNSET`, `OK` or `ERROR`):
 
 ```python
 from datetime import timedelta
 
 from agentkernel.trace import SpanKind, Trace
 
-tool_calls = Trace.get().fetch(last=timedelta(hours=6), kinds=[SpanKind.TOOL])
-spans = Trace.get().fetch(session_id="session-123", limit=500)
+tool_calls = Trace.get().fetch_spans(last=timedelta(hours=6), kinds=[SpanKind.TOOL])
+spans = Trace.get().fetch_spans(session_id="session-123", limit=500)
 tokens = sum(span.usage.total_tokens or 0 for span in spans if span.usage)  # span.usage: tokens and cost per model call
+
+# Whole traces (spans grouped by trace, with the root, input/output and summed usage); skip a trace whose root is missing
+for trace in Trace.get().fetch_traces(session_id="session-123"):
+    if trace.root is not None:
+        print(trace.user_input, trace.output, trace.usage)
 ```
 
 - Langfuse and OpenLLMetry reuse the sending credentials.

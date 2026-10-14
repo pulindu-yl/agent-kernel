@@ -25,11 +25,8 @@ class AKEvaluationCase(BaseModel):
     actual: str
     expected: str | None = None
     threshold: float = 0.5  # the score/pass cutoff the evaluator must weigh its own passed against
-    context: list[str] | None = None  # what the answer should be grounded in; read by Opik's hallucination metric
+    context: list[str] | None = None  # carried, unpopulated in v1 (no shipped metric reads it)
     criteria: str | None = None  # carried, unpopulated in v1 (llm mode uses AK's default rubric)
-    metric: str | None = None  # a reference-free metric to judge by name (Opik: OpikAKEvaluator.METRICS); None judges against expected
-    transcript: str | None = None  # the whole agent run (request, tool calls with results, answer); read by Opik's agent judges
-    tool_call_count: int | None = None  # tool calls in the run; Opik's tool correctness judge needs at least one
 
 
 class AKEvaluationResult(BaseModel):

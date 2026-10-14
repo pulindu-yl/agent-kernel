@@ -11,9 +11,7 @@ from .case import TraceCase
 from .store import EvaluationStore, Progress, TraceProgress
 
 if TYPE_CHECKING:
-    from agentkernel.test.core.evaluator.opik import (
-        OpikAKEvaluator,
-    )  # imported on first grade only: Opik and litellm load slowly
+    from .opik_evaluator import OpikTraceEvaluator  # imported on first grade only: Opik and litellm load slowly
 
 _log = logging.getLogger("ak.example.trace_evaluation")
 
@@ -41,7 +39,6 @@ class TraceEvaluationJob:
     """Decides each of a session's traces' progress (prepare) and judges the ready ones (grade)."""
 
     FETCH_WINDOW = timedelta(hours=24)
-    PASS_THRESHOLD = 0.5  # the score a metric must reach to pass
     SETTLE_TIME = timedelta(minutes=2)
     GRADING_LEASE = timedelta(minutes=15)  # above the grading invocation's 10-minute Lambda timeout
 
@@ -49,27 +46,28 @@ class TraceEvaluationJob:
         self,
         trace: Trace,
         store: EvaluationStore,
-        evaluator_factory: Callable[[], "OpikAKEvaluator"],
+        evaluator_factory: Callable[[], list["OpikTraceEvaluator"]],
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ):
         self._trace = trace
         self._store = store
         self._evaluator_factory = evaluator_factory
-        self._evaluator: "OpikAKEvaluator | None" = None  # built on the first grade
+        self._evaluators: list["OpikTraceEvaluator"] | None = None  # built on the first grade
         self._clock = clock
 
     @classmethod
     def from_env(cls) -> "TraceEvaluationJob":
-        """Builds the job on the configured tracer and the RESULTS_TABLE table, with AK's Opik evaluator."""
+        """Builds the job on the configured tracer and the RESULTS_TABLE table, with the Opik judges."""
 
-        def build_opik_evaluator() -> "OpikAKEvaluator":
-            """Builds the evaluator from the AK_TEST__LLM__* settings."""
+        def build_opik_evaluators() -> list["OpikTraceEvaluator"]:
+            """Builds one Opik evaluator per metric, from the AK_TEST__LLM__* settings."""
             from agentkernel.test import AKTestConfig
-            from agentkernel.test.core.evaluator.opik import OpikAKEvaluator
 
-            return OpikAKEvaluator(AKTestConfig.get())
+            from .opik_evaluator import OpikTraceEvaluator
 
-        return cls(Trace.get(), EvaluationStore.for_table(os.environ["RESULTS_TABLE"]), build_opik_evaluator)
+            return OpikTraceEvaluator.for_all_metrics(AKTestConfig.get())
+
+        return cls(Trace.get(), EvaluationStore.for_table(os.environ["RESULTS_TABLE"]), build_opik_evaluators)
 
     def prepare_traces(self, session_id: str) -> PrepareSummary:
         """Gives every found trace of the session its row and progress; returns the traces to grade."""
@@ -175,13 +173,19 @@ class TraceEvaluationJob:
         return Progress.GRADING
 
     def _run_evaluators(self, case: TraceCase) -> list[AKEvaluationResult]:
-        """Runs every metric that applies to the trace and returns the results."""
-        if self._evaluator is None:
-            self._evaluator = self._evaluator_factory()
-        evaluation_case = case.to_evaluation_case(self.PASS_THRESHOLD)
-        metric_cases = [evaluation_case.model_copy(update={"metric": metric}) for metric in self._evaluator.METRICS]
+        """Runs every evaluator that applies to the trace and returns their results."""
+        if self._evaluators is None:
+            self._evaluators = self._evaluator_factory()
+        evaluation_case = case.to_evaluation_case(self._pass_threshold())
         return [
-            self._evaluator.evaluate_by_llm(metric_case)
-            for metric_case in metric_cases
-            if self._evaluator.applies_to(metric_case)
+            evaluator.evaluate_by_llm(evaluation_case)
+            for evaluator in self._evaluators
+            if evaluator.applies_to(evaluation_case)
         ]
+
+    @staticmethod
+    def _pass_threshold() -> float:
+        """The score a metric must reach to pass, imported lazily so Opik loads only when grading."""
+        from .opik_evaluator import OpikTraceEvaluator
+
+        return OpikTraceEvaluator.THRESHOLD
