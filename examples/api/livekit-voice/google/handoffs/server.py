@@ -3,9 +3,9 @@ import logging
 from google.adk.agents import Agent as GoogleAgent
 from google.genai import types
 
-from agentkernel.framework.adk import GoogleADKModule, GoogleADKToolBuilder
+from agentkernel.adk import GoogleADKModule, GoogleADKToolBuilder
 from agentkernel.integration.adapter import GatewayRunner
-from agentkernel.integration.livekit import LiveKitEdgeGateway
+from agentkernel.livekit import LiveKitEdgeGateway
 from agentkernel.pipeline import IOHandler
 
 logging.basicConfig(

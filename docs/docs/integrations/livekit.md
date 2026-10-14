@@ -61,7 +61,7 @@ from agents import Agent as OpenAIAgent
 
 from agentkernel.framework.openai import OpenAIModule
 from agentkernel.integration.adapter import GatewayRunner
-from agentkernel.integration.livekit import LiveKitEdgeGateway
+from agentkernel.livekit import LiveKitEdgeGateway
 from agentkernel.pipeline import IOHandler
 
 agent = OpenAIAgent(
@@ -82,7 +82,7 @@ the IOHandler with the gateway, and the Agent Runner.
 
 ```python
 from agentkernel.integration.adapter import GatewayRunner
-from agentkernel.integration.livekit import LiveKitEdgeGateway
+from agentkernel.livekit import LiveKitEdgeGateway
 from agentkernel.pipeline import AgentRunner, IOHandler
 
 # Process 1: the gateway and the Response Handler
@@ -97,6 +97,25 @@ Run the Agent Runner as a single replica: its connection pool is local to the pr
 :::note Execution Mode
 LiveKit requires the Agent Kernel execution mode to be set to `realtime`. Standard async/sync text modes will not work. Ensure you have `execution.mode: realtime` set in your `config.yaml`.
 :::
+
+### Tokens for your users
+
+A person joins the room with a token signed by the room's API key and secret. When your app serves a page
+for them, ask the gateway for the token: it signs with the settings it already reads, so your code never
+reads the LiveKit settings itself.
+
+```python
+gateway = LiveKitEdgeGateway(session_id="room_01")
+
+def get_token(name: str) -> dict:
+    return {"url": gateway.room_url, "token": gateway.participant_token(f"user-{name}", name)}
+```
+
+`participant_token(identity, name=None, **grants)` always joins the gateway's room. The `grants` are LiveKit
+`VideoGrants` fields (`can_publish`, `can_subscribe`, `can_publish_data`, ...), with LiveKit's own defaults for
+any not given. It raises `ValueError` for an identity starting with `agent-` (the gateway's own agents, see
+`LiveKitEdgeGateway.AGENT_IDENTITY_PREFIX`), for `room` or `room_join` in `grants`, and when the gateway has no
+`api_key` and `api_secret` (one made with a pre-made `token` only).
 
 ### Realtime pacing and audio batching
 
@@ -142,7 +161,7 @@ from agents import Agent as OpenAIAgent
 
 from agentkernel.framework.openai import OpenAIModule
 from agentkernel.integration.adapter import GatewayRunner
-from agentkernel.integration.livekit import LiveKitEdgeGateway
+from agentkernel.livekit import LiveKitEdgeGateway
 from agentkernel.pipeline import IOHandler
 
 supervisor = OpenAIAgent(name="supervisor", model="gpt-realtime", instructions="Route the caller to billing or tech support.")
@@ -203,13 +222,62 @@ supervisor = GoogleAgent(name="supervisor", model="gemini-3.1-flash-live-preview
 
 ## Talking into a live call
 
-Background work can report back into the call: `RealtimeConnectionPool.get().get_connection(session_id).send_text(...)` puts text into the conversation, and whichever agent has the call answers it. Text starts a model response (on Gemini Live it also interrupts one still being generated), so send it only at a quiet moment; the connection's read-only turn state (`is_responding`, `is_caller_speaking`, `last_model_output_at`, `last_tool_result_at`, `last_caller_speech_at`, `last_edge_text_at`) says when that is: nothing is being played or run, and the model has answered whatever it was last given. See [Turn state](../architecture/realtime-internals.md#turn-state). The `software-team` example's `CallLink` shows the whole pattern.
+Background work can report back into the call with `RealtimeCall`, in the process that runs the realtime pool
+(every process of the single-process topology):
+
+```python
+from agentkernel.pipeline import RealtimeCall
+
+call = RealtimeCall("room_01")
+call.post_when_idle("[Team update] The build finished; 12 tests pass.", key="build")
+```
+
+Text sent into a call starts a model response, and on Gemini Live it cuts off one still being generated, so
+`post_when_idle` waits for a quiet moment: the model is not responding, the caller is not speaking, the model
+has answered what it was last given, and nothing has happened for a moment. Whichever agent has the call
+answers the post. A post waits through a reconnect and for a call that has not connected yet, and is dropped
+after `expires_after` seconds (10 minutes by default). A newer post with the same `key` replaces one still
+waiting, and `call.withdraw(key)` drops one that no longer applies. Say whose words a post is (for example
+`[Team update] ...`): the model takes it as it would the caller's words.
+
+`RealtimeCall` also tells what the call is doing: `connected`, `quiet_for()` (seconds the call has been quiet,
+or `None` while it is busy) and `agent_has_spoken` (whether the agent with the call has said anything since it
+got it, known as soon as the model generates the words: a handoff policy can refuse an agent that hands the call
+on without a word). See [Turn state](../architecture/realtime-internals.md#turn-ExecutionManagerstate) for how quiet is decided.
+
+## Watching a live call
+
+A `RealtimeHook` sees what happens in the calls an agent serves, without reading logs:
+
+```python
+from agentkernel import RealtimeEvent, RealtimeHook
+
+class Transcript(RealtimeHook):
+    async def on_event(self, session, agent, event: RealtimeEvent) -> None:
+        if event.type in ("caller_said", "agent_said"):
+            print(event.agent or "caller", event.text)
+
+    def name(self) -> str:
+        return "transcript"
+
+GoogleADKModule([pm]).realtime_hook(pm, [Transcript()])
+```
+
+| Event | When |
+|---|---|
+| `connected` / `disconnected` | The session's model socket opened (on the caller's first input) or closed (idle, failed, shut down) |
+| `caller_said` | The caller's words in one turn, as the model transcribed them. Gemini Live only: the OpenAI adapter does not enable input transcription |
+| `edge_text` | Text the edge sent into the call: what the caller typed, or a prompt the edge sends for them (the gateway's greeting) |
+| `agent_said` | An agent's words in one turn, as they reached the edge; `interrupted` when the caller talked over it |
+| `agent_changed` | The call moved to `event.agent`, and once for the agent it starts with |
+
+Hooks are attached to the agent a call starts with and see its handoffs' turns too, named in `event.agent`.
+They run one event at a time, in order, on the pool's loop but off the audio path; keep them short. A hook that
+raises is logged, and the next one still runs.
 
 ## Example Projects
 
 Complete working examples (with In-Memory, Kafka, NATS, and AWS SQS architectures) are available in the **examples/api/livekit-voice** directory. The `openai/handoffs` and `google/handoffs` variants show multi-agent handoffs with an internet support line (supervisor, billing and tech support).
-
-The `software-team` showcase puts both patterns together: a client talks to a Gemini Live voice team (Worker, PM, Architect) that agrees requirements and a design with them, then has background agents (Google ADK agents on an OpenAI model through LiteLLM) write, test and review the code in the sandbox, reporting back into the call. The client follows it on its own page: a data-only "project board" participant sends the project's state into the room on its own topic, which the page draws beside the call.
 
 ## Limitations
 

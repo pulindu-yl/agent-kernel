@@ -947,7 +947,9 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
     The caller starting a turn is reported as ``speech_started``, on the first transcription of
     their speech while the model is silent, and each later transcription as ``speech_heard``, so
     the pool can tell a quiet call from a busy one, and a long answer from silence. Gemini Live
-    does not signal the end of the caller's speech, so ``speech_stopped`` is not reported.
+    does not signal the end of the caller's speech, so ``speech_stopped`` is not reported. The
+    caller's words in a turn are reported as ``caller_transcript`` when the turn ends (the model
+    finishes, calls a tool, or text is sent in), for the agent's realtime hooks.
     """
 
     input_sample_rate = 16000
@@ -1315,7 +1317,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
                 self._interrupted_this_turn = False
                 self._model_speaking = False
                 self._caller_turn_reported = False
-                self._end_turn()
+                await self._end_turn_and_report()
                 await self._callback("done", {"status": "completed"})
 
         tool_call = getattr(message, "tool_call", None)
@@ -1333,19 +1335,32 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         final = getattr(server_content, "input_transcription", None)
         return any(transcription is not None and transcription.text for transcription in (interim, final))
 
-    def _end_turn(self) -> None:
+    def _end_turn(self) -> str:
         """Add the turn's transcribed words to the history a transfer replays: the user's, then the agent's.
 
         The caller's words are also logged, as Gemini transcribed them, so a log shows both sides of
         the call (the edge logs the agent's).
+
+        :return: The caller's words in the turn, or "" when they said nothing.
         """
+        said = ""
         for author, role, words in (("user", "user", self._user_words), (self._speaker(), "model", self._model_words)):
             text = "".join(words).strip()
             if text:
                 if author == "user":
+                    said = text
                     self._log.info(f"Caller said: {text}")
                 self._history.append(self._Said(author, types.Content(role=role, parts=[types.Part(text=text)])))
             words.clear()
+        return said
+
+    async def _end_turn_and_report(self) -> None:
+        """End the turn (``_end_turn``) and report the caller's words in it as ``caller_transcript``, for realtime hooks."""
+        await self._report_caller(self._end_turn())
+
+    async def _report_caller(self, said: str) -> None:
+        if said:
+            await self._callback("caller_transcript", {"text": said})
 
     def _speaker(self) -> str:
         """The name of the agent answering, which the turn being recorded is the work of."""
@@ -1378,7 +1393,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
 
     async def send_text(self, text: str) -> None:
         if self._connection:
-            self._end_turn()
+            await self._end_turn_and_report()
             self._history.append(self._Said("user", types.Content(role="user", parts=[types.Part(text=text)])))
             await self._connection.send_client_content(turns=types.Content(role="user", parts=[types.Part(text=text)]), turn_complete=True)
 
@@ -1408,21 +1423,24 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             await self._transfer(batch, self._transfers[chosen.id])
             return
         responses = self._responses(batch)
-        self._record_tool_turn(batch, responses)
+        await self._report_caller(self._record_tool_turn(batch, responses))
         if self._connection:
             await self._connection.send_tool_response(function_responses=responses)
 
-    def _record_tool_turn(self, batch: GoogleADKRealtimeRunner._ToolBatch, responses: list[types.FunctionResponse]) -> None:
+    def _record_tool_turn(self, batch: GoogleADKRealtimeRunner._ToolBatch, responses: list[types.FunctionResponse]) -> str:
         """Add a tool-call turn to the history, as ADK's session records it.
 
         The words said before the calls first, then the calls, then their responses; the words said
         after them follow when the turn ends.
+
+        :return: The caller's words before the calls, as ``_end_turn`` returns them.
         """
-        self._end_turn()
+        said = self._end_turn()
         author = self._speaker()
         calls = [types.Part(function_call=types.FunctionCall(id=call.id, name=call.name, args=call.args or {})) for call in batch.calls]
         self._history.append(self._Said(author, types.Content(role="model", parts=calls)))
         self._history.append(self._Said(author, types.Content(role="user", parts=[types.Part(function_response=response) for response in responses])))
+        return said
 
     @staticmethod
     def _responses(batch: GoogleADKRealtimeRunner._ToolBatch) -> list[types.FunctionResponse]:
@@ -1447,7 +1465,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         self._connection = None
         await self._stop_listening()
 
-        self._record_tool_turn(batch, self._responses(batch))
+        await self._report_caller(self._record_tool_turn(batch, self._responses(batch)))
         self._interrupted_this_turn = False
         self._model_speaking = False
         self._caller_turn_reported = False

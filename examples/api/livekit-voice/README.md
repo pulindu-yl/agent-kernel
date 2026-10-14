@@ -51,10 +51,6 @@ Each variant lives in its own directory (`openai/in_memory`, `openai/kafka`, `op
 commands from the variant you picked. The two `handoffs` variants show multi-agent handoffs, with
 every agent shown as its own participant in the room; see their READMEs.
 
-The `software-team` showcase builds on them: a Gemini Live voice team plans software with
-you while background agents (on an OpenAI model through ADK's LiteLLM) write and test it in the sandbox;
-see its README.
-
 For the single-process `in_memory` example, start the server from its directory:
 
 ```bash

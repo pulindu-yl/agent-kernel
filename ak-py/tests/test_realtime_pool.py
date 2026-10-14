@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import threading
+import time
 import types
 
 import pytest
@@ -14,6 +15,7 @@ from agentkernel.core.realtime import RealtimeRunner
 from agentkernel.core.runtime import Runtime
 from agentkernel.core.session.in_memory import InMemorySessionStore
 from agentkernel.core.tool import ToolContext
+from agentkernel.pipeline import realtime_pool
 from agentkernel.pipeline.envelope import ATTR_INTEGRATION, ATTR_REALTIME, QueueName
 from agentkernel.pipeline.realtime_pool import RealtimeConnection, RealtimeConnectionPool
 from agentkernel.pipeline.thread_runner import ThreadRunner
@@ -626,6 +628,45 @@ class TestRealtimeTurnState:
 
         await conn.connect()
         await asyncio.sleep(0.2)
+        conn._pacing_task.cancel()
+        assert conn.is_responding is False
+
+    @pytest.mark.asyncio
+    async def test_a_pause_mid_answer_is_still_a_response_until_its_done(self):
+        """The model's paced audio can run out while it is still answering: only ``done`` ends the response."""
+        conn = _connection(loop=asyncio.get_running_loop())
+        await conn.connect()
+        await conn.handle_framework_event("audio_delta", {"delta": "QUFB"})
+        await asyncio.sleep(0.2)
+        assert conn._audio_queue.qsize() == 0
+        assert conn.is_responding is True
+
+        await conn.handle_framework_event("done", {"status": "completed"})
+        await asyncio.sleep(0.1)
+        conn._pacing_task.cancel()
+        assert conn.is_responding is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ending", ["interrupt", "speech_started"])
+    async def test_the_caller_speaking_ends_an_open_response(self, ending):
+        conn = _connection(loop=asyncio.get_running_loop())
+        await conn.connect()
+        await conn.handle_framework_event("transcript_delta", {"delta": "So the plan", "message_id": "m1"})
+        await asyncio.sleep(0.1)
+        assert conn.is_responding is True
+
+        await conn.handle_framework_event(ending, {})
+        await asyncio.sleep(0.1)
+        conn._pacing_task.cancel()
+        assert conn.is_responding is False
+
+    @pytest.mark.asyncio
+    async def test_a_response_whose_done_never_comes_stops_holding_the_call(self, monkeypatch):
+        monkeypatch.setattr(realtime_pool, "_UNFINISHED_RESPONSE_SECONDS", 0.05)
+        conn = _connection(loop=asyncio.get_running_loop())
+        await conn.connect()
+        await conn.handle_framework_event("transcript_delta", {"delta": "So the plan", "message_id": "m1"})
+        await asyncio.sleep(0.15)
         conn._pacing_task.cancel()
         assert conn.is_responding is False
 
@@ -2828,3 +2869,346 @@ class TestBrokerRealtimeUserGate:
         finally:
             ThreadRunner.shutdown_event.set()
             thread.join(timeout=5)
+
+
+def _call_state(**state):
+    """The turn state ``RealtimeOutbox`` reads from a connection, quiet and connected unless told otherwise."""
+    defaults = dict(
+        is_ready=True,
+        connected_at=100.0,
+        is_responding=False,
+        is_caller_speaking=False,
+        last_model_output_at=None,
+        last_caller_speech_at=None,
+        last_edge_text_at=None,
+        last_tool_result_at=None,
+    )
+    return types.SimpleNamespace(**{**defaults, **state})
+
+
+class TestRealtimeOutbox:
+    """What an application posts into a call is said only when nobody is talking and nothing is owed a reply."""
+
+    def _outbox(self, *texts, now=100.0, **keys):
+        from agentkernel.pipeline.realtime_pool import RealtimeOutbox
+
+        outbox = RealtimeOutbox("s1")
+        for text in texts:
+            outbox.add(text, keys.get(text), 600.0, now)
+        return outbox
+
+    def test_a_post_waits_until_the_call_has_been_quiet_for_a_moment(self):
+        conn, outbox = _call_state(), self._outbox("J1 finished.")
+
+        assert outbox.take(conn, now=100.5) is None  # connected half a second ago
+        assert outbox.take(conn, now=101.6) == "J1 finished."
+        assert outbox.empty
+
+    @pytest.mark.parametrize("busy", [{"is_responding": True}, {"is_caller_speaking": True}, {"is_ready": False}])
+    def test_nothing_is_said_into_a_busy_or_unready_call(self, busy):
+        conn, outbox = _call_state(**busy), self._outbox("J1 finished.")
+
+        assert outbox.take(conn, now=200.0) is None
+        assert outbox.quiet_for(conn, now=200.0) is None
+
+    @pytest.mark.parametrize("given", ["last_caller_speech_at", "last_edge_text_at", "last_tool_result_at"])
+    def test_the_model_answers_what_it_was_given_before_anything_is_said(self, given):
+        conn, outbox = _call_state(**{given: 110.0}), self._outbox("J1 finished.")
+
+        assert outbox.take(conn, now=120.0) is None  # unanswered for 10 s: still owed
+        conn.last_model_output_at = 121.0
+        assert outbox.take(conn, now=122.0) is None  # answered, but only a second ago
+        assert outbox.take(conn, now=122.6) == "J1 finished."
+
+    def test_an_input_never_answered_stops_holding_the_call(self):
+        """Noise or a silent turn must not keep every post waiting for ever."""
+        conn, outbox = _call_state(last_caller_speech_at=110.0), self._outbox("J1 finished.")
+
+        assert outbox.take(conn, now=110.0 + outbox.REPLY_TIMEOUT_SECONDS + 0.1) == "J1 finished."
+
+    def test_a_post_is_answered_before_the_next_is_said(self):
+        conn, outbox = _call_state(), self._outbox("first", "second")
+
+        assert outbox.take(conn, now=110.0) == "first"
+        assert outbox.take(conn, now=112.0) is None  # the model owes a reply to the first
+        conn.last_model_output_at = 113.0
+        assert outbox.take(conn, now=114.6) == "second"
+
+    def test_a_newer_post_with_the_same_key_replaces_the_waiting_one(self):
+        outbox = self._outbox("Build: 2 of 6 tests pass.", "Review started.", **{"Build: 2 of 6 tests pass.": "build"})
+        outbox.add("Build: 6 of 6 tests pass.", "build", 600.0, 101.0)
+
+        conn = _call_state()
+        said = [outbox.take(conn, now=110.0)]
+        conn.last_model_output_at = 111.0
+        said.append(outbox.take(conn, now=113.0))
+        assert said == ["Build: 6 of 6 tests pass.", "Review started."]
+
+    def test_a_withdrawn_or_expired_post_is_never_said(self):
+        outbox = self._outbox("Is a deposit needed?", **{"Is a deposit needed?": "question"})
+        outbox.add("Old news.", None, 5.0, 100.0)
+
+        assert outbox.withdraw("question") is True
+        assert outbox.withdraw("question") is False
+        assert outbox.take(_call_state(), now=106.0) is None  # "Old news." expired at 105
+        assert outbox.empty
+
+    def test_a_full_outbox_drops_the_oldest(self):
+        from agentkernel.pipeline.realtime_pool import RealtimeOutbox
+
+        outbox = self._outbox(*[f"update {i}" for i in range(RealtimeOutbox.MAX_PENDING + 1)])
+
+        assert outbox.take(_call_state(), now=110.0) == "update 1"
+
+    def test_a_new_connection_owes_no_reply_to_a_post_into_the_old_one(self):
+        old, outbox = _call_state(), self._outbox("first", "second")
+        assert outbox.take(old, now=110.0) == "first"
+
+        new = _call_state(connected_at=111.0)  # the model socket reconnected
+        assert outbox.take(new, now=112.6) == "second"
+
+
+class TestRealtimeCall:
+    """Application code talks into a live call through ``RealtimeCall``, never through the connection's internals."""
+
+    @pytest.fixture(autouse=True)
+    def _transport(self, monkeypatch):
+        monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
+
+    @staticmethod
+    def _pool():
+        pool = RealtimeConnectionPool()
+        RealtimeConnectionPool._instance = pool
+        return pool
+
+    @staticmethod
+    def _connect(pool, session_id="s1", connected_ago=5.0):
+        conn = _connection(session_id, loop=asyncio.get_running_loop())
+        conn._connected_at = time.time() - connected_ago
+        pool._connections[session_id] = conn
+        return conn
+
+    @pytest.mark.asyncio
+    async def test_a_post_waits_for_the_call_and_is_said_once_it_is_quiet(self):
+        from agentkernel.pipeline import RealtimeCall
+
+        pool, call = self._pool(), RealtimeCall("s1")
+        assert call.post_when_idle("[Team update] J1 finished.", key="build") is False  # no call yet
+
+        conn = self._connect(pool)
+        assert call.connected is True
+        pool._deliver_posts(time.time())
+        await asyncio.sleep(0)
+
+        assert conn.adapter.texts == ["[Team update] J1 finished."]
+        assert conn.last_edge_text_at is None  # the application's words, not the caller's
+
+    @pytest.mark.asyncio
+    async def test_a_withdrawn_post_is_never_said(self):
+        from agentkernel.pipeline import RealtimeCall
+
+        pool, call = self._pool(), RealtimeCall("s1")
+        conn = self._connect(pool)
+        call.post_when_idle("Is a deposit needed?", key="question")
+
+        assert call.withdraw("question") is True
+        pool._deliver_posts(time.time())
+        await asyncio.sleep(0)
+        assert conn.adapter.texts == []
+
+    @pytest.mark.asyncio
+    async def test_what_the_call_is_doing(self):
+        from agentkernel.pipeline import RealtimeCall
+
+        pool, call = self._pool(), RealtimeCall("s1")
+        assert (call.connected, call.quiet_for(), call.agent_has_spoken) == (False, None, None)
+
+        conn = self._connect(pool, connected_ago=3.0)
+        assert call.quiet_for() == pytest.approx(3.0, abs=0.5)
+        assert call.agent_has_spoken is False
+
+        await conn.handle_framework_event("agent_changed", {"agent": "billing", "previous_agent": "general"})
+        assert call.agent_has_spoken is False  # the new agent has not said a word
+        await asyncio.sleep(0.01)
+        await conn.handle_framework_event("audio_delta", {"delta": "QUFB"})
+        assert call.agent_has_spoken is True
+        assert call.quiet_for() is None  # its words are still waiting to be played
+
+    @pytest.mark.asyncio
+    async def test_an_outbox_with_no_call_and_nothing_waiting_is_forgotten(self):
+        pool = self._pool()
+        pool.post_when_idle("s1", "Old news.", expires_after=0.0)
+
+        pool._deliver_posts(time.time() + 1)
+
+        assert pool._outboxes == {}
+
+    def test_without_a_pool_nothing_is_reached(self, caplog):
+        from agentkernel.pipeline import RealtimeCall
+
+        call = RealtimeCall("s1")
+        with caplog.at_level(logging.WARNING, logger="ak.pipeline.realtime_pool"):
+            assert call.post_when_idle("J1 finished.") is False
+        assert "No realtime pool in this process" in caplog.text
+        assert (call.connected, call.quiet_for(), call.withdraw("k")) == (False, None, False)
+
+
+class TestRealtimeHooks:
+    """An agent's realtime hooks see the call: who connected, what each side said, who has the call."""
+
+    class _Recorder:
+        def __init__(self, fail=False):
+            self.events = []
+            self.fail = fail
+
+        async def on_event(self, session, agent, event):
+            if self.fail:
+                raise RuntimeError("hook broke")
+            self.events.append((event.type, event.agent, event.text, event.interrupted))
+
+        def name(self):
+            return "recorder"
+
+    @pytest.fixture(autouse=True)
+    def _transport(self, monkeypatch):
+        monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
+
+    @pytest.mark.asyncio
+    async def test_the_hooks_follow_a_call_from_connect_to_close(self):
+        agent = _Agent(name="general")
+        recorder = self._Recorder()
+        agent.realtime_hooks.append(recorder)
+        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+
+        await conn.connect()
+        await asyncio.sleep(0.05)
+        await conn.handle_framework_event("caller_transcript", {"text": " I need a login page. "})
+        await conn.handle_framework_event("transcript_delta", {"delta": "Sure, ", "message_id": "m1"})
+        await conn.handle_framework_event("transcript_delta", {"delta": "a login page.", "message_id": "m1"})
+        await conn.handle_framework_event("done", {"status": "completed"})
+        await asyncio.sleep(0.05)
+        await conn.handle_framework_event("agent_changed", {"agent": "billing", "previous_agent": "general"})
+        await conn.handle_framework_event("transcript_delta", {"delta": "Billing here, your invoice", "message_id": "m2"})
+        await asyncio.sleep(0.05)
+        await conn.handle_framework_event("audio_delta", {"delta": "QUFB", "message_id": "m2"})
+        await conn.handle_framework_event("interrupt", {})
+        await asyncio.sleep(0.05)
+        conn.send_text("example.com/login", from_edge=True)
+        conn.send_text("[Team update] J1 finished.")  # the application's own: not reported
+        await asyncio.sleep(0.05)
+        await conn.close()
+
+        assert recorder.events == [
+            ("connected", "general", "", False),
+            ("agent_changed", "general", "", False),
+            ("caller_said", None, "I need a login page.", False),
+            ("agent_said", "general", "Sure, a login page.", False),
+            ("agent_changed", "billing", "", False),
+            ("agent_said", "billing", "Billing here, your invoice", True),
+            ("edge_text", None, "example.com/login", False),
+            ("disconnected", "billing", "", False),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_hook_is_logged_and_the_next_still_runs(self, caplog):
+        agent = _Agent()
+        recorder = self._Recorder()
+        agent.realtime_hooks.extend([self._Recorder(fail=True), recorder])
+        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+
+        with caplog.at_level(logging.ERROR, logger="ak.pipeline.realtime_pool"):
+            await conn.connect()
+            await conn.close()
+
+        assert [event[0] for event in recorder.events] == ["connected", "disconnected"]
+        assert "Realtime hook _Recorder failed on connected" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_failed_socket_is_reported_disconnected_once(self):
+        agent = _Agent()
+        recorder = self._Recorder()
+        agent.realtime_hooks.append(recorder)
+        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+        await conn.connect()
+
+        await conn.handle_framework_event("error", {"message": "socket closed"})
+        await conn.close()
+
+        assert [event[0] for event in recorder.events].count("disconnected") == 1
+
+    @pytest.mark.asyncio
+    async def test_text_from_the_edge_on_another_thread_reaches_the_hooks(self):
+        agent = _Agent()
+        recorder = self._Recorder()
+        agent.realtime_hooks.append(recorder)
+        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+        await conn.connect()
+
+        typed = threading.Thread(target=lambda: conn.send_text("example.com", from_edge=True))
+        typed.start()
+        while typed.is_alive():
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        await conn.close()
+
+        assert ("edge_text", None, "example.com", False) in recorder.events
+
+    @pytest.mark.asyncio
+    async def test_an_agent_without_realtime_hooks_queues_nothing(self):
+        conn = _connection(loop=asyncio.get_running_loop())
+        await conn.connect()
+
+        await conn.handle_framework_event("caller_transcript", {"text": "Hello"})
+
+        assert conn._hook_events is None and conn._hook_task is None
+        await conn.close()
+
+
+class TestADKCallerTranscript:
+    """The Gemini adapter reports the caller's words in a turn, for the agent's realtime hooks."""
+
+    @staticmethod
+    def _runner():
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        events = []
+
+        async def callback(event_type, data):
+            events.append((event_type, data))
+
+        runner = GoogleADKRealtimeRunner()
+        runner._callback = callback
+        return runner, events
+
+    @pytest.mark.asyncio
+    async def test_the_callers_words_are_reported_when_the_turn_ends(self):
+        runner, events = self._runner()
+
+        await runner._handle_message(_live_transcript("input_transcription", "I need"))
+        await runner._handle_message(_live_transcript("input_transcription", " a login page."))
+        await runner._handle_message(_live_message(turn_complete=True))
+
+        reported = [(t, d) for t, d in events if t in ("caller_transcript", "done")]
+        assert reported == [("caller_transcript", {"text": "I need a login page."}), ("done", {"status": "completed"})]
+
+    @pytest.mark.asyncio
+    async def test_the_callers_words_are_reported_before_text_is_sent_in(self):
+        runner, events = self._runner()
+
+        class _Socket:
+            async def send_client_content(self, **kwargs):
+                pass
+
+        runner._connection = _Socket()
+        await runner._handle_message(_live_transcript("input_transcription", "Book me in for Friday."))
+        await runner.send_text("[Team update] J1 finished.")
+
+        assert ("caller_transcript", {"text": "Book me in for Friday."}) in events
+
+    @pytest.mark.asyncio
+    async def test_a_turn_without_the_callers_words_reports_none(self):
+        runner, events = self._runner()
+
+        await runner._handle_message(_live_message(turn_complete=True))
+
+        assert [t for t, _ in events] == ["done"]

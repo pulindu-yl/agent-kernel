@@ -8,8 +8,6 @@ slug: /
 **The Operating System for Scalable & Compliant Enterprise AI Agents.**
 
 :::tip What's New
-🧑‍💻 **Realtime software team** - A new LiveKit showcase where you talk to a voice team (Worker, PM, Architect) that agrees requirements and a design with you, while background agents write, test and review the code in the sandbox and report back into the call. Realtime now runs Google ADK tool callbacks and exposes the call's turn state, so a callback can refuse a handoff and background work can speak at a quiet moment. [Learn more →](./integrations/livekit.md#talking-into-a-live-call)
-
 🔀 **Realtime multi-agent handoffs** - A voice call moves between agents with the OpenAI Agents SDK's handoffs or Google ADK's transfers, and in LiveKit every agent appears as its own participant, with only the active one unmuted. [Learn more →](./integrations/livekit.md#multi-agent-handoffs)
 
 🙋 **Human in the Loop** - Let a run pause for a person's approval or answer, and resume from their decision minutes or hours later, on any replica. Works on OpenAI, LangGraph, Pydantic AI and Google ADK, over REST, streaming and AG-UI. [Learn more →](./advanced/human-in-the-loop.md)

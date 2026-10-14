@@ -106,6 +106,9 @@ class RealtimeRunner(Runner):
               answer is still going on
             - ``speech_stopped``: ``{}``, the user stopped speaking; report it only with
               :attr:`reports_speech_stopped` set
+            - ``caller_transcript``: ``{"text": str}``, the user's words in a turn, once the model has
+              transcribed the whole turn; optional, for an adapter whose model transcribes the user.
+              The pool passes it to the agent's realtime hooks as ``caller_said``
             - ``agent_changed``: ``{"agent": str, "previous_agent": str}``, a framework-native
               handoff moved the conversation to another agent; report it after the previous
               agent's last output and before the new agent's first. The pool announces the agent

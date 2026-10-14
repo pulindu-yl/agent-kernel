@@ -75,6 +75,7 @@ A `RealtimeRunner` adapter talks to the model and reports what it does through t
 | `interrupt` / `speech_started` | The caller started speaking: over the model (`interrupt`), or while it is silent (`speech_started`, reported once per caller turn by both adapters) | An `interrupt`, or a `speech_started` while paced audio is still queued, drops unheard audio and text and keeps `done` and `agent_changed`. Either one marks when the caller last spoke (see [Turn state](#turn-state)) |
 | `speech_heard` / `speech_stopped` | The caller is still speaking (`speech_heard`: Gemini, on each later transcription of their words), or has stopped (`speech_stopped`: OpenAI's server VAD, from an adapter with `reports_speech_stopped`) | Nothing reaches the edge; both mark when the caller last spoke, and `speech_stopped` ends `is_caller_speaking` |
 | `agent_changed` | A handoff moved the call to another agent | In order: after the old agent's output, before the new agent's |
+| `caller_transcript` | Optional: the caller's words in a turn, once the model has transcribed the whole turn (Gemini) | Nothing reaches the edge; the agent's [realtime hooks](#realtime-hooks) get it as `caller_said` |
 | `error` | The socket failed | Tells the caller, then replaces the connection |
 
 Two more members of the contract:
@@ -101,7 +102,7 @@ Code that talks into a live call from outside it, such as a background job repor
 
 | Property | Is |
 |---|---|
-| `is_responding` | True while model output is still queued for the edge, or a tool call is running until its result is sent (for an ADK handoff, that includes opening the next agent's socket) |
+| `is_responding` | True from the model's first audio or transcript of a response until the adapter reports its `done` (or the caller barges in), so a pause mid-answer is not its end; while model output is still queued for the edge; or while a tool call is running until its result is sent (for an ADK handoff, that includes opening the next agent's socket). A response whose `done` never arrives stops counting after 15 s with no new output |
 | `last_model_output_at` | When the model's audio or transcript last left for the edge. Only output counts: not control events (an `interrupt` is the caller's doing), and not a finished tool call |
 | `last_model_generated_at` | When the adapter last reported model audio or transcript: the model's own time, ahead of the paced output above. With `last_agent_change_at` it tells whether the agent now answering has said anything yet, at the moment it calls a tool such as a handoff, while its words may still be queued |
 | `last_agent_change_at` | When the adapter last reported a handoff to another agent (`agent_changed`), in the model's own time: what is generated after it is the new agent's |
@@ -112,27 +113,24 @@ Code that talks into a live call from outside it, such as a background job repor
 
 `last_activity_at` cannot serve here: every caller audio frame moves it, silence included.
 
-The pool cannot see the model generating before its first output, after the caller speaks or types or a tool result is sent. Code deciding the call is quiet therefore checks that the model owes no reply: its last output is later than the caller's last speech, the edge's last text, the last tool result, and the code's own last post (each waited for a bounded time, since an input the model never answers must not hold the call forever). It also waits while `is_responding` or `is_caller_speaking`, and until nothing has happened for a short while. The `software-team` LiveKit example's `CallLink` does exactly this, then uses `RealtimeConnection.send_text`, which is thread-safe:
+The pool cannot see the model generating before its first output, after the caller speaks or types or a tool result is sent. So deciding the call is quiet also checks that the model owes no reply: its last output is later than the caller's last speech, the edge's last text, the last tool result, and the last post (each waited for at most `RealtimeOutbox.REPLY_TIMEOUT_SECONDS`, since an input the model never answers must not hold the call forever). It also waits while `is_responding` or `is_caller_speaking`, and until nothing has happened for `RealtimeOutbox.QUIET_SECONDS`.
 
-```python
-import time
+Applications do not read these properties themselves: `RealtimeCall` (see [Talking into a live call](../integrations/livekit.md#talking-into-a-live-call)) is the public face of this rule. Its `post_when_idle` queues text in the session's `RealtimeOutbox`, which the pool keeps per session rather than per connection, so posts survive a reconnect. Every `_POST_POLL_SECONDS` the pool's loop says each session's next post if `RealtimeOutbox.quiet_for` finds the call quiet long enough, with `RealtimeConnection.send_text`. `RealtimeCall.quiet_for()` and `agent_has_spoken` read the same state.
 
-from agentkernel.pipeline.realtime_pool import RealtimeConnectionPool
+## Realtime hooks
 
+A connection whose agent has `realtime_hooks` (`Module.realtime_hook`) queues `RealtimeEvent`s for them, and one task gives each event to the hooks in order, off the audio path:
 
-def owes_reply(connection, my_last_post_at, wait=15.0):
-    """Whether the model has still to answer something it was given."""
-    output = connection.last_model_output_at
-    given = (connection.last_caller_speech_at, connection.last_edge_text_at, connection.last_tool_result_at, my_last_post_at)
-    now = time.time()
-    return any(at is not None and (output is None or output < at) and now - at < wait for at in given)
+| Event | Raised by |
+|---|---|
+| `connected` | `connect()`, once the adapter is connected, before any other event of the call |
+| `agent_changed` | The pacing loop, as it emits each `AgentChanged` (the starting agent included) |
+| `agent_said` | The pacing loop: the transcript it emitted since the turn began, at the turn's `done`, an `interrupt` (`interrupted=True`: only what was played) or an `agent_changed` |
+| `caller_said` | The adapter's optional `caller_transcript` event; the Gemini adapter reports the caller's words when a turn ends (the model finishes, calls a tool, or text is sent in) |
+| `edge_text` | `send_text(..., from_edge=True)`, from the consumer thread, handed to the pool's loop |
+| `disconnected` | `close()` or a socket failure, once |
 
-
-connection = RealtimeConnectionPool.get().get_connection(session_id)
-busy = connection is None or connection.is_responding or connection.is_caller_speaking
-if not busy and not owes_reply(connection, last_post_at):
-    connection.send_text("[Team update, not from the client] The build finished; 12 tests pass.")
-```
+On `close()` the hooks get up to `_HOOK_DRAIN_SECONDS` to take the events still queued. An agent without hooks gets no queue and no task.
 
 ## Starting a call: announcing the team
 
@@ -265,6 +263,8 @@ The caller hears a short gap (about 1 to 2 seconds) while the new socket opens; 
 | `AgentChanged` | `agentkernel.core.event` | The speaker-change event, with the team on the first one |
 | `RealtimeRunner` | `agentkernel.core.realtime.runner` | The adapter contract, `team()`, shared cleanup |
 | `RealtimeConnectionPool`, `RealtimeConnection` | `agentkernel.pipeline.realtime_pool` | Connections per session, ordering, pacing, tool scopes |
+| `RealtimeCall`, `RealtimeOutbox` | `agentkernel.pipeline` (`realtime_pool`) | Talking into a call at a quiet moment, and what the call is doing, for application code |
+| `RealtimeHook`, `RealtimeEvent` | `agentkernel.core.hooks` | Observing a call: connection, transcripts, speaker changes |
 | `OpenAIRealtimeRunner` | `agentkernel.framework.openai` | OpenAI socket, handoffs by `session.update` |
 | `GoogleADKRealtimeRunner` | `agentkernel.framework.adk` | Gemini socket, transfers by reconnect + history |
 | `LiveKitEdgeGateway` | `agentkernel.integration.livekit` | Room, one participant per agent, who is heard and unmuted |

@@ -58,7 +58,7 @@ flowchart TB
 ### Core change B: realtime turn state (`RealtimeConnection`)
 
 - New read-only properties; no configuration:
-  - `is_responding`: true while model output has not yet left for the edge (audio, transcript or a control event still queued), or while a tool call is running until its result is sent (for an ADK handoff, that includes opening the next agent's socket);
+  - `is_responding`: true from a response's first audio or transcript until its `done` (or a barge-in), so a pause mid-answer with the paced audio run out is not its end (a lost `done` stops counting after 15 s without output); while model output has not yet left for the edge (audio, transcript or a control event still queued); or while a tool call is running until its result is sent (for an ADK handoff, that includes opening the next agent's socket);
   - `last_model_output_at`: epoch seconds when model output (audio or transcript) last left for the edge; `None` before that. A finished tool call does not count: its result is input the model has still to answer;
   - `last_model_generated_at` and `last_agent_change_at`: epoch seconds when the adapter last reported model audio or transcript, and a handoff (`agent_changed`), in the model's own time, ahead of pacing. Together they tell whether the agent now answering has said anything yet when it calls a tool such as a handoff; `last_model_output_at` cannot, as its words may still be queued;
   - `last_tool_result_at`: epoch seconds when a tool call's result was last sent to the model; `None` before that. Until `last_model_output_at` is later, a reply is owed; for an ADK handoff the result seeds the next agent's socket, so it marks the new agent's turn;
@@ -83,7 +83,9 @@ flowchart TB
 - A socket opened by a transfer is seeded as ADK seeds one: the caller's words as they are, every agent's turn (the new agent's own included) through ADK's `_present_other_agent_message`, on the user's side and fenced as data.
 - Imported from `google.adk.flows.llm_flows.contents`, where both ADK 1.24 (the floor) and 2.x provide it; private, like the `_build_transfer_instructions` #809 already uses.
 
-### Example: `examples/api/livekit-voice/software-team/`
+### Use case: the software team (kept outside this repository)
+
+- Not shipped in `examples/`: it is a full application, kept as a local use case; this section records its design.
 
 - Labelled a showcase in its README, which points to `google/handoffs` for the handoffs it builds on.
 - Laid out for a first-time reader, in five Python files, each opening with a list of its sections:
@@ -132,7 +134,7 @@ flowchart TB
 - A recorded decision also records the options it rejected and why, and the challenge raised in the debate and how it was answered; recording one with the same title revises it.
 - `ask_team` waits up to 2 minutes for `answer_coder`, from the Architect for a technical question or the PM for a business one. With no answer, the Coder records an assumption and continues; every assumption the Coder records is posted to the call and starts unsettled; the PM (a business rule, after asking the client) or the Architect (a technical one) settles it with `settle_assumption`, and delivery waits until all are settled.
 - A task is done only when the Coder reports it done and the tests pass; the job's update names unfinished tasks.
-- A question to the client is noticed from the agent's words, not from a tool: `ClientQuestionWatcher` (a logging handler on `ak.integration.livekit`) reads each agent turn the gateway logs once its audio has played ("AI response: ..."), and a turn that ends with a question not addressed to a teammate ("Worker, ...?", "..., Architect?"), and did not end in a handover, marks the client's answer as pending, so the team is not nudged while the client is answering, and the board shows the question under "Waiting for you". An answer the client types counts as an answer.
+- A question to the client is noticed from the agent's words, not from a tool: `ClientQuestions` reads each agent turn as heard (`CallObserver`'s `agent_said`, once its audio has played and not talked over), and a turn that ends with a question (followed by at most one short courtesy, "... Take your time.") not addressed to a teammate ("Worker, ...?", "..., Architect?"), said by the agent that still has the call (so it did not end in a handover, and a silent handover before it does not hide it), marks the client's answer as pending, so the team is not nudged while the client is answering, and the board shows the question under "Waiting for you". An answer the client types counts as an answer.
   - an `ask_client` tool did this before, but a tool answering in the middle of a spoken turn makes Gemini Live start talking again: live, the PM asked one question three times, and every wording of the tool's reply failed in one call order or the other.
 
 #### Project state (`ProjectStore`)
@@ -144,7 +146,7 @@ flowchart TB
   - tasks with status, and progress;
   - review findings and acceptance results;
   - a log of who recorded what, and when.
-- Re-renders four documents on every change, without an LLM (`ProjectDocuments`): `requirements.md`, `design.md`, `status.md` (tasks, jobs, findings, acceptance and the outcome) and `log.md`. A `DocumentWriter` thread does the writing, coalescing changes, so a voice tool on the pool's loop never waits for files; change listeners are told once the documents show the change.
+- Re-renders four documents on every change, without an LLM (`ProjectDocuments`): `requirements.md`, `design.md`, `status.md` (tasks, jobs, findings, acceptance and the outcome) and `log.md`. A `DocumentWriter` thread does the writing, coalescing changes, so a voice tool on the pool's loop never waits for files.
 - The log tells records (a requirement, a decision, a job) from activity notes (a file written, a question put to the client): only records count as the team moving on, for `HandoffGuard` and the stuck-build check.
 - `add_tasks` adds no task whose title is already there.
 - Safe for concurrent use from the pool's event loop and from job threads.
@@ -156,32 +158,34 @@ flowchart TB
   - The Coder and Reviewer share that session, so they work in one sandbox workspace and take turns.
 - Each call runs one job at a time; a job requested while another runs is queued.
 - Each job runs on its own thread and event loop, never on the pool's loop, so model calls and sandbox waits cannot stall the audio.
+- The example's own code reaches the sandbox only inside the Coder's runs, through two AK hooks on the Coder, as AK's own sandbox tools and its `SandboxPreHook` reach it (the run holds the `-dev` session and makes it current, and stores it afterwards):
+  - `ShareClientFiles` (`PreHook`) puts the client's shared files into the sandbox before each run;
+  - `VerifyBuild` (`PostHook`) runs pytest after each run, records the real output, and copies the workspace out into the project's hidden `.build/` folder (the call's `build`). It passes the Coder's reply on unchanged and never fails the run: a sandbox out of reach is recorded on the build, and the develop job fails as a problem in the team's systems, with no task counted as done.
 - Job kinds:
   - **develop:** listed task ids, or a list of findings to fix;
   - **review:** all the code, or only listed findings;
   - **acceptance:** map each acceptance criterion to a test result.
 - A job's result is recorded in the `ProjectStore`. If the call is still connected, it is also posted to the call; if the call has ended, it is only recorded.
-- `deliver` copies the sandbox workspace into `code/` and the last pytest output into `test-results.txt`.
+- `deliver` hands over the last build: `.build/` into `code/`, with the result its tests had; the last pytest output is in `test-results.txt`. It needs no sandbox: the gates let it start only after the Reviewer, who never changes the code, accepted that build.
 - After 3 builds in a row that end with the same failing tests (`Job.tests`, run times aside), `start_development` is refused until a voice agent records something (a decision, a revised requirement) or the client speaks.
 - The job thread and its event loop live for the whole call, never closed between jobs (LiteLLM keeps a logging task on the loop of its first call).
 - Each background run starts from its brief only (`include_contents="none"` on the Coder and the Reviewer): the two share one AK session and so one ADK session, and every model call of every job would otherwise resend every earlier job, file writes and test output included.
 - A review or acceptance job counts only once the Reviewer submits it (`ProjectState.review_submitted_at`, `acceptance_checked_at`): one that finishes without `submit_review` or `submit_acceptance` is asked once more, then fails.
 - A build that ends with failing tests names them (pytest's `FAILED`/`ERROR` lines) in its update, `get_progress` and `get_project_state`, and the Coder's brief carries the end of the failing output, so the next build fixes what failed.
-- The Coder's and the Reviewer's own words for a status are normalized ("completed" is done, "passed" a pass); a status that is neither is sent back. A review resolves only findings the Coder marked fixed.
-- `copy_workspace` packs the workspace into one archive in the sandbox (a Python snippet: the sandbox always has Python, and GNU and BSD tar match exclusions differently) and downloads it once, falling back to one download per file.
-- A failed background run (the runner's error reply, or an exception) fails its job, and the voice team is told not to restart it. After 2 failures in a row of one kind, that kind is refused until the client speaks.
+- The Coder's and the Reviewer's own words for a status are normalized ("completed" is done, "passed" a pass); a status that is neither is sent back, and an acceptance result that is not exactly a pass, a fail or not covered ("pass only after the remaining fixes") sends the whole check back. The command the Coder and the Reviewer run the tests with keeps pytest's exit code. A review resolves only findings the Coder marked fixed.
+- `VerifyBuild` packs the workspace into one archive in the sandbox (a Python snippet: the sandbox always has Python, and GNU and BSD tar match exclusions differently) and downloads it once, falling back to one download per file.
+- A failed background run (one ADK did not finish: the agents' `after_agent_callback` never ran, whatever the reply says; or an exception) fails its job, and the voice team is told not to restart it. After 2 failures in a row of one kind, that kind is refused until the client speaks.
 
 #### Call coordination
 
-- **`CallLink`** posts text into the call only when nobody is speaking:
-  - it waits until `is_responding` and `is_caller_speaking` are false, the model owes no reply (to the caller's speech, the edge's text or the link's own post, each for up to 15 s; to a tool result, for up to 8 s), and nothing has happened for 1.5 s, then calls `send_text("[Team update, not from the client] ...")`;
-  - an update can carry a check that it still applies, made just before posting (a Coder question that timed out is dropped); a full queue drops its oldest update with a warning;
-  - it nudges a stalled team, once the client has spoken or typed: after 5 s with nothing said or given, no running job, no pending client question and no plan waiting for the client's approval, it posts a nudge that also covers the commonest stall (an agent naming a teammate without handing over). It nudges at most 2 times in a row, and watches the call from the moment the call is first seen;
-  - it notices when the pool replaces the model connection (a new one starts at the PM and remembers nothing): its posts and nudges start over, and the PM is told where the recorded project stands and the client's name (kept from the page's `/token` request). Only the latest renewal's notice is posted, written when it is posted: live, failed reconnect attempts each queued a notice, and thirteen of them, each saying "the Worker delivers the project" after it had, made the Worker deliver thirteen times;
-  - an update may be a function that writes it when it is posted, so it says where the project stands then; a tool result is waited on for up to 15 s (live, a reply started 10 s after one).
+- **`CallLink`** posts the team's updates with `RealtimeCall.post_when_idle` (core change E), which says them only when nobody is speaking, as `[Team update, not from the client] ...`:
+  - an update that no longer applies is withdrawn (a Coder question that timed out); a renewal's notice and a nudge carry a `key`, so a newer one replaces one still waiting;
+  - it nudges a stalled team, once the client has spoken or typed: when `RealtimeCall.quiet_for()` reaches 5 s, with no running job, no pending client question and no plan waiting for the client's approval, it posts a nudge that also covers the commonest stall (an agent naming a teammate without handing over). It nudges at most 2 times in a row, until the client speaks or types or the call goes to another agent, and watches the call from the moment the call is first seen;
+  - `heard()` (a job starts once its announcement was heard) is `quiet_for()` of at least 1 s, and the silent-handover check is `RealtimeCall.agent_has_spoken`.
+- **`CallObserver`**, the team's realtime hook on the PM (core change F), learns what happens in the call: the client's words for the board (`caller_said`), when the client last spoke or typed (`caller_said`, `edge_text`), a handover (`agent_changed`), each agent turn as heard (`agent_said`, for client questions and written handovers), and a renewed model connection (a second `connected`), after which the PM is told where the recorded project stands and the client's name (kept from the page's `/token` request). Each renewal's notice replaces one still waiting: live, failed reconnect attempts each queued a notice, and thirteen of them, each saying "the Worker delivers the project" after it had, made the Worker deliver thirteen times.
 - **Running work is visible, not narrated**:
   - a job tool's reply states what was started; the meeting rules say to announce a job once, in one sentence;
-  - `ActivityFeed` records every Coder and Reviewer tool call in plain words, from ADK's `after_tool_callback`, and `ModelWaitWatcher` adds the `openai` client's rate-limit retry waits (LiteLLM's OpenAI calls go through it); the board's job card shows the latest, and `get_progress` answers "how is it going?";
+  - `ActivityFeed` records every Coder and Reviewer tool call in plain words, from ADK's `after_tool_callback`, and `ModelWaitWatcher` adds the `openai` client's waits before a retry, without guessing the reason its log line does not give (LiteLLM's OpenAI calls go through it); the board's job card shows the latest, and `get_progress` answers "how is it going?";
   - nothing is narrated into the call while a job runs: a Live model answers every completed turn, so periodic progress posts came out as the same status line again and again. Only events that need the team post: a job's result, the Coder's question or assumption, the client's click or file.
 - **Relaxed tone** (meeting rules): the agents never rush the client, ask them to wait or stay longer, apologize for how long something takes, or talk about the team's rules and limits; a "Not ..." tool answer is for the team, not the client; while a job runs and nobody needs an answer, the agent stops talking until there is news. Live, the client heard "we need a bit more time", the handoff limit, and "I can't start the build yet".
 - **`ProcessGates`** keep the SDLC order whatever the model does: `create_tasks` and `start_development` need confirmed requirements and a written design; `write_design` needs a component and a decision, each decision with its challenge; `request_review` needs a finished build; `check_acceptance` needs a review of the latest build and every finding `resolved` by the Reviewer (a `fixed` finding is re-reviewed first; a re-review the Reviewer does not confirm puts it back to `to fix`); `deliver` needs every task done (the Coder is asked once more when a develop job ends with no task reported), an acceptance check run after the last build, covering every current criterion, all passing, and every Coder assumption settled, so a requirement added later needs a new check. `DevJobRunner` runs the same check again when a queued job starts and skips a job that no longer passes, so a delivery requested during a new build cannot ship it unchecked. A blocked tool returns why and who should act, and starts nothing.
@@ -213,14 +217,11 @@ flowchart TB
 #### Project board and the client's page
 
 - Voice alone left the client blind: what was agreed, what is being built and what the team waits for were spoken once and gone. The client now follows the project on screen while talking.
-- **`ProjectBoard`** (`server.py`) joins the room as one more participant, `project-board` ("Project board"), with a token that publishes data only (`can_publish=False`, `can_subscribe=False`, `can_publish_data=True`).
-  - It runs on a thread and event loop of its own, never the realtime pool's.
-  - It sends a `BoardSnapshot` as JSON on the topic `ak.project` with LiveKit text streams (`send_text`): to every viewer (everyone but the `agent-*` participants, which run in the same process and would only log that they ignore the topic) after a project change, at most once a second (later changes coalesce into the next send), and to each participant that joins, so a page opened or reloaded mid-call starts full.
-  - It never reaches the agents: the gateway takes only audio and the chat topics as the client's input, and the board sends neither. No core change: the example uses the LiveKit SDK Agent Kernel already installs.
-  - It is visible, not `hidden`, since a hidden participant's data delivery is unverified; the client's page draws no tile for it.
-  - With no LiveKit URL, key or secret it does not start, and the call works as before.
+- **The board over HTTP** (`server.py`): the client's page asks the example's server for it once a second while in the call (`GET /project/board`), with the client's words since the last turn it showed (`ClientWords`, numbered).
+  - The board is not a LiveKit participant: an earlier version joined the room on a thread and event loop of its own, which raced the gateway's first use of the LiveKit SDK's native client and needed the SDK's private `FfiClient` to avoid it.
+  - It never reaches the agents, and a page opened or reloaded mid-call gets the current board on its first request.
 - **`BoardSnapshot`** (pydantic, from `ProjectState` and the call, no LLM): project, goal, phase, the SDLC steps (Requirements, Design, Approval, Build, Review, Acceptance, Delivered, done from the same checks as `ProcessGates`), `approval_pending`, the last 15 log entries, requirements with each criterion's acceptance result, decisions with their challenge, tasks, the running job with its last 5 activities, findings, the test summary, the delivered folder, and **waiting for you** (the question just asked, open questions, the Coder's unsettled assumptions).
-- **The client's own words** reach the page with no core change: `ClientWordsWatcher` (a logging handler on `ak.adk.realtime`) picks up the adapter's `Caller said: ...` line, logged when the model has answered the turn, and the board sends it on its `ak.client` topic. Gemini only. The client joins under their name (capitals kept in the identity), which the gateway's greeting already uses.
+- **The client's own words** reach the page through `CallObserver`: the Gemini adapter reports each caller turn (`caller_said`) when the model has answered it, and the page fetches it with the board. Gemini only. The client joins under their name (capitals kept in the identity), which the gateway's greeting already uses.
 - **Typing, sharing, documents and files on the page** (example only):
   - the client's token may publish data, so the page's message box sends to the room chat, which the gateway already passes to the agent with the call as the client's words;
   - `POST /project/share` saves a file in the project's `shared/` folder (`ProjectFiles`, a safe name, at most 10 MB), records it (`SharedFile`), announces it to the team (a short text file quoted, marked as data, not instructions), lists it in the Coder's brief, and a develop job uploads it to the sandbox under `shared/`;
@@ -230,7 +231,6 @@ flowchart TB
   - once the design is written and the requirements are not yet approved, the board's Project tab shows **Ready for your approval**: the live `requirements.md` and `design.md` in a scroll box, with **Looks good, build it** and **I'd like a change**; the page brings it into view once, when it appears;
   - `POST /project/approval?decision=approve|change&by=<name>`: an approval records the confirmation under the client's name, marks the question to the client answered, and tells the team it is recorded (not to call `confirm_requirements`) and to hand to the Worker; a change request tells the PM to ask what; either answers `409` when nothing waits for approval;
   - saying yes out loud still works: the PM calls `confirm_requirements`.
-- **`ProjectStore.on_change(listener)`**: called after every change, on the changing thread under the store's lock; a listener only schedules work, and one that raises is logged, never failing the change.
 - **The client's page** (`panel/`, Vite + React + `livekit-client`, like `examples/api/agui/frontend`): joins under the client's name (microphone, and data for the chat box), plays the agents, highlights the agent with `ak.active`, shows each agent's words from the gateway's chat topic, and draws the board.
   - Served by `ClientPage` at `GET /` from `panel/dist`, with `GET /token` minting the client's token (`RoomAccess`, from the `AK_LIVEKIT__*` settings the gateway uses); `api.custom_router_prefix: ""` mounts them at the root. The routes are unauthenticated, so `config.yaml` binds the server to `127.0.0.1`; opening it to a network (`AK_API__HOST`) needs authentication in front of it.
 
@@ -238,9 +238,9 @@ flowchart TB
 
 - Example-local classes, one job each:
   - `agents.py`: the prompts as plain constants (`MEETING_RULES`, `WORKER`, `PM`, `ARCHITECT`, `CODER`, `REVIEWER`); `VoiceTeam` (the three voice agents, written out one by one); `BackgroundTeam` (the Coder and the Reviewer);
-  - `tools.py`: `TeamTools` (the tool sets, bound per role); `project.py`: `ProjectStore` and `ProjectDocuments`' `DocumentWriter`; `team.py`: `ProcessGates` and `HandoffGuard`, `DevJobRunner`, `CallLink`, `ActivityFeed` and `ModelWaitWatcher` (with `ClientWordsWatcher` and `ClientQuestionWatcher`, on one `LogLineWatcher` base that warns when a watched logger is set above INFO), `ClientApproval`;
+  - `tools.py`: `TeamTools` (the tool sets, bound per role); `project.py`: `ProjectStore` and `ProjectDocuments`' `DocumentWriter`; `team.py`: `ProcessGates` and `HandoffGuard`, `DevJobRunner` with the Coder's hooks `ShareClientFiles` and `VerifyBuild`, `CallLink` (over `RealtimeCall`), `CallObserver` (a `RealtimeHook`, with `ClientQuestions` and `WrittenHandovers`), `ActivityFeed` and `ModelWaitWatcher` (the one `LogLineWatcher` left, for the `openai` client's retry lines, which no hook reports), `ClientApproval`;
   - `TeamCall`: one call's state (its store, jobs, link, guard and the Coder's open question); `TeamCalls` finds it from the session a tool runs in (the call's session or its `-dev` session);
-  - `ProjectBoard` and `BoardSnapshot`, `RoomAccess`, `ClientPage`: the board participant, its snapshot, LiveKit tokens, and the client's page;
+  - `BoardSnapshot` and `ClientWords`, `RoomAccess`, `ClientPage`: the board, the client's words, the LiveKit token, and the client's page with its routes;
   - `SoftwareTeamServer`: loads the voice team and the background agents, starts the board, and serves the room and the client's page.
 - This is not a core capability and selects no external backend, so it has no ABC or factory (house pattern 1).
 
@@ -250,6 +250,26 @@ flowchart TB
   - ADK runs parallel calls as concurrent tasks (`asyncio.gather`), and the tool wrapper activates the run's one shared AK `ToolContext` in each of them.
   - `ToolContext.set()` keeps the reset token on that shared instance, so one call overwrote another's token, and the first to finish reset with a token from another task.
 - New `ToolContext.activated()`, a context manager that keeps the token with the caller. The ADK wrapper (sync and async) activates the context with it; `set()` and `reset()` are unchanged for their other callers, which activate once per run.
+
+### Core change E: talking into a live call (`RealtimeCall`, `RealtimeOutbox`)
+
+- The example's `CallLink` read the connection's turn state to post at a quiet moment; every app that pushes background updates into a call needs the same. It moves to the pool:
+  - `RealtimeOutbox`, one per session (not per connection, so posts outlive a reconnect): a post waits until the model is not responding, the caller is not speaking, the model owes no reply (to the caller's speech, edge text, a tool result or the last post, each for at most `REPLY_TIMEOUT_SECONDS`), and the call has been quiet for `QUIET_SECONDS`. A post with the same `key` replaces a waiting one; `withdraw(key)` drops one; posts expire after `expires_after`; at most `MAX_PENDING` wait.
+  - The pool's loop delivers them every `_POST_POLL_SECONDS` with `RealtimeConnection.send_text`.
+- `RealtimeCall(session_id)`, exported from `agentkernel.pipeline`, is the public face: `post_when_idle(text, key=, expires_after=)`, `withdraw(key)`, `connected`, `quiet_for()`, `agent_has_spoken`. Applications no longer import `realtime_pool` or read turn state. In a process without the pool a post is dropped with a warning.
+- No configuration: the thresholds are the ones live runs settled on, as class constants.
+
+### Core change F: realtime hooks (`RealtimeHook`)
+
+- The example learned what was said in the call from log lines (`Caller said: ...`, `AI response: ...`), which break silently when a log's wording changes.
+- `RealtimeHook.on_event(session, agent, event)` in `core/hooks.py`, attached with `Module.realtime_hook(agent, hooks)` to the agent a call starts with, beside `pre_hook` / `post_hook`. `RealtimeEvent.type`: `connected`, `caller_said`, `edge_text`, `agent_said` (`interrupted`), `agent_changed`, `disconnected`.
+- Events go through one queue and task per connection, in order, off the audio path; a failing hook is logged and the next runs; an agent without hooks gets neither.
+- Adapter contract: an optional `caller_transcript` event. The Gemini adapter reports the caller's words when a turn ends (turn complete, a tool call, text sent in). The OpenAI adapter does not enable input transcription, so it reports none: documented, not faked.
+
+### Core change G: LiveKit tokens and alias
+
+- `agentkernel/livekit.py`, the integration's public alias, as `slack.py` is Slack's.
+- `LiveKitEdgeGateway.participant_token(identity, name=None, **grants)`: signed with the key and secret the gateway already reads, for its own room, so an app serving its users a page never reads `AKConfig`. It refuses `AGENT_IDENTITY_PREFIX` identities, another room, and a gateway without a key and secret. The gateway's own agent tokens use the same signing helper.
 
 ### Configuration
 
@@ -274,16 +294,20 @@ flowchart TB
   - `is_caller_speaking` holds until `speech_stopped` on an adapter that reports it, and is false on one that does not;
   - the ADK adapter reports `speech_started` once per caller turn, `speech_heard` for its later words, and neither while the model speaks; the OpenAI adapter reports `speech_stopped`.
 - Core change C unit tests: a seeded socket shows the caller's words as they are and each agent's turn, tool calls and results included, as `[agent] ...` context.
+- Core change E unit tests: a post waits for a quiet moment; nothing is said into a busy or unready call; the model answers what it was given first, and an unanswered input stops holding the call after the timeout; one post is answered before the next; a keyed post replaces a waiting one; withdrawn and expired posts are never said; a full outbox drops the oldest; a new connection owes nothing to a post into the old one; through `RealtimeCall`: a post made before the call connects is said once it is quiet, `quiet_for` / `agent_has_spoken` / `connected`, and nothing reached without a pool.
+- Core change F unit tests: a call's events in order from connect to close (`connected`, `agent_changed`, `caller_said`, `agent_said`, interrupted `agent_said`, `edge_text` and not the application's own text, `disconnected`); a failing hook logged and the next run; a failed socket reported once; edge text from another thread; no queue for an agent without hooks; `Module.realtime_hook` chaining; the Gemini adapter reporting the caller's words at turn end and before text is sent in.
+- Core change G unit tests: the alias exports the gateway; a participant token joins the gateway's room signed with its key, carries the grants asked for, and is refused for an agent identity, another room, or no key.
 - Example tests (`demo_test.py`, no live models):
   - `ProjectStore` and `ProjectDocuments` rendering;
   - the voice team's transfer graph and callbacks, and the background team on LiteLLM;
   - `HandoffGuard` counting and reset, and the handover brief at each stage;
-  - `CallLink` waiting and nudging, against a fake connection: waiting for the reply to a tool result and to typed text, dropping an update that no longer applies, a full queue, a new connection;
+  - `CallLink` against a fake `RealtimeCall`: the update's prefix and key, withdrawing an update, nudging once quiet long enough and at most twice until the client speaks or the call moves, a new connection, `heard()` and the silent-agent check; `CallObserver`: client questions and written handovers from `agent_said` (not an interrupted one), the client's words and input times, renewals replacing one notice; the PM carrying the hook;
   - `TeamCall`: no nudge while the plan waits for approval, the PM told where the project stands after a new connection, a timed-out Coder question not posted;
-  - `DevJobRunner` running one job at a time and handling an ended call, against a fake agent; a review or acceptance check never submitted, failing tests named and given to the next build, the workspace copied as one archive or file by file;
+  - `DevJobRunner` running one job at a time and handling an ended call, against a fake agent; a review or acceptance check never submitted, failing tests named and given to the next build, work whose tests could not be run failing its job, delivery handing over the last build;
+  - the Coder's hooks: `VerifyBuild` running the tests and copying the workspace out as one archive or file by file, the last build replacing the one before, a sandbox out of reach recorded rather than raised; `ShareClientFiles` putting the client's files in; both on the Coder only;
   - the tools: no task created twice, the Coder's and Reviewer's words for done and pass, a review resolving only fixed findings, job tools that state facts;
   - the prompts' invariants (every tool a prompt names is one that agent has; ADK's transfer tool), not their wording, which is expected to be tuned;
-  - the board's snapshot, its coalesced sends and the send to a joining participant (fake room), the change listeners, the tokens' grants, and the client page's routes.
+  - the board's snapshot, the board route with the client's words (each once), the client token's grants, and the client page's routes.
 - `panel/` type-checks and builds (`npm run build`).
 - Live runs, done by the maintainer: the full flow with Gemini Live voices and the background agents on `openai/gpt-4.1` through LiteLLM.
 
@@ -292,6 +316,7 @@ flowchart TB
 - `docs/docs/integrations/livekit.md`: the example, and ADK tool callbacks in realtime.
 - `docs/docs/architecture/realtime-internals.md`: the turn state, `speech_started` from both adapters, and tool callbacks.
 - `examples/api/livekit-voice/README.md` index, and the example's own README.
+- Core changes E to G: `livekit.md` ("Tokens for your users", "Talking into a live call", "Watching a live call"), `realtime-internals.md` (turn state through `RealtimeOutbox`, realtime hooks, `caller_transcript`), `hooks.md` (`RealtimeHook`).
 
 ## Non-goals
 
@@ -299,7 +324,7 @@ flowchart TB
 - The client leaving and rejoining, and project state that lasts across calls.
 - Calls longer than about 10 minutes. Gemini Live session limits are not handled.
 - Multiple Agent Runner replicas or broker transports for the example: `CallLink` and the jobs run in-process (`in_memory` only).
-- Generated projects other than Python with pytest. The voice agents are told so and offer a Python web app instead. The sandbox could run Node with another image; supporting other stacks needs the test check (`DevJobRunner`) and the Coder's brief to follow the recorded stack. Previewing a built site needs a sandbox port/preview capability that does not exist yet. Both are follow-ups.
+- Generated projects other than Python with pytest. The voice agents are told so and offer a Python web app instead. The sandbox could run Node with another image; supporting other stacks needs the test check (`VerifyBuild`) and the Coder's brief to follow the recorded stack. Previewing a built site needs a sandbox port/preview capability that does not exist yet. Both are follow-ups.
 - An OpenAI Realtime voice team. The voices are Gemini Live only, which keeps one team definition; OpenAI voice handoffs are shown by `openai/handoffs`.
 - ADK plugins in realtime.
 - A text summary in the LiveKit chat. The outcome is spoken and saved to `status.md`.
@@ -313,4 +338,6 @@ flowchart TB
 - Core fix D fixes a bug already in `develop`: ship it as its own `fix:` PR first?
 
 - Should core change A ship as its own `fix:` PR? It stops realtime ignoring ADK tool callbacks for every user, whether or not they use this example.
-- Should `CallLink`'s "post only when nobody is speaking" logic become a pool method instead of example code? Every app that pushes background updates into a call needs it.
+- ~~Should `CallLink`'s "post only when nobody is speaking" logic become a pool method?~~ Yes: core change E.
+- An `ExecutionManager.in_session(session_id)` for application code beside the agents (run the tests, copy the code out) was built and dropped: it reached the sandbox from outside any run, unlike every other sandbox use. The example uses AK hooks on the Coder instead, inside its runs, with no change to the sandbox package.
+- Stripping tool calls Gemini writes into its words (`transfer_to_agent{...}`) in the adapter was considered and not done: transcripts stream in pieces, so it would hold text back on guesses, and an app recovering a handoff the model wrote instead of made needs to see the words. Edges filter what they show.
