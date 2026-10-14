@@ -56,13 +56,15 @@ class TraceloopTraceFetcher(TraceFetcher):
         if query.session_id:
             filters.append({"id": self._SESSION_ATTRIBUTE, "operator": "equals", "value": query.session_id})
         if query.trace_ids:
-            filters.append({"id": "trace_id", "operator": "in", "value": query.trace_ids})
+            # The API reference puts an "in" list in "value", but the API rejects that (400) and reads "values"
+            filters.append({"id": "trace_id", "operator": "in", "values": query.trace_ids})
         params: dict[str, Any] = {
             "from_timestamp_sec": int(start.timestamp()),
             "to_timestamp_sec": math.ceil(end.timestamp()),  # whole seconds; the exact end is applied locally
             "limit": min(self._PAGE_SIZE, query.limit),
-            "sort_by": "timestamp",
-            "sort_order": "desc",
+            # Newest first. No sort_by: although documented, every sort_by value (timestamp included) makes the
+            # API return no spans, while sort_order alone orders by timestamp (both checked live, 2026-10).
+            "sort_order": "DESC",
         }
         if query.name:
             params["span_name"] = query.name

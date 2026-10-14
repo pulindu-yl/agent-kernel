@@ -1,7 +1,7 @@
 """Tests for fetching spans back from the tracing providers' clouds (trace/fetch.py and the per-provider fetchers).
 
-No provider SDK is needed: Langfuse gets a fake client, Logfire a fake ``logfire.experimental.query_client``
-module, and Traceloop an ``httpx.MockTransport``.
+No provider SDK is needed: Langfuse gets a fake client, Logfire a fake query client module (``logfire.query_client``,
+or ``logfire.experimental.query_client`` before logfire 5), and Traceloop an ``httpx.MockTransport``.
 """
 
 import json
@@ -435,16 +435,19 @@ def _row(span_id, minute, span_name="execute_tool get_weather", **attributes):
     }
 
 
-@pytest.fixture
-def fake_query_client(monkeypatch):
+@pytest.fixture(params=["logfire.query_client", "logfire.experimental.query_client"])
+def fake_query_client(monkeypatch, request):
+    """A fake query client at logfire 5's module path, then at logfire 4's (where 5 no longer has it)."""
     client = MagicMock()
     client.__enter__.return_value = client
     client.__exit__.return_value = False
-    module = types.ModuleType("logfire.experimental.query_client")
+    module = types.ModuleType(request.param)
     module.LogfireQueryClient = MagicMock(return_value=client)
     monkeypatch.setitem(sys.modules, "logfire", types.ModuleType("logfire"))
-    monkeypatch.setitem(sys.modules, "logfire.experimental", types.ModuleType("logfire.experimental"))
-    monkeypatch.setitem(sys.modules, "logfire.experimental.query_client", module)
+    monkeypatch.delitem(sys.modules, "logfire.query_client", raising=False)
+    if request.param == "logfire.experimental.query_client":
+        monkeypatch.setitem(sys.modules, "logfire.experimental", types.ModuleType("logfire.experimental"))
+    monkeypatch.setitem(sys.modules, request.param, module)
     return client
 
 
@@ -543,7 +546,22 @@ class TestTraceloopFetcher:
         assert params["from_timestamp_sec"] == str(int(START.timestamp())) and params["to_timestamp_sec"] == str(int(END.timestamp()))
         # kinds are applied locally only: no kind filter is sent even when kinds is set
         assert json.loads(params["filters"]) == [{"id": "traceloop.association.properties.session_id", "operator": "equals", "value": "s-1"}]
+        # verified live: sort_by=timestamp makes the warehouse API return no spans, so only sort_order is sent
+        assert params["sort_order"] == "DESC" and "sort_by" not in params
         assert requests[1].url.params["cursor"] == "c1"
+
+    def test_trace_ids_filter_uses_values(self):
+        # verified live: "in" rejects a "value" array ("cannot unmarshal array") and needs "values"
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"spans": {"data": [], "next_cursor": None}})
+
+        fetcher = TraceloopTraceFetcher(api_key="key", transport=httpx.MockTransport(handler))
+        fetcher.fetch(TraceQuery(start=START, end=END, trace_ids=["t-1", "t-2"]))
+
+        assert json.loads(requests[0].url.params["filters"]) == [{"id": "trace_id", "operator": "in", "values": ["t-1", "t-2"]}]
 
     def test_returns_a_tool_span_typed_only_by_traceloop_span_kind(self):
         # the SDK's own @tool decorator sets traceloop.span.kind but no gen_ai.operation.name

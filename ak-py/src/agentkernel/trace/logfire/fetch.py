@@ -47,11 +47,20 @@ class LogfireTraceFetcher(TraceFetcher):
         self._log = logging.getLogger("ak.trace.logfire.fetch")
 
     def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]:
-        from logfire.experimental.query_client import LogfireQueryClient
-
         _, end = query.window()
-        with LogfireQueryClient(read_token=self._read_token, base_url=self._base_url) as client:
+        with self._query_client_class()(read_token=self._read_token, base_url=self._base_url) as client:
             return self._page_backward(query, before=end, max_rows=self._MAX_ROWS, page=partial(self._page, client, query))
+
+    @staticmethod
+    def _query_client_class() -> type:
+        """
+        Logfire's query client: ``logfire.query_client`` from logfire 5, ``logfire.experimental.query_client`` before.
+        """
+        try:
+            from logfire.query_client import LogfireQueryClient
+        except ImportError:
+            from logfire.experimental.query_client import LogfireQueryClient
+        return LogfireQueryClient
 
     def _page(self, client: Any, query: TraceQuery, size: int, before: datetime) -> list[tuple[Optional[datetime], FetchedSpan]]:
         # whether max_timestamp is inclusive is undocumented; matches() applies the exclusive end either way
