@@ -20,7 +20,7 @@ class BinarySerde:
         :param obj: The value to serialize.
         :return: The serialized value as a JSON string.
         """
-        cls._log.debug(f"dumped: {type(obj).__name__}")
+        cls._log.debug(f"dumped: {obj}")
         return pickle.dumps(obj)
 
     @classmethod
@@ -34,5 +34,5 @@ class BinarySerde:
         if payload is None:
             return None
         loaded = pickle.loads(payload)
-        cls._log.debug(f"loaded: {type(loaded).__name__}")
+        cls._log.debug(f"loaded: {loaded}")
         return loaded
