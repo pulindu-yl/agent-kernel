@@ -45,10 +45,10 @@ class TraceloopTraceFetcher(TraceFetcher):
         self._transport = transport
         self._log = logging.getLogger("ak.trace.openllmetry.fetch")
 
-    def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]:
+    def _query_provider(self, query: TraceQuery) -> Iterable[FetchedSpan]:
         headers = {"Authorization": f"Bearer {self._api_key}"}
         with httpx.Client(base_url=self._base_url, headers=headers, timeout=self._TIMEOUT, transport=self._transport) as client:
-            return self._follow_cursor(query, partial(self._page, client, self._params(query)), self._to_span)
+            return self._fetch_by_cursor(query, partial(self._fetch_page, client, self._params(query)), self._to_span)
 
     def _params(self, query: TraceQuery) -> dict[str, Any]:
         start, end = query.window()
@@ -72,12 +72,12 @@ class TraceloopTraceFetcher(TraceFetcher):
             params["filters"] = json.dumps(filters)
         return params
 
-    def _page(self, client: httpx.Client, params: dict[str, Any], cursor: Optional[str]) -> tuple[list[dict[str, Any]], Optional[str]]:
+    def _fetch_page(self, client: httpx.Client, params: dict[str, Any], cursor: Optional[str]) -> tuple[list[dict[str, Any]], Optional[str]]:
         response = client.get(self._PATH, params={**params, "cursor": cursor} if cursor else params)
         response.raise_for_status()
         body = response.json()
-        page = body.get("spans", body)
-        return page.get("data") or [], page.get("next_cursor")
+        spans_page = body.get("spans", body)
+        return spans_page.get("data") or [], spans_page.get("next_cursor")
 
     def _to_span(self, item: dict[str, Any]) -> FetchedSpan:
         attributes = item.get("span_attributes") or {}

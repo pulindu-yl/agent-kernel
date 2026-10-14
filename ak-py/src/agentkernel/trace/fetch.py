@@ -225,8 +225,8 @@ class OTelSpanClassifier:
 class TraceFetcher(ABC):
     """The base of the built-in fetchers: the pinned window, the merge and the two paging loops they share.
 
-    Subclasses implement only their provider's requests (``_collect``) and their ``_to_span`` mapping. Not
-    exported: bring-your-own tracers override ``BaseTrace.fetch`` and only have to pass ``TraceFetchContract``.
+    Subclasses implement only their provider's requests (``_query_provider``) and their ``_to_span`` mapping.
+    Not exported: bring-your-own tracers override ``BaseTrace.fetch`` and only have to pass ``TraceFetchContract``.
     """
 
     provider: ClassVar[str]  # the tracer's trace.type short name, written to every FetchedSpan.provider
@@ -240,74 +240,94 @@ class TraceFetcher(ABC):
         # matches() resolves window() on every call, so a defaulted end (now) would move between calls
         start, end = query.window()
         query = query.model_copy(update={"start": start, "end": end})
-        spans: dict[str, FetchedSpan] = {}
-        for span in self._collect(query):
-            spans.setdefault(span.span_id, span)
-        return FetchedSpan.oldest_first(spans.values())[-query.limit :]
+        spans_by_id: dict[tuple[str, str], FetchedSpan] = {}
+        for span in self._query_provider(query):
+            spans_by_id.setdefault(self._span_key(span), span)
+        return FetchedSpan.oldest_first(spans_by_id.values())[-query.limit :]
 
     @abstractmethod
-    def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]:
+    def _query_provider(self, query: TraceQuery) -> Iterable[FetchedSpan]:
         """Runs the provider's requests for a query whose window is already pinned."""
 
-    def _follow_cursor(
+    @staticmethod
+    def _span_key(span: FetchedSpan) -> tuple[str, str]:
+        # OTel span ids are unique only within a trace
+        return span.trace_id, span.span_id
+
+    def _fetch_by_cursor(
         self,
         query: TraceQuery,
-        page: Callable[[Optional[str]], tuple[list[Any], Optional[str]]],
-        to_span: Callable[[Any], FetchedSpan],
+        fetch_page: Callable[[Optional[str]], tuple[list[Any], Optional[str]]],
+        item_to_span: Callable[[Any], FetchedSpan],
     ) -> list[FetchedSpan]:
         """
         Follows a newest-first cursor API, keeping up to ``limit`` spans that ``query.matches``.
 
-        :param page: Returns ``(items, next_cursor)`` for a cursor (None for the first page).
-        :param to_span: Maps one item to a span.
+        :param fetch_page: Returns ``(items, next_cursor)`` for a cursor (None for the first page).
+        :param item_to_span: Maps one item to a span.
         """
-        kept: list[FetchedSpan] = []
+        matched_spans: list[FetchedSpan] = []
         cursor: Optional[str] = None
         while True:
-            items, next_cursor = page(cursor)
+            items, next_cursor = fetch_page(cursor)
             for item in items:
-                span = to_span(item)
+                span = item_to_span(item)
                 if query.matches(span):
-                    kept.append(span)
-                    if len(kept) >= query.limit:
-                        return kept
+                    matched_spans.append(span)
+                    if len(matched_spans) >= query.limit:
+                        return matched_spans
             # a repeated cursor would page forever when local filtering keeps the limit from being reached
             if not next_cursor or not items or next_cursor == cursor:
-                return kept
+                return matched_spans
             cursor = next_cursor
 
-    def _page_backward(
+    def _fetch_by_time_window(
         self,
         query: TraceQuery,
-        before: datetime,
-        max_rows: int,
-        page: Callable[[int, datetime], list[tuple[Optional[datetime], FetchedSpan]]],
+        upper_bound: datetime,
+        max_rows_per_request: int,
+        fetch_page: Callable[[int, datetime], list[tuple[Optional[datetime], FetchedSpan]]],
     ) -> list[FetchedSpan]:
         """
         Pages backwards in time over an API with a row cap and no cursor, keeping up to ``limit`` spans
         that ``query.matches``.
 
-        :param before: The upper bound of the first page.
-        :param max_rows: The API's row cap per query.
-        :param page: Returns up to ``size`` ``(cursor timestamp, span)`` rows at or before ``before``, newest first.
+        Each page's upper bound is inclusive, so the rows at the boundary are read again on the next page
+        and dropped as already seen; the page size is grown by that many rows so they never crowd out older ones.
+
+        :param upper_bound: The upper bound of the first page.
+        :param max_rows_per_request: The API's row cap per query.
+        :param fetch_page: Returns up to ``page_size`` ``(cursor timestamp, span)`` rows at or before
+            ``upper_bound``, newest first.
         """
-        kept: list[FetchedSpan] = []
-        seen: set[str] = set()
-        while len(kept) < query.limit:
-            size = min(max_rows, query.limit - len(kept))
-            rows = page(size, before)
-            fresh = [(stamp, span) for stamp, span in rows if span.span_id not in seen]
-            seen.update(span.span_id for _, span in fresh)
-            for _, span in fresh:
+        matched_spans: list[FetchedSpan] = []
+        seen_span_keys: set[tuple[str, str]] = set()
+        reread_rows = 0  # rows already seen that the next request is expected to return again
+        while len(matched_spans) < query.limit:
+            page_size = min(max_rows_per_request, query.limit - len(matched_spans) + reread_rows)
+            page_rows = fetch_page(page_size, upper_bound)
+            new_rows = [(stamp, span) for stamp, span in page_rows if self._span_key(span) not in seen_span_keys]
+            seen_span_keys.update(self._span_key(span) for _, span in new_rows)
+            for _, span in new_rows:
                 # both callers filter by session server side, so spans without their own id belong to it
                 span.session_id = span.session_id or query.session_id
                 if query.matches(span):
-                    kept.append(span)
-            # rows at the boundary timestamp are re-read on the next page and dropped as already seen
-            stamps = [stamp for stamp, _ in fresh if stamp is not None]
-            if len(rows) < size or not stamps:
-                if len(rows) == size and not fresh:
-                    self._log.warning("More than %d spans share one timestamp; stopping the %s fetch early", size, self.provider)
+                    matched_spans.append(span)
+                    if len(matched_spans) >= query.limit:
+                        return matched_spans
+            if len(page_rows) < page_size:
+                break  # the window is exhausted
+            if not new_rows:
+                # more already-seen rows came back than expected (e.g. CloudWatch re-reads the whole boundary
+                # second): retry with a page big enough to reach past them
+                if page_size < max_rows_per_request:
+                    reread_rows = page_size
+                    continue
+                self._log.warning("More than %d spans share one timestamp; stopping the %s fetch early", page_size, self.provider)
                 break
-            before = min(stamps)
-        return kept
+            new_row_times = [stamp for stamp, _ in new_rows if stamp is not None]
+            if not new_row_times:
+                break
+            upper_bound = min(new_row_times)
+            reread_rows = sum(1 for stamp, _ in page_rows if stamp == upper_bound)
+        return matched_spans

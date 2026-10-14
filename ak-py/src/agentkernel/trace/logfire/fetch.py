@@ -46,10 +46,12 @@ class LogfireTraceFetcher(TraceFetcher):
         self._base_url = base_url
         self._log = logging.getLogger("ak.trace.logfire.fetch")
 
-    def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]:
+    def _query_provider(self, query: TraceQuery) -> Iterable[FetchedSpan]:
         _, end = query.window()
         with self._query_client_class()(read_token=self._read_token, base_url=self._base_url) as client:
-            return self._page_backward(query, before=end, max_rows=self._MAX_ROWS, page=partial(self._page, client, query))
+            return self._fetch_by_time_window(
+                query, upper_bound=end, max_rows_per_request=self._MAX_ROWS, fetch_page=partial(self._fetch_page, client, query)
+            )
 
     @staticmethod
     def _query_client_class() -> type:
@@ -62,13 +64,13 @@ class LogfireTraceFetcher(TraceFetcher):
             from logfire.experimental.query_client import LogfireQueryClient
         return LogfireQueryClient
 
-    def _page(self, client: Any, query: TraceQuery, size: int, before: datetime) -> list[tuple[Optional[datetime], FetchedSpan]]:
+    def _fetch_page(self, client: Any, query: TraceQuery, page_size: int, upper_bound: datetime) -> list[tuple[Optional[datetime], FetchedSpan]]:
         # whether max_timestamp is inclusive is undocumented; matches() applies the exclusive end either way
         start, end = query.window()
-        rows = client.query_json_rows(sql=self._sql(query, size, before), min_timestamp=start, max_timestamp=end, limit=size)["rows"]
+        rows = client.query_json_rows(sql=self._sql(query, page_size, upper_bound), min_timestamp=start, max_timestamp=end, limit=page_size)["rows"]
         return [(span.start_time, span) for span in map(self._to_span, rows)]
 
-    def _sql(self, query: TraceQuery, limit: int, before: datetime) -> str:
+    def _sql(self, query: TraceQuery, limit: int, upper_bound: datetime) -> str:
         conditions = ["kind = 'span'"]
         if query.kinds is not None and SpanKind.SPAN not in query.kinds:
             conditions.append("(" + " OR ".join(self._KIND_SQL[kind] for kind in query.kinds) + ")")
@@ -84,7 +86,7 @@ class LogfireTraceFetcher(TraceFetcher):
         if query.session_id:
             # AK sets session_id on its wrapper span only, so match every span of those traces
             conditions.append(f"trace_id IN (SELECT trace_id FROM records WHERE attributes->>'session_id' = {self._literal(query.session_id)})")
-        conditions.append(f"start_timestamp <= {self._literal(before.isoformat())}")
+        conditions.append(f"start_timestamp <= {self._literal(upper_bound.isoformat())}")
         return f"SELECT {self._COLUMNS} FROM records WHERE {' AND '.join(conditions)} ORDER BY start_timestamp DESC LIMIT {limit}"
 
     @staticmethod

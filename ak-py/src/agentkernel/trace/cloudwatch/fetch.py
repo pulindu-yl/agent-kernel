@@ -54,16 +54,18 @@ class CloudWatchTraceFetcher(TraceFetcher):
         self._timeout = timeout
         self._log = logging.getLogger("ak.trace.cloudwatch.fetch")
 
-    def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]:
+    def _query_provider(self, query: TraceQuery) -> Iterable[FetchedSpan]:
         client = self._client or self._create_client()
         _, end = query.window()
-        # each query's endTime is ceil(before), so rows in the boundary second are re-read and dropped by span id
-        before = max(end, min(end + self._END_PADDING, datetime.now(timezone.utc)))
-        return self._page_backward(query, before=before, max_rows=self._MAX_ROWS, page=partial(self._page, client, query))
+        # each query's endTime is ceil(upper_bound), so rows in the boundary second are re-read and dropped as seen
+        upper_bound = max(end, min(end + self._END_PADDING, datetime.now(timezone.utc)))
+        return self._fetch_by_time_window(
+            query, upper_bound=upper_bound, max_rows_per_request=self._MAX_ROWS, fetch_page=partial(self._fetch_page, client, query)
+        )
 
-    def _page(self, client: Any, query: TraceQuery, size: int, before: datetime) -> list[tuple[Optional[datetime], FetchedSpan]]:
+    def _fetch_page(self, client: Any, query: TraceQuery, page_size: int, upper_bound: datetime) -> list[tuple[Optional[datetime], FetchedSpan]]:
         start, _ = query.window()
-        return [self._to_span(row) for row in self._run(client, self._insights(query, size), start, before)]
+        return [self._to_span(row) for row in self._run(client, self._insights(query, page_size), start, upper_bound)]
 
     def _create_client(self) -> Any:
         from botocore.session import Session as BotocoreSession

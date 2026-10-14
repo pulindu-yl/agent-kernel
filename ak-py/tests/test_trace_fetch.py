@@ -200,8 +200,8 @@ class TestTraceFetch:
 # --- TraceFetcher (the built-ins' shared paging and merge) ---------------------------------------------------
 
 
-def _span(span_id, minute, session_id=None, kind=SpanKind.TOOL):
-    return FetchedSpan(provider="fake", trace_id="t1", span_id=span_id, start_time=_ts(minute), session_id=session_id, kind=kind)
+def _span(span_id, minute, session_id=None, kind=SpanKind.TOOL, trace_id="t1"):
+    return FetchedSpan(provider="fake", trace_id=trace_id, span_id=span_id, start_time=_ts(minute), session_id=session_id, kind=kind)
 
 
 class _ScriptedFetcher(TraceFetcher):
@@ -213,7 +213,7 @@ class _ScriptedFetcher(TraceFetcher):
         self.spans = list(spans)
         self.queries = []
 
-    def _collect(self, query):
+    def _query_provider(self, query):
         self.queries.append(query)
         return self.spans
 
@@ -232,7 +232,7 @@ class TestTraceFetcher:
         windows = []
 
         class WindowRecorder(_ScriptedFetcher):
-            def _collect(self, query):
+            def _query_provider(self, query):
                 windows.extend([query.window(), query.window()])
                 return [_span("edge", 59)] if query.matches(_span("edge", 59)) else []
 
@@ -248,6 +248,11 @@ class TestTraceFetcher:
         assert [span.span_id for span in spans] == ["b", "c"]
         assert fetcher.fetch(TraceQuery(start=START, end=END))[0] is first_a
 
+    def test_fetch_keeps_spans_sharing_an_id_across_traces(self):
+        fetcher = _ScriptedFetcher([_span("a", 1, trace_id="t1"), _span("a", 2, trace_id="t2")])
+        spans = fetcher.fetch(TraceQuery(start=START, end=END))
+        assert [span.trace_id for span in spans] == ["t1", "t2"]
+
     @pytest.mark.parametrize(
         "pages, limit, expected_calls",
         [
@@ -257,7 +262,7 @@ class TestTraceFetcher:
             ({None: ([1, 2], "c1")}, 2, 1),  # limit reached
         ],
     )
-    def test_follow_cursor_stop_rules(self, pages, limit, expected_calls):
+    def test_fetch_by_cursor_stop_rules(self, pages, limit, expected_calls):
         calls = []
 
         def page(cursor):
@@ -265,16 +270,16 @@ class TestTraceFetcher:
             return pages[cursor]
 
         query = TraceQuery(start=START, end=END, limit=limit)
-        spans = _ScriptedFetcher()._follow_cursor(query, page, lambda minute: _span(f"s{minute}", minute))
+        spans = _ScriptedFetcher()._fetch_by_cursor(query, page, lambda minute: _span(f"s{minute}", minute))
         assert len(calls) == expected_calls and len(spans) <= limit
 
-    def test_follow_cursor_keeps_only_matching_spans(self):
+    def test_fetch_by_cursor_keeps_only_matching_spans(self):
         query = TraceQuery(start=START, end=END, kinds=[SpanKind.TOOL])
         items = [_span("tool", 1), _span("llm", 2, kind=SpanKind.LLM), _span("late", 61)]
-        spans = _ScriptedFetcher()._follow_cursor(query, lambda cursor: (items, None), lambda span: span)
+        spans = _ScriptedFetcher()._fetch_by_cursor(query, lambda cursor: (items, None), lambda span: span)
         assert [span.span_id for span in spans] == ["tool"]
 
-    def test_page_backward_dedupes_the_boundary_and_backfills_the_session(self):
+    def test_fetch_by_time_window_dedupes_the_boundary_and_backfills_the_session(self):
         pages = [[(_ts(4), _span("d", 4)), (_ts(3), _span("c", 3))], [(_ts(3), _span("c", 3)), (_ts(2), _span("b", 2, session_id="s-1"))], []]
         befores = []
 
@@ -283,12 +288,12 @@ class TestTraceFetcher:
             return pages[len(befores) - 1]
 
         query = TraceQuery(start=START, end=END, session_id="s-1", limit=10)
-        spans = _ScriptedFetcher()._page_backward(query, before=END, max_rows=2, page=page)
+        spans = _ScriptedFetcher()._fetch_by_time_window(query, upper_bound=END, max_rows_per_request=2, fetch_page=page)
         assert [span.span_id for span in spans] == ["d", "c", "b"]
         assert all(span.session_id == "s-1" for span in spans)
         assert befores == [END, _ts(3), _ts(2)]
 
-    def test_page_backward_stops_on_a_short_page_or_the_limit(self):
+    def test_fetch_by_time_window_stops_on_a_short_page_or_the_limit(self):
         calls = []
 
         def page(size, before):
@@ -296,29 +301,56 @@ class TestTraceFetcher:
             return [(_ts(5 - i), _span(f"s{len(calls)}-{i}", 5 - i)) for i in range(size)]
 
         query = TraceQuery(start=START, end=END, limit=3)
-        spans = _ScriptedFetcher()._page_backward(query, before=END, max_rows=2, page=page)
-        assert len(spans) == 3 and calls == [2, 1]
+        spans = _ScriptedFetcher()._fetch_by_time_window(query, upper_bound=END, max_rows_per_request=2, fetch_page=page)
+        assert len(spans) == 3 and calls == [2, 2]
 
-        short = _ScriptedFetcher()._page_backward(
-            TraceQuery(start=START, end=END), before=END, max_rows=5, page=lambda size, before: [(_ts(1), _span("a", 1))]
+        short = _ScriptedFetcher()._fetch_by_time_window(
+            TraceQuery(start=START, end=END), upper_bound=END, max_rows_per_request=5, fetch_page=lambda size, before: [(_ts(1), _span("a", 1))]
         )
         assert [span.span_id for span in short] == ["a"]
 
-    def test_page_backward_stops_on_rows_without_a_cursor_timestamp(self):
+    def test_fetch_by_time_window_sizes_pages_past_the_reread_boundary(self):
+        # an inclusive upper bound re-reads the previous page's oldest row; it must not fill the last page
+        rows = [(_ts(minute), _span(f"s{minute}", minute)) for minute in (10, 9, 8, 7)]
+
+        def page(size, before):
+            return [row for row in rows if row[0] <= before][:size]
+
+        query = TraceQuery(start=START, end=END, limit=3)
+        spans = _ScriptedFetcher()._fetch_by_time_window(query, upper_bound=END, max_rows_per_request=2, fetch_page=page)
+        assert [span.span_id for span in spans] == ["s10", "s9", "s8"]
+
+    def test_fetch_by_time_window_grows_the_page_when_more_rows_are_reread_than_expected(self):
+        # like CloudWatch, which re-reads the whole boundary second rather than the boundary timestamp only
+        rows = [(_ts(minute), _span(f"s{minute}", minute)) for minute in (5, 4, 3, 2, 1)]
+        sizes = []
+
+        def page(size, before):
+            sizes.append(size)
+            return [row for row in rows if row[0] <= before + timedelta(minutes=1)][:size]
+
+        query = TraceQuery(start=START, end=END, limit=4)
+        spans = _ScriptedFetcher()._fetch_by_time_window(query, upper_bound=END, max_rows_per_request=3, fetch_page=page)
+        assert [span.span_id for span in spans] == ["s5", "s4", "s3", "s2"]
+        assert sizes == [3, 2, 3]
+
+    def test_fetch_by_time_window_stops_on_rows_without_a_cursor_timestamp(self):
         calls = []
 
         def page(size, before):
             calls.append(before)
             return [(None, _span("a", 1)), (None, _span("b", 2))]
 
-        spans = _ScriptedFetcher()._page_backward(TraceQuery(start=START, end=END), before=END, max_rows=2, page=page)
+        spans = _ScriptedFetcher()._fetch_by_time_window(TraceQuery(start=START, end=END), upper_bound=END, max_rows_per_request=2, fetch_page=page)
         assert len(spans) == 2 and len(calls) == 1
 
-    def test_page_backward_warns_on_a_full_page_with_no_fresh_rows(self, caplog):
+    def test_fetch_by_time_window_warns_on_a_full_page_with_no_fresh_rows(self, caplog):
         rows = [(_ts(3), _span("a", 3)), (_ts(3), _span("b", 3))]
         fetcher = _ScriptedFetcher()
         with caplog.at_level("WARNING", logger="ak.trace.fetch"):
-            spans = fetcher._page_backward(TraceQuery(start=START, end=END), before=END, max_rows=2, page=lambda size, before: rows)
+            spans = fetcher._fetch_by_time_window(
+                TraceQuery(start=START, end=END), upper_bound=END, max_rows_per_request=2, fetch_page=lambda size, before: rows
+            )
         assert [span.span_id for span in spans] == ["a", "b"]
         assert "share one timestamp" in caplog.text
 

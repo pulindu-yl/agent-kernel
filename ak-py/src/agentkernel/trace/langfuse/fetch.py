@@ -32,7 +32,7 @@ class LangfuseTraceFetcher(TraceFetcher):
         self._client = client
         self._log = logging.getLogger("ak.trace.langfuse.fetch")
 
-    def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]:
+    def _query_provider(self, query: TraceQuery) -> Iterable[FetchedSpan]:
         """
         Each requested kind and trace id is a separate paginated request, because the v2 API's direct
         parameters take a single value each. Langfuse pages newest first, so each request keeps the most
@@ -41,7 +41,7 @@ class LangfuseTraceFetcher(TraceFetcher):
         spans: list[FetchedSpan] = []
         for langfuse_type in self._types(query):
             for trace_id in query.trace_ids or [None]:
-                spans.extend(self._follow_cursor(query, partial(self._page, query, langfuse_type, trace_id), self._to_span))
+                spans.extend(self._fetch_by_cursor(query, partial(self._fetch_page, query, langfuse_type, trace_id), self._to_span))
         return spans
 
     def _types(self, query: TraceQuery) -> list[Optional[str]]:
@@ -50,7 +50,7 @@ class LangfuseTraceFetcher(TraceFetcher):
             return [None]
         return [self._TYPES[kind] for kind in query.kinds]
 
-    def _page(
+    def _fetch_page(
         self, query: TraceQuery, langfuse_type: Optional[str], trace_id: Optional[str], cursor: Optional[str]
     ) -> tuple[list[Any], Optional[str]]:
         start, end = query.window()
