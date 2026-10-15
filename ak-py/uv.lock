@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'win32'",
@@ -95,11 +95,6 @@ azure = [
     { name = "azure-data-tables" },
     { name = "azure-functions", version = "1.25.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13' or (extra == 'extra-11-agentkernel-crewai' and extra == 'extra-11-agentkernel-test')" },
     { name = "azure-functions", version = "2.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13' or (extra == 'extra-11-agentkernel-crewai' and extra == 'extra-11-agentkernel-test')" },
-]
-browser = [
-    { name = "fastapi" },
-    { name = "uvicorn" },
-    { name = "websockets" },
 ]
 chromadb = [
     { name = "chromadb", version = "1.1.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-11-agentkernel-crewai'" },
@@ -280,7 +275,6 @@ requires-dist = [
     { name = "docker", marker = "extra == 'sandbox-docker'", specifier = ">=7.0.0" },
     { name = "e2b-code-interpreter", marker = "extra == 'e2b'", specifier = ">=2.8.0" },
     { name = "fastapi", marker = "extra == 'api'", specifier = ">=0.118.0" },
-    { name = "fastapi", marker = "extra == 'browser'", specifier = ">=0.118.0" },
     { name = "fastapi", marker = "extra == 'instagram'", specifier = ">=0.118.0" },
     { name = "fastapi", marker = "extra == 'messenger'", specifier = ">=0.118.0" },
     { name = "fastapi", marker = "extra == 'slack'", specifier = ">=0.118.0" },
@@ -350,12 +344,10 @@ requires-dist = [
     { name = "trino", marker = "extra == 'trino'", specifier = ">=0.337.0" },
     { name = "typesafe-sdk", marker = "extra == 'jev'", specifier = ">=0.7.2,<0.8" },
     { name = "uvicorn", marker = "extra == 'api'", specifier = ">=0.37.0" },
-    { name = "uvicorn", marker = "extra == 'browser'", specifier = ">=0.37.0" },
     { name = "valkey", marker = "extra == 'valkey'", specifier = ">=6.0.0" },
     { name = "walledai", marker = "extra == 'walledai'", specifier = ">=4.9.3" },
-    { name = "websockets", marker = "extra == 'browser'", specifier = ">=13.0" },
 ]
-provides-extras = ["auth", "langfuse", "openllmetry", "logfire", "cloudwatch", "crewai", "langgraph", "smolagents", "pydanticai", "cli", "livekit", "browser", "aws", "azure", "redis", "valkey", "kafka", "nats", "thread", "agui", "cron", "neo4j", "chromadb", "trino", "openai", "adk", "walledai", "api", "slack", "whatsapp", "messenger", "instagram", "telegram", "teams", "gmail", "gcp", "test", "a2a", "mcp", "multimodal", "sandbox-docker", "e2b", "daytona", "kubernetes", "opik", "jev"]
+provides-extras = ["auth", "langfuse", "openllmetry", "logfire", "cloudwatch", "crewai", "langgraph", "smolagents", "pydanticai", "cli", "livekit", "aws", "azure", "redis", "valkey", "kafka", "nats", "thread", "agui", "cron", "neo4j", "chromadb", "trino", "openai", "adk", "walledai", "api", "slack", "whatsapp", "messenger", "instagram", "telegram", "teams", "gmail", "gcp", "test", "a2a", "mcp", "multimodal", "sandbox-docker", "e2b", "daytona", "kubernetes", "opik", "jev"]
 
 [package.metadata.requires-dev]
 dev = [

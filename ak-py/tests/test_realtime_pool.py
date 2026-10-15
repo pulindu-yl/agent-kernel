@@ -283,6 +283,51 @@ class TestRealtimePoolShutdown:
         assert RealtimeConnectionPool.get()._connections == {}
 
 
+class TestRealtimePoolSweep:
+    """The pool's loop releases connections nobody will send to again, and reports when it was blocked."""
+
+    @staticmethod
+    def _start(monkeypatch):
+        monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
+        pool = RealtimeConnectionPool.initialize()
+        thread = threading.Thread(target=pool.start, daemon=True)
+        thread.start()
+        assert pool._loop_ready.wait(timeout=5)
+        return pool, thread
+
+    @staticmethod
+    def _until(condition, seconds=3.0):
+        deadline = time.monotonic() + seconds
+        while not condition():
+            assert time.monotonic() < deadline, "timed out"
+            time.sleep(0.02)
+
+    def test_a_failed_connection_is_released_without_further_input(self, monkeypatch):
+        """Before, a failed connection was released only by its session's next input: a caller who had left
+        never sent one, and the adapter stayed connected until the process stopped."""
+        monkeypatch.setattr(realtime_pool, "_SWEEP_SECONDS", 0.05)
+        pool, thread = self._start(monkeypatch)
+        agent = _Agent(realtime_runner_cls=TestRealtimePoolShutdown._CountingAdapter)
+        conn = pool.get_or_create("s1", agent, Runtime(InMemorySessionStore()), Session("s1"))
+
+        asyncio.run_coroutine_threadsafe(conn.handle_framework_event("error", {"message": "socket closed"}), pool._loop).result(timeout=5)
+        self._until(lambda: "s1" not in pool._connections and conn.adapter.disconnects == 1)
+
+        ThreadRunner.shutdown_event.set()
+        thread.join(timeout=5)
+
+    def test_a_blocked_loop_is_reported(self, monkeypatch, caplog):
+        monkeypatch.setattr(realtime_pool, "_LOOP_LAG_WARNING_SECONDS", 0.1)
+        pool, thread = self._start(monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger="ak.pipeline.realtime_pool"):
+            pool._loop.call_soon_threadsafe(time.sleep, 0.4)
+            self._until(lambda: "The realtime loop was blocked" in caplog.text)
+
+        ThreadRunner.shutdown_event.set()
+        thread.join(timeout=5)
+
+
 class TestRealtimeRunnerReuse:
     def test_audio_chunks_reuse_connection_without_re_resolving(self, monkeypatch):
         from unittest.mock import MagicMock
@@ -793,6 +838,24 @@ class TestRealtimeTurnState:
             assert seen == {"responding": True, "speech": None}
         finally:
             loop.close()
+
+    @pytest.mark.asyncio
+    async def test_a_call_whose_socket_is_being_recovered_is_not_ready(self):
+        conn = _connection(loop=asyncio.get_running_loop())
+        await conn.connect()
+        assert conn.is_ready is True
+
+        await conn.handle_framework_event("done", {"status": "reconnecting"})
+        assert conn.is_ready is False
+
+        await conn.handle_framework_event("reconnected", {"agent": "general", "seconds": 1, "seeded": False})
+        assert conn.is_ready is True
+        assert conn.last_reconnect_at is None  # nothing was replayed, so nothing is owed
+
+        await conn.handle_framework_event("done", {"status": "reconnecting"})
+        await conn.handle_framework_event("reconnected", {"agent": "general", "seconds": 1, "seeded": True})
+        assert conn.last_reconnect_at is not None  # the model owes a reply to the replayed conversation
+        conn._pacing_task.cancel()
 
 
 class TestRealtimeAgentChanged:
@@ -2326,7 +2389,7 @@ class TestADKRealtimeRecovery:
         client = _FakeLiveClient([self._spoken_turn(), ConnectionError("1006 abnormal closure")], [])
         runner, events = await self._connect(monkeypatch, client)
 
-        await self._until(lambda: ("reconnected", {"agent": "supervisor", "seconds": 0}) in events)
+        await self._until(lambda: ("reconnected", {"agent": "supervisor", "seconds": 0, "seeded": True}) in events)
 
         assert [kind for kind, _ in events if kind == "error"] == []  # recovered: the pool is never told it failed
         assert len(client.sessions) == 2 and client.sessions[0].closed
@@ -2462,6 +2525,66 @@ class TestADKRealtimeRecovery:
         await runner._transfer(batch, billing)
 
         assert client.sessions[1].realtime_audio == [b"\x07" * 320]
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_the_note_goes_to_the_reconnected_socket_only(self, monkeypatch):
+        """Kept in the history, the note was replayed to every later socket as the caller's words."""
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "QUICK_DROP_SECONDS", 0.0)
+        client = _FakeLiveClient([self._spoken_turn(), ConnectionError("dropped")], [ConnectionError("dropped again")], [])
+        runner, _ = await self._connect(monkeypatch, client)
+
+        await self._until(lambda: len(client.sessions) == 3)
+
+        third = _seen(client.sessions[2].client_content[0][0])
+        assert sum("connection dropped" in line for line in third) == 1
+        assert not any("connection dropped" in (part.text or "") for said in runner._history for part in said.content.parts)
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_tool_result_for_a_lost_socket_is_kept_in_the_history(self, monkeypatch):
+        client = _FakeLiveClient([[_live_tool_call("c1", "lookup_account", account_id="A-1")], ConnectionError("dropped")], [])
+        runner, events = await self._connect(monkeypatch, client)
+        await self._until(lambda: any(kind == "reconnected" for kind, _ in events))
+
+        await runner.send_tool_result("c1", "A-1: paid up")
+
+        assert client.sessions[1].tool_responses == []  # the socket that asked is gone
+        assert _seen(runner._presented_history())[-2:] == [
+            "[supervisor] called tool `lookup_account` with parameters: {'account_id': 'A-1'}",
+            "[supervisor] `lookup_account` tool returned result: {'result': 'A-1: paid up'}",
+        ]
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_the_callers_own_words_do_not_hide_a_stall(self, monkeypatch):
+        """Every message used to end the wait, so a transcription of the caller hid a socket that never answered."""
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "STALL_SECONDS", 0.2)
+        client = _FakeLiveClient([0.05, [_live_transcript("input_transcription", "Hello?")]], [])
+        runner, events = await self._connect(monkeypatch, client)
+
+        await runner.send_text("Are you there?")
+        await self._until(lambda: any(kind == "reconnected" for kind, _ in events))
+
+        assert len(client.sessions) == 2
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_response_that_stops_part_way_is_a_stall(self, monkeypatch):
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "STALL_SECONDS", 0.2)
+        audio = _live_message(model_turn=types.SimpleNamespace(parts=[types.SimpleNamespace(inline_data=types.SimpleNamespace(data=b"\x00\x00"))]))
+        client = _FakeLiveClient([[audio]], [])  # the answer starts, then nothing, and no turn_complete
+        runner, events = await self._connect(monkeypatch, client)
+
+        await self._until(lambda: any(kind == "reconnected" for kind, _ in events))
+
+        assert len(client.sessions) == 2
         await runner.disconnect()
 
 
@@ -3117,6 +3240,7 @@ def _call_state(**state):
         last_caller_speech_at=None,
         last_edge_text_at=None,
         last_tool_result_at=None,
+        last_reconnect_at=None,
     )
     return types.SimpleNamespace(**{**defaults, **state})
 
@@ -3146,7 +3270,7 @@ class TestRealtimeOutbox:
         assert outbox.take(conn, now=200.0) is None
         assert outbox.quiet_for(conn, now=200.0) is None
 
-    @pytest.mark.parametrize("given", ["last_caller_speech_at", "last_edge_text_at", "last_tool_result_at"])
+    @pytest.mark.parametrize("given", ["last_caller_speech_at", "last_edge_text_at", "last_tool_result_at", "last_reconnect_at"])
     def test_the_model_answers_what_it_was_given_before_anything_is_said(self, given):
         conn, outbox = _call_state(**{given: 110.0}), self._outbox("J1 finished.")
 
@@ -3287,6 +3411,61 @@ class TestRealtimeCall:
         assert "No realtime pool in this process" in caplog.text
         assert (call.connected, call.quiet_for(), call.withdraw("k")) == (False, None, False)
 
+    def test_close_ends_the_sessions_connection_and_drops_its_posts(self, monkeypatch):
+        from agentkernel.pipeline import RealtimeCall
+
+        closed = []
+
+        class Conn:
+            closed = False
+            is_ready = False
+
+            async def close(self):
+                closed.append(True)
+
+        pool = RealtimeConnectionPool()
+        loop = asyncio.new_event_loop()
+        pool._loop = loop
+        conn = Conn()
+        pool._connections["s1"] = conn
+        pool.post_when_idle("s1", "an update")
+        monkeypatch.setattr(RealtimeConnectionPool, "_instance", pool)
+        try:
+            assert RealtimeCall("s1").close() is True
+            loop.run_until_complete(asyncio.sleep(0.01))
+        finally:
+            loop.close()
+
+        assert closed == [True] and conn.closed
+        assert "s1" not in pool._connections and "s1" not in pool._outboxes
+        assert RealtimeCall("s1").close() is False
+
+    def test_close_without_a_pool_is_a_no_op(self, monkeypatch):
+        from agentkernel.pipeline import RealtimeCall
+
+        monkeypatch.setattr(RealtimeConnectionPool, "_instance", None)
+        assert RealtimeCall("s1").close() is False
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_posted_while_the_socket_is_being_recovered(self):
+        """Text handed to a recovering adapter waits for its next socket, then cuts off the recovered agent."""
+        from agentkernel.pipeline import RealtimeCall
+
+        pool, call = self._pool(), RealtimeCall("s1")
+        conn = self._connect(pool)
+        call.post_when_idle("[Team update] J1 finished.")
+
+        await conn.handle_framework_event("done", {"status": "reconnecting"})
+        conn._audio_queue.get_nowait()  # the turn's done, which the pacing loop would have sent on
+        pool._deliver_posts(time.time())
+        await asyncio.sleep(0)
+        assert conn.adapter.texts == [] and call.connected is False
+
+        await conn.handle_framework_event("reconnected", {"agent": "general", "seconds": 1, "seeded": False})
+        pool._deliver_posts(time.time())
+        await asyncio.sleep(0)
+        assert conn.adapter.texts == ["[Team update] J1 finished."]
+
 
 class TestRealtimeHooks:
     """An agent's realtime hooks see the call: who connected, what each side said, who has the call."""
@@ -3397,6 +3576,19 @@ class TestRealtimeHooks:
 
         assert conn._hook_events is None and conn._hook_task is None
         await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_a_reconnect_reaches_the_hooks(self):
+        agent = _Agent()
+        recorder = self._Recorder()
+        agent.realtime_hooks.append(recorder)
+        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+        await conn.connect()
+
+        await conn.handle_framework_event("reconnected", {"agent": "billing", "seconds": 2, "seeded": True})
+        await conn.close()
+
+        assert ("reconnected", "billing", "", False) in recorder.events
 
 
 class TestADKCallerTranscript:

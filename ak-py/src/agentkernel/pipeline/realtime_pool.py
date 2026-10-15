@@ -33,6 +33,8 @@ _log = logging.getLogger("ak.pipeline.realtime_pool")
 _SEND_TIMEOUT_SECONDS = 10.0
 # Connections idle for this long are evicted and closed by the pool's background thread.
 _IDLE_TIMEOUT_SECONDS = 300.0
+# How often the pool's loop looks for idle and failed connections to evict.
+_SWEEP_SECONDS = 5.0
 # At shutdown, how long work still running on the pool loop (a socket close, a tool call) may
 # finish before it is cancelled.
 _SHUTDOWN_GRACE_SECONDS = 2.0
@@ -99,7 +101,14 @@ class RealtimeConnection:
         self._last_tool_result_at: Optional[float] = None
         self._last_caller_speech_at: Optional[float] = None
         self._last_edge_text_at: Optional[float] = None
+        # When the adapter last replaced a lost model socket by replaying the conversation into a new one:
+        # the model owes a reply to what it was seeded with.
+        self._last_reconnect_at: Optional[float] = None
         self._caller_speaking = False
+        # From the adapter reporting a lost model socket (``done`` with status ``reconnecting``) until it
+        # reports ``reconnected`` (or fails): text sent meanwhile would wait for a socket, then interrupt the
+        # recovered agent, so nothing is posted into the call.
+        self._recovering = False
         # When the model socket finished connecting; ``None`` until then. Nothing is posted into a
         # connection (``RealtimeOutbox``) before it, as the adapter has no socket to send to yet.
         self._connected_at: Optional[float] = None
@@ -272,6 +281,14 @@ class RealtimeConnection:
         elif event_type in ("done", "interrupt", "speech_started"):
             # The response ended, or the caller spoke over it or after it.
             self._response_open = False
+        if event_type == "done" and data.get("status") == "reconnecting":
+            self._recovering = True
+        elif event_type == "reconnected":
+            self._recovering = False
+            if data.get("seeded"):
+                self._last_reconnect_at = self.last_activity_at
+        elif event_type == "error":
+            self._recovering = False
         if event_type == "audio_delta":
             self._queued_audio += 1
             await self._audio_queue.put(("audio_delta", data))
@@ -535,8 +552,16 @@ class RealtimeConnection:
 
     @property
     def is_ready(self) -> bool:
-        """Whether the model socket has connected and not closed: text sent now reaches the model."""
-        return self._connected_at is not None and not self.closed
+        """Whether the model socket has connected, is not closed and is not being recovered: text sent now
+        reaches the model at once."""
+        return self._connected_at is not None and not self.closed and not self._recovering
+
+    @property
+    def last_reconnect_at(self) -> Optional[float]:
+        """Epoch seconds when the adapter last replaced a lost model socket by replaying the conversation into a
+        new one (``reconnected`` with ``seeded``); ``None`` before that. The model owes a reply to that seed, as
+        it does to a tool result, until ``last_model_output_at`` is later."""
+        return self._last_reconnect_at
 
     @property
     def connected_at(self) -> Optional[float]:
@@ -607,7 +632,8 @@ class RealtimeOutbox:
     Text sent into a call starts a model response, and on Gemini Live cuts off one being generated, so
     a post waits until nobody is talking: the model is not mid-response, the caller is not speaking,
     the model has answered what it was last given (the caller's words, text from the edge, a tool
-    result, the last post), and nothing has happened for ``QUIET_SECONDS``. An input the model never
+    result, a conversation replayed into a recovered socket, the last post), and nothing has happened
+    for ``QUIET_SECONDS``. An input the model never
     answers (noise, a silent turn) stops holding the call after ``REPLY_TIMEOUT_SECONDS``.
 
     The pool keeps one per session, not per connection, so a post made while the model socket
@@ -663,6 +689,24 @@ class RealtimeOutbox:
 
     def quiet_for(self, connection: RealtimeConnection, now: float) -> Optional[float]:
         """Seconds since anything happened in ``connection``'s call, or ``None`` while it is busy or owes a reply."""
+        with self._lock:
+            return self._quiet_for(connection, now)
+
+    def take(self, connection: RealtimeConnection, now: float) -> Optional[str]:
+        """The next post to say into ``connection`` now, removed from the outbox; ``None`` while the call is busy."""
+        self.expire(now)
+        with self._lock:
+            if not self._pending:
+                return None
+            quiet = self._quiet_for(connection, now)
+            if quiet is None or quiet < self.QUIET_SECONDS:
+                return None
+            post = self._pending.pop(0)
+            self._last_post_at = now
+        return post.text
+
+    def _quiet_for(self, connection: RealtimeConnection, now: float) -> Optional[float]:
+        """``quiet_for``, with the lock held: it may forget the last post, which a new connection owes nothing to."""
         self._notice(connection)
         if not connection.is_ready or connection.is_responding or connection.is_caller_speaking or self._owes_reply(connection, now):
             return None
@@ -672,24 +716,10 @@ class RealtimeOutbox:
             connection.last_caller_speech_at,
             connection.last_edge_text_at,
             connection.last_tool_result_at,
+            connection.last_reconnect_at,
             self._last_post_at,
         )
         return now - max(t for t in times if t is not None)
-
-    def take(self, connection: RealtimeConnection, now: float) -> Optional[str]:
-        """The next post to say into ``connection`` now, removed from the outbox; ``None`` while the call is busy."""
-        self.expire(now)
-        if self.empty:
-            return None
-        quiet = self.quiet_for(connection, now)
-        if quiet is None or quiet < self.QUIET_SECONDS:
-            return None
-        with self._lock:
-            if not self._pending:
-                return None
-            post = self._pending.pop(0)
-        self._last_post_at = now
-        return post.text
 
     def _notice(self, connection: RealtimeConnection) -> None:
         if connection is not self._connection:
@@ -699,7 +729,13 @@ class RealtimeOutbox:
     def _owes_reply(self, connection: RealtimeConnection, now: float) -> bool:
         """Whether the model has still to answer something it was given, and is still being waited for."""
         output = connection.last_model_output_at
-        given = (connection.last_caller_speech_at, connection.last_edge_text_at, connection.last_tool_result_at, self._last_post_at)
+        given = (
+            connection.last_caller_speech_at,
+            connection.last_edge_text_at,
+            connection.last_tool_result_at,
+            connection.last_reconnect_at,
+            self._last_post_at,
+        )
         return any(at is not None and (output is None or output < at) and now - at < self.REPLY_TIMEOUT_SECONDS for at in given)
 
 
@@ -782,20 +818,24 @@ class RealtimeConnectionPool:
         last_sweep = time.time()
         while not ThreadRunner.shutdown_event.is_set():
             now = time.time()
-            if now - last_sweep > 5.0:
+            if now - last_sweep > _SWEEP_SECONDS:
                 last_sweep = now
-                idle_sessions = []
+                # Idle connections, and connections whose model socket failed: a failed one is otherwise
+                # released only when its session sends more input, which a caller who left never does.
+                evicted = []
                 with self._conn_lock:
                     for session_id, conn in self._connections.items():
-                        if not conn.closed and (now - conn.last_activity_at) > _IDLE_TIMEOUT_SECONDS:
-                            idle_sessions.append(session_id)
+                        if conn.closed:
+                            evicted.append((session_id, "its model socket failed"))
+                        elif (now - conn.last_activity_at) > _IDLE_TIMEOUT_SECONDS:
+                            evicted.append((session_id, f"idle for > {_IDLE_TIMEOUT_SECONDS}s"))
                             conn.closed = True
 
-                for session_id in idle_sessions:
+                for session_id, reason in evicted:
                     with self._conn_lock:
                         conn = self._connections.pop(session_id, None)
                     if conn:
-                        _log.info(f"Realtime session {session_id} idle for > {_IDLE_TIMEOUT_SECONDS}s; evicting.")
+                        _log.info(f"Realtime session {session_id} {reason}; evicting.")
                         self._loop.create_task(conn.close())
             try:
                 self._deliver_posts(now)

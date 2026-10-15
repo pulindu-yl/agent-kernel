@@ -114,7 +114,6 @@ const sidebars = {
         'integrations/hooks',
         'integrations/agui',
         'integrations/livekit',
-        'integrations/browser-voice',
       ],
     },
     {

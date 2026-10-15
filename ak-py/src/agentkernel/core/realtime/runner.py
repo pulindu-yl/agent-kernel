@@ -95,7 +95,13 @@ class RealtimeRunner(Runner):
             - ``transcript_delta``: ``{"delta": <text>, "message_id": str}``
             - ``tool_call``: ``{"call_id": str, "name": str, "arguments": <JSON string>}``; the pool
               then calls :meth:`execute_tool` and :meth:`send_tool_result`
-            - ``done``: ``{"status": ...}``, the end of a model turn
+            - ``done``: ``{"status": ...}``, the end of a model turn; status ``reconnecting`` when the
+              turn ended because the adapter lost its socket and is replacing it, after which the
+              pool posts nothing into the call until ``reconnected`` or ``error``
+            - ``reconnected``: ``{"agent": str, "seconds": int, "seeded": bool}``, optional, for an
+              adapter that recovers a lost socket itself: the socket was replaced and ``agent`` still
+              has the call; ``seeded`` when the new socket was given the conversation to answer. The
+              pool passes it to the agent's realtime hooks
             - ``error``: ``{"message": str}``, the socket failed; the pool tells the user and
               replaces the connection
             - ``interrupt``: ``{}``, the user spoke while the model was responding

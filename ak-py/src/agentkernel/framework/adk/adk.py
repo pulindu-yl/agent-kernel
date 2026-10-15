@@ -951,15 +951,17 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
     that answers in the tool's place stops a transfer. ADK plugins do not run, since a Live socket
     has no ADK ``Runner`` to hold them.
 
-    A socket that drops, or stops answering (nothing for ``STALL_SECONDS`` after it was given something to answer:
-    a dead socket can take the websocket keepalive about 40 seconds to notice), is replaced without leaving the
-    agent that had the call: the runner reconnects that agent, seeded with the conversation and told the line
-    dropped (``RECONNECTED_NOTE``), up to ``RECONNECT_ATTEMPTS`` times, waiting ``RECONNECT_DELAYS_SECONDS``
-    between attempts, and reports ``reconnected``; only when every attempt fails, or reconnected sockets keep being
-    lost again within ``QUICK_DROP_SECONDS``, is it reported as an ``error``.
-    The server closing a connection at its time limit is recovered the same way. While no socket is open (a
-    reconnect, a transfer), what the caller says is held, its latest ``HOLD_AUDIO_SECONDS``, and sent to the next
-    socket, as is any text sent meanwhile.
+    A socket that drops, or stalls, is replaced without leaving the agent that had the call: the runner reconnects
+    that agent, seeded with the conversation and told the line dropped (``RECONNECTED_NOTE``, in that seed only),
+    up to ``RECONNECT_ATTEMPTS`` times, waiting ``RECONNECT_DELAYS_SECONDS`` between attempts, and reports
+    ``reconnected``; only when every attempt fails, or reconnected sockets keep being lost again within
+    ``QUICK_DROP_SECONDS``, is it reported as an ``error``. The server closing a connection at its time limit is
+    recovered the same way. A stall is no progress from the model for ``STALL_SECONDS`` after it was given something
+    to answer (a tool result, text, a seeded turn) or in the middle of a response (a dead socket can take the
+    websocket keepalive about 40 seconds to notice). A turn the caller speaks and the model never answers is not
+    detected: Gemini Live does not signal the end of the caller's speech. While no socket is open (a reconnect, a
+    transfer), what the caller says is held, its latest ``HOLD_AUDIO_SECONDS``, and sent to the next socket, as is
+    any text sent meanwhile; a tool result that arrives for a lost socket is kept in the history.
 
     The caller starting a turn is reported as ``speech_started``, on the first transcription of
     their speech while the model is silent, and each later transcription as ``speech_heard``, so
@@ -1046,6 +1048,9 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         # Each dispatched call's batch, the calls of its tool_call message. Holds only the open
         # socket's calls: a result for a call a transfer has closed the socket of is dropped.
         self._batches: dict[str, GoogleADKRealtimeRunner._ToolBatch] = {}
+        # The batches a lost socket was still owed results for, by call id, with the agent that made them: their
+        # results are kept in the history when they arrive, though the socket that asked is gone.
+        self._lost_batches: dict[str, tuple[GoogleADKRealtimeRunner._ToolBatch, str]] = {}
         # True once disconnect() runs; the listen loop suppresses its error callback then so a
         # normal shutdown does not surface as a model-socket failure.
         self._closing = False
@@ -1270,7 +1275,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         self._listen_task = asyncio.create_task(self._listen())
         self._watchdog = asyncio.create_task(self._watch_for_stalls())
 
-    async def _open_socket(self, sdk_agent: Any) -> None:
+    async def _open_socket(self, sdk_agent: Any, extra: list[types.Content] | None = None) -> bool:
         """Open a Live socket configured for ``sdk_agent`` and make it the agent answering.
 
         After a transfer the socket is seeded with the conversation so far, presented as ADK presents
@@ -1278,9 +1283,14 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         completed when it ends with the user's side (it always does, as every agent turn is presented
         on that side), so the new agent answers; on Gemini 3.x, which waits for fresh input after
         replayed history, followed by the placeholder input ADK sends.
+
+        :param sdk_agent: The ADK agent the socket is for.
+        :param extra: Turns added to this seed only, after the conversation, such as the note a reconnect
+            sends; they are not kept in the history a later socket is seeded with.
+        :return: Whether the socket was seeded.
         """
         model = self._live_model(sdk_agent)
-        turns = self._presented_history()
+        turns = self._presented_history() + list(extra or [])
         seeded = bool(turns)
         self._log.info(f"Connecting to Gemini Live (agent={sdk_agent.name}, model={model})")
         cm = self._client.aio.live.connect(model=model, config=self._connect_config(sdk_agent, seeded=seeded))
@@ -1295,6 +1305,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             if turn_complete:
                 self._owed_since = self._given_at = time.monotonic()
         self._connection = connection
+        return seeded
 
     async def _close_socket(self) -> None:
         cm, self._cm, self._connection = self._cm, None, None
@@ -1354,6 +1365,9 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             await self._close_socket()
         except Exception as e:
             self._log.debug(f"Closing the lost socket failed: {e!r}")
+        # A tool still running for the lost socket reports to no socket; its result is kept for the history.
+        for call_id, batch in self._batches.items():
+            self._lost_batches[call_id] = (batch, getattr(self._callers.get(call_id), "name", None) or self._speaker())
         self._batches.clear()
         self._callers.clear()
         self._transfers.clear()
@@ -1383,14 +1397,10 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
                 return
             heard = caller_was_speaking or self._held_speech()
             note = self._reconnected_note(time.monotonic() - (last if last is not None else started), heard)
-            if note is not None:
-                self._history.append(note)
             try:
-                await asyncio.wait_for(self._open_socket(self._active), timeout=self.RECONNECT_TIMEOUT_SECONDS)
+                seeded = await asyncio.wait_for(self._open_socket(self._active, extra=note), timeout=self.RECONNECT_TIMEOUT_SECONDS)
             except Exception as e:
                 self._log.warning(f"Reconnect attempt {attempt} of {self.RECONNECT_ATTEMPTS} failed: {e!r}")
-                if note is not None:
-                    self._history.remove(note)
                 await self._close_socket()
                 continue
             if self._closing:
@@ -1400,7 +1410,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             self._reconnected_at = time.monotonic()
             seconds = round(time.monotonic() - started)
             self._log.info(f"Reconnected '{self._speaker()}' to Gemini Live after {seconds} s")
-            await self._callback("reconnected", {"agent": self._speaker(), "seconds": seconds})
+            await self._callback("reconnected", {"agent": self._speaker(), "seconds": seconds, "seeded": seeded})
             await self._release_held()
             return
         self._log.error(f"Gemini Live could not reconnect after {self.RECONNECT_ATTEMPTS} attempts")
@@ -1420,12 +1430,16 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             self._log.info(f"'{self._speaker()}' started speaking {', '.join(waits)}")
         self._caller_words_at = self._given_at = None
 
-    def _reconnected_note(self, seconds: float, caller_spoke: bool) -> "GoogleADKRealtimeRunner._Said | None":
+    def _reconnected_note(self, seconds: float, caller_spoke: bool) -> list[types.Content]:
+        """The note a reconnected socket's seed ends with, telling the agent the line dropped; none for an empty note.
+
+        For that seed only: kept in the history, it would be replayed as the caller's words to every later socket.
+        """
         note = self.RECONNECTED_NOTE if caller_spoke else self.RECONNECTED_QUIET_NOTE
         if not note:
-            return None
+            return []
         text = note.format(seconds=max(1, round(seconds)))
-        return self._Said("user", types.Content(role="user", parts=[types.Part(text=text)]))
+        return [types.Content(role="user", parts=[types.Part(text=text)])]
 
     def _held_speech(self) -> bool:
         """Whether the audio held while no socket was open has speech in it, not only the silence an edge sends."""
@@ -1462,8 +1476,14 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             await self.send_text(text)
 
     async def _handle_message(self, message: types.LiveServerMessage) -> None:
+        """Handle one server message.
+
+        The stall wait (``_owed_since``) moves only on the model's progress: each audio or output
+        transcription restarts it, as a response under way must keep producing, and ``turn_complete``, an
+        ``interrupted`` (or the barge-in this runner detects) and a tool call end it. Any other message, the
+        caller's own transcription included, leaves it as it is.
+        """
         self._last_message_at = time.monotonic()
-        self._owed_since = None
         server_content = getattr(message, "server_content", None)
         if server_content is not None:
             # Barge-in. The server signals it on ``interrupted``; its low-latency
@@ -1472,6 +1492,9 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             # talking over the model. Only fires while the model is actually speaking, and only
             # once per turn.
             interim = getattr(server_content, "interim_input_transcription", None)
+            if getattr(server_content, "interrupted", False):
+                # The response stopped: the model owes the caller an answer only once they finish speaking.
+                self._owed_since = None
             if getattr(server_content, "interrupted", False) and not self._interrupted_this_turn:
                 self._interrupted_this_turn = True
                 self._model_speaking = False
@@ -1483,6 +1506,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
                     self._interrupted_this_turn = True
                     self._model_speaking = False
                     self._caller_turn_reported = True
+                    self._owed_since = None
                     self._log.info("Gemini barge-in (user speaking); stopping playback")
                     await self._callback("interrupt", {})
             elif not self._model_speaking and not self._caller_turn_reported and self._transcribed(interim, server_content):
@@ -1503,6 +1527,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             output_transcription = getattr(server_content, "output_transcription", None)
             if output_transcription is not None and output_transcription.text:
                 self._caller_turn_reported = False
+                self._owed_since = time.monotonic()
                 self._model_words.append(output_transcription.text)
                 await self._callback("transcript_delta", {"delta": output_transcription.text, "message_id": ""})
 
@@ -1515,6 +1540,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
                             self._log_first_audio()
                         self._model_speaking = True
                         self._caller_turn_reported = False
+                        self._owed_since = time.monotonic()
                         audio_b64 = base64.b64encode(inline.data).decode("utf-8")
                         await self._callback("audio_delta", {"delta": audio_b64, "message_id": ""})
 
@@ -1522,11 +1548,14 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
                 self._interrupted_this_turn = False
                 self._model_speaking = False
                 self._caller_turn_reported = False
+                self._owed_since = None
                 await self._end_turn_and_report()
                 await self._callback("done", {"status": "completed"})
 
         tool_call = getattr(message, "tool_call", None)
         if tool_call and tool_call.function_calls:
+            # The model answered with calls; it owes a reply again once their results are sent.
+            self._owed_since = None
             batch = self._ToolBatch(calls=list(tool_call.function_calls))
             for call in batch.calls:
                 self._batches[call.id] = batch
@@ -1615,8 +1644,19 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         the calls asked for a transfer the responses go only into that history, which seeds the new
         agent's socket; the first transfer in call order is performed, and any other is answered as
         not performed. A result for a call made on a socket a transfer has since closed is dropped:
-        the call is not the open socket's.
+        the call is not the open socket's. A result for a call made on a socket that was lost is kept in
+        the history, once every call of its batch has one, so a later socket is seeded with it; it is
+        sent to no socket, and a transfer it asked for is not performed.
         """
+        lost = self._lost_batches.pop(call_id, None)
+        if lost is not None:
+            batch, author = lost
+            batch.results[call_id] = result
+            self._transfers.pop(call_id, None)
+            if len(batch.results) == len(batch.calls):
+                self._append_tool_turn(author, batch, self._responses(batch))
+                self._log.info(f"Kept the results of {[call.name for call in batch.calls]}, called on a lost socket, in the history")
+            return
         batch = self._batches.pop(call_id, None)
         if batch is None:
             self._log.debug(f"Dropping the result of call {call_id}: it was made on a socket a transfer has closed")
@@ -1647,11 +1687,14 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         :return: The caller's words before the calls, as ``_end_turn`` returns them.
         """
         said = self._end_turn()
-        author = self._speaker()
+        self._append_tool_turn(self._speaker(), batch, responses)
+        return said
+
+    def _append_tool_turn(self, author: str, batch: GoogleADKRealtimeRunner._ToolBatch, responses: list[types.FunctionResponse]) -> None:
+        """Add a batch's calls, then their responses, to the history, as made by ``author``."""
         calls = [types.Part(function_call=types.FunctionCall(id=call.id, name=call.name, args=call.args or {})) for call in batch.calls]
         self._history.append(self._Said(author, types.Content(role="model", parts=calls)))
         self._history.append(self._Said(author, types.Content(role="user", parts=[types.Part(function_response=response) for response in responses])))
-        return said
 
     @staticmethod
     def _responses(batch: GoogleADKRealtimeRunner._ToolBatch) -> list[types.FunctionResponse]:

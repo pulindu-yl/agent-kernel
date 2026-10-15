@@ -8,10 +8,9 @@ class StatefulEdgeRegistry:
     """A runtime registry for active, stateful edge connections (spec #524).
 
     Unlike the IntegrationAdapterFactory which constructs stateless webhook adapters on demand,
-    stateful edges (like LiveKit or Twilio) are constructed and managed by a GatewayRunner, or by an
-    endpoint that serves connections as they come (``BrowserVoiceEndpoint``). The host registers the
-    live connection here so that the Response Handler can route replies back to the same long-lived
-    connection.
+    stateful edges (like LiveKit or Twilio) are constructed and managed by a GatewayRunner.
+    The runner registers the live connection here so that the Response Handler can route
+    replies back to the same long-lived connection.
     """
 
     _cache: Dict[str, StatefulEdgeAdapter] = {}
