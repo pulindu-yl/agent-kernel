@@ -74,11 +74,11 @@ fixture.
 | `test_multimodal_tools.py` | `analyze_attachments` content routing per stored-record shape: a remote record's `url` is sent as-is (an image as `image_url`, anything else named in text) and never wrapped as base64; a stored record's base64 becomes a `data:` URI, a PDF a `file` part, any other type a `[Document: ...]` line; plus the two early returns that never reach the store or the LLM |
 | `test_config.py` | AKConfig loading, env vars |
 | `test_test_config.py` | AKTestConfig (Test framework config) loading, defaults |
-| `test_tool.py` | ToolContext, cache; `ToolContext.activated()` restoring the previous context (also after an exception) and keeping one context active in concurrent tasks (#810) |
+| `test_tool.py` | ToolContext, cache |
 | `test_tool_openai.py` | OpenAI ToolBuilder |
 | `test_tool_crewai.py` | CrewAI ToolBuilder |
 | `test_tool_langgraph.py` | LangGraph ToolBuilder |
-| `test_tool_adk.py` | Google ADK ToolBuilder; its runner-driving mock agents come from the file's `_mock_agent()` helper (#758); a model's parallel tool calls, run as concurrent tasks, sharing the run's AK context without one resetting with another's token (#810) |
+| `test_tool_adk.py` | Google ADK ToolBuilder; its runner-driving mock agents come from the file's `_mock_agent()` helper (#758) |
 | `test_tool_smolagents.py` | Smolagents ToolBuilder |
 | `test_tool_pydanticai.py` | Pydantic AI ToolBuilder |
 | `test_openai_runner.py` | OpenAIRunner execution, error handling; run options forwarded to `Runner.run` / `run_streamed`, and a real `RunHooks` resolving `Session.current()` / `Agent.current()` through `Runtime.run` and `Runtime.stream` (#754); a factory-merged mapping wins at `Runner.run` / `run_streamed`, resolution is awaited once per method, a failing resolution becomes the error reply in `run` and propagates from `stream`, and a real factory declared through `OpenAIModule.run_options` runs per call (#758). Every mock agent handed to a runner comes from a `_mock_agent()` helper carrying `run_options` and an `AsyncMock` `resolve_run_options` returning it, the contract all runner test files share since #758 |

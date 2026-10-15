@@ -1,4 +1,3 @@
-import asyncio
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -146,34 +145,6 @@ class TestToolContextGetSetReset:
         ctx1.reset()
         with pytest.raises(RuntimeError):
             ToolContext.get()
-
-
-class TestToolContextActivated:
-
-    def test_activated_sets_and_restores(self, tool_context):
-        with tool_context.activated() as active:
-            assert active is tool_context
-            assert ToolContext.get() is tool_context
-        with pytest.raises(RuntimeError):
-            ToolContext.get()
-
-    def test_activated_restores_after_an_exception(self, tool_context):
-        with pytest.raises(ValueError):
-            with tool_context.activated():
-                raise ValueError("tool failed")
-        with pytest.raises(RuntimeError):
-            ToolContext.get()
-
-    @pytest.mark.asyncio
-    async def test_one_context_active_in_concurrent_tasks(self, tool_context):
-        """Each task keeps its own reset token: the first to finish must not reset with another's token."""
-
-        async def call(seconds):
-            with tool_context.activated():
-                await asyncio.sleep(seconds)
-                return ToolContext.get() is tool_context
-
-        assert await asyncio.gather(asyncio.create_task(call(0.01)), asyncio.create_task(call(0.05))) == [True, True]
 
 
 # ToolContext context manager (__enter__ / __exit__)

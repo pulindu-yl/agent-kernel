@@ -2068,34 +2068,31 @@ class GoogleADKToolBuilder(ToolBuilder):
                 return kwargs
             return {**kwargs, "tool_context": tool_context}
 
-        def activated_context(tool_context: ToolContext | None) -> contextlib.AbstractContextManager:
-            """
-            Activates the run's AK tool context for one tool call, if the ADK context carries its id.
-
-            A model's parallel tool calls run as concurrent tasks sharing that one AK context, so it is
-            activated per call with :meth:`AKToolContext.activated`, which keeps each call's reset token
-            separate.
-
-            :param tool_context: The ADK tool context supplied to the wrapper.
-            :return: A context manager for the duration of the call.
-            """
-            if tool_context and tool_context.state and tool_context.state.get("ak_tool_context"):
-                return AKToolContext.fetch(tool_context.state["ak_tool_context"]).activated()
-            return contextlib.nullcontext()
-
         if asyncio.iscoroutinefunction(func):
 
             @functools.wraps(func)
             async def wrapper(*args: Any, tool_context: ToolContext | None = None, **kwargs: Any) -> Any:
-                with activated_context(tool_context):
+                tctx: AKToolContext | None = None
+                try:
+                    if tool_context and tool_context.state and tool_context.state.get("ak_tool_context"):
+                        tctx = AKToolContext.fetch(tool_context.state["ak_tool_context"]).set()
                     return await func(*args, **forwarded_kwargs(args, kwargs, tool_context))
+                finally:
+                    if tctx:
+                        tctx.reset()
 
         else:
 
             @functools.wraps(func)
             def wrapper(*args: Any, tool_context: ToolContext | None = None, **kwargs: Any) -> Any:
-                with activated_context(tool_context):
+                tctx: AKToolContext | None = None
+                try:
+                    if tool_context and tool_context.state and tool_context.state.get("ak_tool_context"):
+                        tctx = AKToolContext.fetch(tool_context.state["ak_tool_context"]).set()
                     return func(*args, **forwarded_kwargs(args, kwargs, tool_context))
+                finally:
+                    if tctx:
+                        tctx.reset()
 
         # Only add a tool_context parameter if the original function does not already
         # declare one, and insert it before any **kwargs (VAR_KEYWORD) parameter to

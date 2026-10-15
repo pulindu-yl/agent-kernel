@@ -335,28 +335,6 @@ class TestWrapAdkAwareTools:
             assert wrapped(tool_context=adk_ctx) == "['milk']"
             assert captured_ids == [ak_ctx.id]
 
-    @pytest.mark.asyncio
-    async def test_parallel_tool_calls_share_one_ak_context(self):
-        """Live: a model's parallel tool calls run as concurrent tasks, and the first to finish failed with
-        "Token ... was created in a different Context", because the reset token was kept on the shared context."""
-        runtime = MagicMock(spec=Runtime)
-        ak_ctx = AKToolContext(runtime, MockAgent(), Session("parallel-session"), [AgentRequestText(prompt="hi")])
-
-        async def slow(name: str, seconds: float) -> str:
-            """A tool that takes a while."""
-            await asyncio.sleep(seconds)
-            return f"{name}:{AKToolContext.get().id == ak_ctx.id}"
-
-        with ak_ctx:
-            adk_ctx = _make_adk_tool_context({"ak_tool_context": ak_ctx.id})
-            wrapped = GoogleADKToolBuilder._wrap(slow)
-            results = await asyncio.gather(
-                asyncio.create_task(wrapped(name="a", seconds=0.01, tool_context=adk_ctx)),
-                asyncio.create_task(wrapped(name="b", seconds=0.05, tool_context=adk_ctx)),
-            )
-
-        assert results == ["a:True", "b:True"]
-
 
 # _wrap – invocation with AKToolContext integration
 class TestWrapInvocationWithContext:

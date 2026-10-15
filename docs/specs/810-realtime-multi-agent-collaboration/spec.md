@@ -3,7 +3,7 @@
 Implements the requirements in [`design.md`](design.md). The realtime pool keeps each call's turn state, says
 application posts at quiet moments through `RealtimeOutbox` / `RealtimeCall`, and feeds `RealtimeHook`s. The Gemini
 adapter runs ADK's tool callbacks, seeds transfers with authored history, applies the call's `RunConfig`, and recovers
-lost sockets by replaying the conversation. `ToolContext.activated()` fixes parallel ADK tool calls. The
+lost sockets by replaying the conversation. The
 LiveKit gateway signs participant tokens. The idea: voice is the meeting room, not the engine.
 
 ## Verification performed for this spec
@@ -48,8 +48,7 @@ ak-py/src/agentkernel/
 │   ├── hooks.py               # RealtimeEvent, RealtimeHook
 │   ├── base.py                # Agent.realtime_hooks
 │   ├── module.py              # Module.realtime_hook
-│   ├── realtime/runner.py     # reports_speech_stopped; the new adapter events
-│   └── tool.py                # ToolContext.activated
+│   └── realtime/runner.py     # reports_speech_stopped; the new adapter events
 ├── framework/
 │   ├── adk/adk.py             # GoogleADKRealtimeRunner; the ADK tool wrapper
 │   └── openai/openai.py       # speech_stopped
@@ -80,10 +79,6 @@ class Module:
 
 class RealtimeRunner:
     reports_speech_stopped: bool = False   # True only where the model signals the end of the caller's speech
-
-class ToolContext:
-    @contextmanager
-    def activated(self) -> Iterator[Self]: ...   # the reset token stays with the caller, not on the instance
 ```
 
 Rules:
@@ -163,11 +158,6 @@ Rules:
 2. **Stall wait.** `_owed_since` is set to now after a tool response, after text is sent, after a seed that completes a turn, and on each model audio or output transcription while a response is open; it is cleared on `turn_complete`, `interrupted` and a tool call. No other message touches it.
 3. **Held input.** While `_connection` is `None` and the runner is not closing, `append_audio` keeps the latest `HOLD_AUDIO_SECONDS` and `send_text` queues the text; both go to the next socket after a reconnect or a transfer.
 4. **Shutdown.** `disconnect()` cancels and awaits the watchdog and any recovery before closing the socket.
-
-### ADK tool wrapper (`GoogleADKToolBuilder._wrap`)
-
-The sync and async wrappers enter `AKToolContext.fetch(id).activated()` when the ADK context carries
-`ak_tool_context`, and `contextlib.nullcontext()` otherwise.
 
 ### OpenAI realtime runner (`OpenAIRealtimeRunner`)
 
@@ -272,9 +262,8 @@ model, LiveKit server or key.
 4. A transfer's seed presents every agent's turn as user-side `[agent] ...` context, instead of model turns. Intentional, ADK's own presentation.
 5. The ADK adapter reports `speech_started`, `speech_heard` and `caller_transcript`; the OpenAI adapter reports `speech_stopped`. None reaches the edge; `speech_started` is a barge-in only while paced audio is queued, as before.
 6. The Live config takes turn detection and transcription from the call's `RunConfig`. Without a `run_config` option it is as before.
-7. The ADK tool wrapper activates the AK context per call; parallel tool calls stop failing. Intentional, the bug fix.
-8. The pool's loop wakes every 0.25 s instead of 0.5 s; the idle sweep still runs every 5 s and now also closes failed connections.
-9. LiveKit agent tokens are signed through `_sign`, with the same claims.
+7. The pool's loop wakes every 0.25 s instead of 0.5 s; the idle sweep still runs every 5 s and now also closes failed connections.
+8. LiveKit agent tokens are signed through `_sign`, with the same claims.
 
 **Non-changes:** the stream event union and `AgentChanged`'s fields; queue message formats; OpenAI handoffs and the
 LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the extras; other examples' behaviour.
@@ -313,8 +302,6 @@ LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the
 
 ### Changed: other files
 
-- `test_tool.py`: `activated()` restores the previous context, after an exception too, and holds in concurrent tasks
-- `test_tool_adk.py`: the ADK wrapper's parallel calls share the run's context
 - `test_module.py`: `realtime_hook` attaches to the wrapped agent and chains
 - `test_livekit_gateway.py`: participant tokens (room, grants, refusals, no key); the alias
 - `test_ecs_akagentrunner_realtime.py`: `send_text(..., from_edge=True)`
@@ -334,7 +321,7 @@ callback, a background post said at a quiet moment, a forced socket drop, and a 
 ### Commands
 
 ```bash
-cd ak-py && ./build.sh && uv run pytest tests/test_realtime_pool.py tests/test_tool.py tests/test_tool_adk.py tests/test_module.py tests/test_livekit_gateway.py tests/test_ecs_akagentrunner_realtime.py -v
+cd ak-py && ./build.sh && uv run pytest tests/test_realtime_pool.py tests/test_module.py tests/test_livekit_gateway.py tests/test_ecs_akagentrunner_realtime.py -v
 cd ak-py && uv run pytest
 make lint-check-all
 cd examples/api/livekit-voice/google/handoffs && ./build.sh local && uv run pytest -s

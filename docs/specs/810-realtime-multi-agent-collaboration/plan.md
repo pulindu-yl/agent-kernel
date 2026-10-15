@@ -8,22 +8,20 @@ before the code they describe.
 
 ## Iteration 1: Core contracts
 
-- **Goal:** realtime hooks, the new adapter events and a context that can be active in several tasks exist in `core/`; nothing uses them yet.
-- **Files:** `ak-py/src/agentkernel/core/hooks.py`, `core/base.py`, `core/module.py`, `core/__init__.py`, `core/realtime/runner.py`, `core/tool.py`
+- **Goal:** realtime hooks and the new adapter events exist in `core/`; nothing uses them yet.
+- **Files:** `ak-py/src/agentkernel/core/hooks.py`, `core/base.py`, `core/module.py`, `core/__init__.py`, `core/realtime/runner.py`
 - **Steps:**
   1. Add `RealtimeEvent`, `RealtimeHook`, `Agent.realtime_hooks` and `Module.realtime_hook`, per spec.md "Core contracts".
   2. Add `RealtimeRunner.reports_speech_stopped` and document every new adapter event in the callback contract, `reconnected` and the `reconnecting` status included (Rule 2).
-  3. Add `ToolContext.activated()`.
-- **Verify:** `cd ak-py && uv run pytest tests/test_module.py tests/test_tool.py`.
+- **Verify:** `cd ak-py && uv run pytest tests/test_module.py`.
 
-## Iteration 2: ADK tool callbacks and parallel tool calls
+## Iteration 2: ADK tool callbacks
 
-- **Goal:** realtime ADK tool calls run the agent's tool callbacks, and parallel calls share one AK context safely.
+- **Goal:** realtime ADK tool calls run the agent's tool callbacks.
 - **Files:** `ak-py/src/agentkernel/framework/adk/adk.py`
 - **Steps:**
   1. Add `_run_tool` and `_call`, and call `_run_tool` from `execute_tool`, per spec.md "Tool callbacks".
-  2. Make the ADK tool wrapper enter `activated()`, per spec.md "ADK tool wrapper".
-- **Verify:** `TestADKRealtimeToolCallbacks` in `test_realtime_pool.py`, and `test_tool_adk.py`.
+- **Verify:** `TestADKRealtimeToolCallbacks` in `test_realtime_pool.py`.
 
 ## Iteration 3: Caller events and turn state
 

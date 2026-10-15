@@ -22,8 +22,6 @@ Contract background: [`../809-realtime-multi-agent-handoffs/design.md`](../809-r
   - The ADK adapter reports no `speech_started`; it reads the caller's transcription only for barge-in (`adk.py:1250`)
 - After a Gemini transfer, the new agent cannot tell a teammate's words from its own
   - The adapter replays every agent's turn as the model's own (`role="model"`, no author); ADK presents other agents' turns as user-side context naming the author (`google.adk.flows.llm_flows.contents._present_other_agent_message`)
-- An ADK agent's parallel tool calls fail with "Token ... was created in a different Context"
-  - The tool wrapper sets the run's one shared `ToolContext` in each concurrent task, and `ToolContext.set()` keeps the reset token on that shared instance (`ak-py/src/agentkernel/core/tool.py:102-116`); in `develop` since #221
 - An application learns what was said in a call only from log lines (`AI response: ...`)
 - An application serving its users a LiveKit page has to read `AKConfig` to sign their tokens
 - A call cannot set how Gemini detects the caller's turns or which language it transcribes
@@ -66,10 +64,6 @@ flowchart TB
 
 - Each history entry records its author; a transfer's socket is seeded as ADK seeds one: the caller's words as they are, every agent's turn through ADK's `_present_other_agent_message`
 - The caller's words are logged per turn (`Caller said: ...`)
-
-### Parallel tool calls on ADK (`ToolContext`, `GoogleADKToolBuilder`)
-
-- New `ToolContext.activated()`, a context manager that keeps the reset token with the caller; the ADK wrapper uses it; `set()` / `reset()` unchanged
 
 ### Talking into a live call (`RealtimeCall`, `RealtimeOutbox`)
 
@@ -123,7 +117,7 @@ flowchart TB
 
 ### Tests
 
-- Offline, against scripted sockets: `ak-py/tests/test_realtime_pool.py`, `test_tool.py`, `test_tool_adk.py`, `test_module.py`, `test_livekit_gateway.py`, `test_ecs_akagentrunner_realtime.py`; the example's `server_test.py`
+- Offline, against scripted sockets: `ak-py/tests/test_realtime_pool.py`, `test_module.py`, `test_livekit_gateway.py`, `test_ecs_akagentrunner_realtime.py`; the example's `server_test.py`
 - Live runs on `gemini-3.1-flash-live-preview`, done by the maintainer: handoffs, a background post, a forced drop, a call past 10 minutes
 
 ### Documentation and skills
@@ -140,6 +134,7 @@ flowchart TB
 - Gemini's native session resumption: a follow-up. A handoff needs a new socket for the new agent anyway, and the replay already recovers a drop and the ~10 minute limit; resumption would also need context window compression (an audio session ends at 15 minutes without it) and is unproven on the preview Live model
 - A browser voice edge (a web page carrying a call with no media server); an application can build one on the public edge seam (`StatefulEdgeAdapter`, `StatefulEdgeRegistry`)
 - The application that drove these changes
+- Parallel tool calls on a non-realtime ADK run ("Token ... was created in a different Context"): a separate bug fix on its own branch, `bugfix/adk-parallel-tool-context`. A realtime tool call cannot hit it: each gets its own `ToolContext`, and a call's tool calls run one at a time under the session lock
 
 ## Open questions
 
