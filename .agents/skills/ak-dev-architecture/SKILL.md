@@ -478,13 +478,18 @@ already receive survives to a frontend instead of being discarded at the text-on
   `forwardedProps`/`context` are volatile and no session store persists them, and a cached session
   store would hand the edge back its own copy anyway. The runner applies the envelope, owns the
   before/after state comparison, and emits the snapshot as one extra chunk *before* the terminal one
-  (`stream()` returns at the first `done`). `__init__` raises `AKConfigError` when the response store
-  cannot stream chunks, when either store is process-local on a broker transport, or when
-  `session.type` is the literal `in_memory` there.
+  (`stream()` returns at the first `done`). `__init__` raises `AKConfigError` on four counts: when the
+  response store cannot stream chunks, when it is process-local on a broker transport, when
+  `session.type` is the literal `in_memory` there, and when `multimodal.enabled` is set with an
+  attachment store that is not shared there (the reference the edge enqueues would be unresolvable in
+  the runner).
 - **A pause is the third terminal shape** (#606): `RunFinishedEvent(outcome=RunFinishedInterruptOutcome(interrupts=[...]))`,
   with any `StateSnapshot` emitted **before** it so a client resuming from the snapshot has it in
   hand. It is an *outcome* of the run, not an event during it — so `to_agui` still returns `None`
-  for `RunPaused` and nothing is dropped. `PausedInterruption.kind` passes through as `Interrupt.reason`
+  for `RunPaused` and nothing is dropped. **Both handlers carry it**, and a queue-mode handler that
+  only mapped events would finish the run silently: `_events` holds the pause back from the live
+  stream, `_events_from_store` from the chunk the runner wrote, and both end on the shared
+  `_interrupt_outcome`. `PausedInterruption.kind` passes through as `Interrupt.reason`
   **untranslated**, because `reason` is a free-form `str`; what the protocol has no field for
   (`tool_name`, `arguments`, the question payload) rides in `Interrupt.metadata` rather than being
   forced into `response_schema`, which means a JSON Schema

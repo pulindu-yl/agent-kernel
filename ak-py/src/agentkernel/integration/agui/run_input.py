@@ -348,9 +348,4 @@ class AGUIRunRequest(BaseRunRequest):
     extra; RequestProducer takes a BaseRunRequest, so a subclass needs no producer change.
     """
 
-    # AG-UI maps the client's user message straight onto `requests`, so there is no prompt string
-    # to carry. Defaulted here rather than relaxed on BaseChatRequest, which every other surface
-    # still requires one from; the runner reads `requests`, never this.
-    prompt: str = ""
-
     agui: Optional[AGUIRunEnvelope] = None

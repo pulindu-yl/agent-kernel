@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from ...auth.authoriser import Authoriser
 from ...auth.handler import AuthValidator
 from ...core.config import AKConfig
+from ...core.event import RunPaused
 from ...core.model import StreamChunk
 from ...core.multimodal.storage import AttachmentStorageManager
 from ...core.util.factory import AKConfigError
@@ -160,6 +161,10 @@ class AGUIPipelineRequestHandler(AGUIRequestHandler):
         The runner's state snapshot arrives as a chunk rather than a StreamChunk event, because
         only the runner can compute it (a cached session store hands the edge back its own copy).
 
+        A pause is carried to the terminal event rather than mapped mid-stream, the same way
+        `_events` does it: in this protocol it is an *outcome* of the run, not something that
+        happened during it.
+
         :param encoder: The SDK's EventEncoder, matched to the request's Accept header.
         :param request_id: The enqueued run's id, which is also its chunk stream's key.
         :param run_input: The parsed RunAgentInput, for thread and run ids.
@@ -171,6 +176,7 @@ class AGUIPipelineRequestHandler(AGUIRequestHandler):
 
         chunks = self._store.stream(request_id)
         error: Optional[str] = None
+        paused: Optional[Any] = None
         try:
             while True:
                 # The store's stream is a blocking iterator; a worker thread keeps the event loop free.
@@ -185,6 +191,9 @@ class AGUIPipelineRequestHandler(AGUIRequestHandler):
                     error = payload.error
                     continue
                 if payload.event is None:
+                    continue
+                if isinstance(payload.event, RunPaused):
+                    paused = payload.event
                     continue
                 agui_event = AGUIMapper.to_agui(payload.event)
                 if agui_event is not None:
@@ -204,6 +213,16 @@ class AGUIPipelineRequestHandler(AGUIRequestHandler):
 
         if error is not None:
             yield encoder.encode(RunErrorEvent(message=error))
+            return
+
+        if paused is not None:
+            yield encoder.encode(
+                RunFinishedEvent(
+                    thread_id=run_input.thread_id,
+                    run_id=run_input.run_id,
+                    outcome=self._interrupt_outcome(paused),
+                )
+            )
             return
 
         yield encoder.encode(RunFinishedEvent(thread_id=run_input.thread_id, run_id=run_input.run_id))

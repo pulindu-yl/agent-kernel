@@ -368,12 +368,26 @@ def _validate_topology(self) -> None:
             f"session store 'in_memory' is single-process only, but the queue transport is "
             f"'{transport}'; use redis, valkey, dynamodb, cosmosdb or firestore"
         )
+    if AKConfig.get().multimodal.enabled and transport != "in_memory" and not AttachmentStorageManager.store_is_shared():
+        raise AKConfigError(
+            f"multimodal.storage_type '{AKConfig.get().multimodal.storage_type}' keeps attachments in "
+            f"the process that wrote them, but the queue transport is '{transport}', so the agent runs "
+            f"in another one: an AG-UI attachment offloaded at the edge would be unresolvable in the "
+            f"runner. Use redis or dynamodb, or run the single-process in_memory transport"
+        )
 ```
 
 Message shape copies `ScheduleManager._validate_store_topology` (`schedule/manager.py:392-395`): name
 what is wrong, name the transport, name the way out. The third check compares the literal
 `in_memory` and lets a dotted path through — the accepted blind spot `design.md` §6 records, matching
 `manager.py:387`.
+
+The fourth check guards the offload `_run` performs before the enqueue (§5): the bytes are stored at
+the edge and `MultimodalPreHook` resolves the reference in the runner, so a process-local attachment
+store hands the runner an id it cannot look up. It is the least obvious of the four, because nothing
+is wrong at startup — the failure is per request, and only for a request that carries an attachment.
+It reads `store_is_shared()` rather than the `storage_type` name, so a dotted-path store that
+declares itself shared passes.
 
 ### Consumer changes
 

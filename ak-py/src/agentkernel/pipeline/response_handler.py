@@ -252,7 +252,9 @@ class ResponseHandler:
             raise ValueError("request_id is required in queue message attributes")
         store = self._get_store()
         if not store.supports_chunk_streaming():
-            raise AKConfigError("local STREAM delivery requires a chunk-streaming response store (in_memory, or a BYO store with the capability)")
+            raise AKConfigError(
+                "local STREAM delivery requires a chunk-streaming response store (in_memory, redis, valkey, or a BYO store with the capability)"
+            )
         store.add_chunk(request_id, json.loads(message.body))
 
     def _broadcast(self, message: QueueMessage, message_type: WebSocketHandlerABC.MessageType) -> None:

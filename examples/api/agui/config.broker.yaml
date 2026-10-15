@@ -50,6 +50,13 @@ execution:
     # The return path. Needs chunk streaming, which valkey and redis have and dynamodb does not:
     # a reader has to block on a chunk the agent has not produced yet.
     type: valkey
+    # retry_count x delay is how long the edge waits for *each next chunk*, 60s here. It is not
+    # only the gap between tokens: the first gap is queue latency plus the model's time to first
+    # token, and the gap between ToolCallEnd and ToolCallResult is the tool's whole run. Past it
+    # the client gets RunError and the edge stops reading while the agent keeps going, so this
+    # product must exceed the longest silence a turn can produce.
+    retry_count: 12
+    delay: 5
     valkey:
       url: valkey://localhost:6379
       prefix: "ak:agui:responses:"

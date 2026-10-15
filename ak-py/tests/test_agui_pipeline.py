@@ -7,6 +7,7 @@ it; the client's forwardedProps and context cannot cross on the session; and the
 has to be taken after the inbound state is applied, not before.
 """
 
+import base64
 import json
 import threading
 from unittest.mock import patch
@@ -17,8 +18,8 @@ from fastapi import HTTPException
 from agentkernel.auth.authoriser import Authoriser
 from agentkernel.core.base import Session
 from agentkernel.core.config import AKConfig
-from agentkernel.core.event import MessageEnd, MessageStart, TextDelta
-from agentkernel.core.model import ExecutionMode, StreamChunk
+from agentkernel.core.event import MessageEnd, MessageStart, PausedInterruption, RunPaused, TextDelta
+from agentkernel.core.model import AgentRequestAttachmentRef, AgentRequestImage, ExecutionMode, StreamChunk
 from agentkernel.core.util.factory import AKConfigError
 from agentkernel.integration.agui.pipeline import AGUIPipelineRequestHandler
 from agentkernel.integration.agui.run_input import AGUIRunEnvelope, AGUIRunRequest
@@ -366,6 +367,56 @@ class TestTheEnvelopeBudget:
         AGUIRunEnvelope.build(self._Input({"tasks": []})).reject_if_oversized()
 
 
+class _RecordingProducer:
+    """Stands in for RequestProducer, keeping what was enqueued and which thread sent it."""
+
+    def __init__(self):
+        self.threads = []
+        self.requests = []
+
+    def enqueue(self, request, **kwargs):
+        self.threads.append(threading.current_thread())
+        self.requests.append(request)
+        return {}
+
+
+class _RunInputStub:
+    """The handful of RunAgentInput fields `_run` and `_events_from_store` read."""
+
+    thread_id = "t-1"
+    run_id = "r-1"
+    parent_run_id = None
+    state = None
+    forwarded_props = None
+    context = []
+
+
+def _edge_handler(monkeypatch, requests=None, store=None):
+    """A handler with the edge half stubbed back to what the caller under test supplies.
+
+    `_resolve_run_inputs` is the direct handler's verbatim and has its own tests, so these cases
+    skip it and hand `_run` the agent and requests it would have produced.
+    """
+    handler = TestPreconditions._construct(store or InMemoryResponseStore(), "in_memory")
+    agent = type("_Agent", (), {"name": "planner"})()
+
+    async def _resolved(agent_name, request):
+        return "u1", agent, _RunInputStub(), list(requests or [])
+
+    monkeypatch.setattr(handler, "_resolve_run_inputs", _resolved)
+    monkeypatch.setattr(handler, "_warn_if_unreadable", lambda *a, **k: None)
+    handler._producer = _RecordingProducer()
+    return handler
+
+
+async def _drain_events(response):
+    """Parse the SSE payloads a StreamingResponse yields into AG-UI event dicts."""
+    events = []
+    async for part in response.body_iterator:
+        events += [json.loads(line[len("data: ") :]) for line in part.splitlines() if line.startswith("data: ")]
+    return events
+
+
 class TestTheEdgeNeverBlocksTheEventLoop:
     """The edge holds the caller's SSE socket, so a blocking call there stalls every request.
 
@@ -375,49 +426,18 @@ class TestTheEdgeNeverBlocksTheEventLoop:
     request. `pipeline/request_handler.py` offloads the identical send and says why.
     """
 
-    class _RecordingProducer:
-        def __init__(self):
-            self.threads = []
-
-        def enqueue(self, *args, **kwargs):
-            self.threads.append(threading.current_thread())
-            return {}
-
-    class _RunInput:
-        thread_id = "t-1"
-        run_id = "r-1"
-        parent_run_id = None
-        state = None
-        forwarded_props = None
-        context = []
-
-    def _handler(self, monkeypatch):
-        handler = TestPreconditions._construct(InMemoryResponseStore(), "in_memory")
-        agent = type("_Agent", (), {"name": "planner"})()
-
-        async def _resolved(agent_name, request):
-            return "u1", agent, self._RunInput(), []
-
-        monkeypatch.setattr(handler, "_resolve_run_inputs", _resolved)
-        monkeypatch.setattr(handler, "_warn_if_unreadable", lambda *a, **k: None)
-        return handler
-
     @pytest.mark.asyncio
     async def test_the_enqueue_runs_off_the_event_loop(self, monkeypatch):
-        handler = self._handler(monkeypatch)
-        producer = self._RecordingProducer()
-        handler._producer = producer
+        handler = _edge_handler(monkeypatch)
 
         await handler._run("planner", _StubRequest())
 
-        assert producer.threads, "the producer was never called"
-        assert producer.threads[0] is not threading.current_thread(), "the broker send ran on the event loop"
+        assert handler._producer.threads, "the producer was never called"
+        assert handler._producer.threads[0] is not threading.current_thread(), "the broker send ran on the event loop"
 
     @pytest.mark.asyncio
     async def test_close_stream_runs_off_the_event_loop(self, monkeypatch):
         """Including on the disconnect path, which is the only reason close_stream exists."""
-        handler = self._handler(monkeypatch)
-        handler._producer = self._RecordingProducer()
         threads = []
 
         class _Store(InMemoryResponseStore):
@@ -427,13 +447,96 @@ class TestTheEdgeNeverBlocksTheEventLoop:
             def close_stream(self, request_id):
                 threads.append(threading.current_thread())
 
-        handler._store = _Store()
+        handler = _edge_handler(monkeypatch, store=_Store())
         response = await handler._run("planner", _StubRequest())
         async for _ in response.body_iterator:
             pass
 
         assert threads, "close_stream was never called"
         assert threads[0] is not threading.current_thread(), "close_stream ran on the event loop"
+
+
+class TestTheAttachmentsAreOffloadedBeforeTheEnqueue:
+    """Bytes must not ride the queue: a broker caps a message far below `api.max_file_size`.
+
+    The edge stores them and enqueues a reference; `MultimodalPreHook` resolves it in the runner.
+    This is why `_validate_topology` refuses a process-local attachment store on a broker — the
+    reference would reach a process that cannot look it up.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_enqueued_body_carries_a_reference_and_no_bytes(self, monkeypatch):
+        _use_attachment_store(monkeypatch, "in_memory")
+        image = AgentRequestImage(
+            prompt="what is this?", name="shot.png", image_data=base64.b64encode(b"not-really-a-png").decode(), mime_type="image/png"
+        )
+
+        handler = _edge_handler(monkeypatch, requests=[image])
+        await handler._run("planner", _StubRequest())
+
+        enqueued = handler._producer.requests[0].requests
+        assert [type(request) for request in enqueued] == [AgentRequestAttachmentRef]
+        assert enqueued[0].attachment_id
+        assert "not-really-a-png" not in json.dumps(handler._producer.requests[0].model_dump(mode="json"))
+
+
+class TestAPauseIsTheRunsTerminalOutcome:
+    """#606's third terminal shape, carried over the queue (spec #710 §7).
+
+    `AGUIMapper.to_agui` returns None for `RunPaused` on purpose: in this protocol a pause is the
+    run's *outcome*, not an event during it. So an edge that only maps events drops it and ends the
+    run as though the agent had answered — the approval-gated tool in `examples/api/agui` would
+    finish silently with nothing for the client to resume. `_events_from_store` therefore mirrors
+    the direct handler's `_events`.
+    """
+
+    PAUSED = RunPaused(
+        run_id="p-1",
+        agent="planner",
+        interruptions=[PausedInterruption(id="i1", kind="tool_call", tool_name="refund", arguments='{"amount": 100}')],
+    )
+
+    @staticmethod
+    def _store_yielding(*chunks):
+        class _Store(InMemoryResponseStore):
+            def stream(self, request_id, chunk_timeout=None):
+                yield from chunks
+
+        return _Store()
+
+    @staticmethod
+    def _chunk(event):
+        return json.loads(StreamChunk(event=event).model_dump_json())
+
+    @pytest.mark.asyncio
+    async def test_the_terminal_event_carries_the_interrupt_outcome(self, monkeypatch):
+        store = self._store_yielding(self._chunk(self.PAUSED), {"done": True})
+        handler = _edge_handler(monkeypatch, store=store)
+
+        finished = (await _drain_events(await handler._run("planner", _StubRequest())))[-1]
+
+        assert finished["type"] == "RUN_FINISHED"
+        assert finished["outcome"]["type"] == "interrupt"
+        assert [interrupt["id"] for interrupt in finished["outcome"]["interrupts"]] == ["i1"]
+
+    @pytest.mark.asyncio
+    async def test_the_pause_is_not_also_emitted_mid_stream(self, monkeypatch):
+        store = self._store_yielding(self._chunk(TextDelta(message_id="m1", content="hi")), self._chunk(self.PAUSED), {"done": True})
+        handler = _edge_handler(monkeypatch, store=store)
+
+        types = [event["type"] for event in await _drain_events(await handler._run("planner", _StubRequest()))]
+
+        assert types == ["RUN_STARTED", "TEXT_MESSAGE_CONTENT", "RUN_FINISHED"]
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_did_not_pause_still_finishes_without_an_outcome(self, monkeypatch):
+        store = self._store_yielding(self._chunk(TextDelta(message_id="m1", content="hi")), {"done": True})
+        handler = _edge_handler(monkeypatch, store=store)
+
+        finished = (await _drain_events(await handler._run("planner", _StubRequest())))[-1]
+
+        assert finished["type"] == "RUN_FINISHED"
+        assert finished.get("outcome") is None
 
 
 class TestPreconditions:

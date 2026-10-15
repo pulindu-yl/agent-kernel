@@ -86,7 +86,7 @@ Two decisions taken up front, so no iteration stalls on them:
 - **Files:** `integration/agui/pipeline.py` (new), `integration/agui/__init__.py`
 - **Steps:**
   1. Write `AGUIPipelineRequestHandler` with `requires_pipeline = True` (spec §7).
-  2. Implement `_validate_topology`'s three checks (spec §8).
+  2. Implement `_validate_topology`'s four checks (spec §8).
   3. Implement `_events_from_store`, reusing the direct handler's bracket and mapping an
      `agui_state` chunk to `StateSnapshotEvent`.
   4. Offload attachments before enqueue.

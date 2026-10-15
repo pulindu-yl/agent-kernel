@@ -270,6 +270,13 @@ the socket. `request_id` is a string, so it fits a queue attribute where a socke
     The check catches the accidental default — which is the case that actually happens, since
     `session.type` defaults to `in_memory` (`core/config.py:94`) — and leaves a deliberate choice
     to the deployer.
+- **Raise `AKConfigError` in `__init__`** when `multimodal.enabled` is set with a process-local
+  attachment store on a broker transport (`AttachmentStorageManager.store_is_shared()`). The edge
+  offloads attachment bytes before enqueueing (§5) and `MultimodalPreHook` resolves the reference in
+  the runner, so an unshared store hands the runner an id it cannot look up. It is the least obvious
+  of the four because nothing is wrong at startup: the failure is per request, and only for a request
+  that carries an attachment. Unlike the session check this reads the store's own `store_is_shared()`
+  rather than the configured name, so a dotted-path store that declares itself shared passes.
 - **Not a precondition, recorded here because it is the other way a run can fail on configuration:**
   the per-chunk wait keeps the response store's existing `retry_count x delay` budget
   (`core/config.py:455-456`) rather than introducing an AG-UI-specific timeout. It is the one knob a
@@ -286,8 +293,8 @@ the socket. `request_id` is a string, so it fits a queue attribute where a socke
 
 ### 8. Compatibility
 
-- **Additive.** `AGUIRequestHandler` and its direct SSE path are unchanged and stay the documented
-  default; an app that mounts nothing new behaves exactly as before.
+- **Additive.** `AGUIRequestHandler` and its direct SSE path are unchanged and stay supported for
+  deployments that want no queue; an app that mounts nothing new behaves exactly as before.
 - `QueueMessage`'s shape is unchanged beyond one new attribute constant.
 - The new store methods implement a capability the base class already declares, so a bring-your-own
   store is unaffected.
