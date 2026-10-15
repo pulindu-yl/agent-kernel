@@ -140,7 +140,7 @@ class RealtimeConnection:
         model generating before its first output is not visible here, so code deciding the call is
         quiet also checks that the model has answered whatever it was last given
         (``last_caller_speech_at``, ``last_edge_text_at``, ``last_tool_result_at``, compared with
-        ``last_model_output_at``). Safe to read from any thread.
+        ``last_model_generated_at``). Safe to read from any thread.
         """
         return self._audio_queue.qsize() > 0 or self._tools_in_flight > 0 or self._response_unfinished()
 
@@ -727,8 +727,12 @@ class RealtimeOutbox:
             self._last_post_at = None
 
     def _owes_reply(self, connection: RealtimeConnection, now: float) -> bool:
-        """Whether the model has still to answer something it was given, and is still being waited for."""
-        output = connection.last_model_output_at
+        """Whether the model has still to answer something it was given, and is still being waited for.
+
+        Answered by what the model generated after it, not by what was played after it: words generated before a
+        handoff or a tool result can still be playing out after it, and are no answer to it.
+        """
+        output = connection.last_model_generated_at
         given = (
             connection.last_caller_speech_at,
             connection.last_edge_text_at,
@@ -814,6 +818,26 @@ class RealtimeConnectionPool:
             self._loop.run_until_complete(self._loop.shutdown_asyncgens())
             self._loop.close()
 
+    def _evict_stale(self, now: float) -> list[tuple[str, "RealtimeConnection", str]]:
+        """Remove the idle connections, and those whose model socket failed; returns them, to be closed.
+
+        Removed under the lock they were inspected under: a consumer may replace a failed connection as soon as the
+        lock is released, and that replacement must not be the one closed.
+        """
+        evicted = []
+        with self._conn_lock:
+            for session_id, conn in list(self._connections.items()):
+                if conn.closed:
+                    reason = "its model socket failed"
+                elif (now - conn.last_activity_at) > _IDLE_TIMEOUT_SECONDS:
+                    reason = f"idle for > {_IDLE_TIMEOUT_SECONDS}s"
+                    conn.closed = True
+                else:
+                    continue
+                del self._connections[session_id]
+                evicted.append((session_id, conn, reason))
+        return evicted
+
     async def _wait_for_shutdown(self) -> None:
         last_sweep = time.time()
         while not ThreadRunner.shutdown_event.is_set():
@@ -822,21 +846,9 @@ class RealtimeConnectionPool:
                 last_sweep = now
                 # Idle connections, and connections whose model socket failed: a failed one is otherwise
                 # released only when its session sends more input, which a caller who left never does.
-                evicted = []
-                with self._conn_lock:
-                    for session_id, conn in self._connections.items():
-                        if conn.closed:
-                            evicted.append((session_id, "its model socket failed"))
-                        elif (now - conn.last_activity_at) > _IDLE_TIMEOUT_SECONDS:
-                            evicted.append((session_id, f"idle for > {_IDLE_TIMEOUT_SECONDS}s"))
-                            conn.closed = True
-
-                for session_id, reason in evicted:
-                    with self._conn_lock:
-                        conn = self._connections.pop(session_id, None)
-                    if conn:
-                        _log.info(f"Realtime session {session_id} {reason}; evicting.")
-                        self._loop.create_task(conn.close())
+                for session_id, conn, reason in self._evict_stale(now):
+                    _log.info(f"Realtime session {session_id} {reason}; evicting.")
+                    self._loop.create_task(conn.close())
             try:
                 self._deliver_posts(now)
             except Exception:

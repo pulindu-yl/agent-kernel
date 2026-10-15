@@ -988,6 +988,9 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
     STALL_CHECK_SECONDS: float = 1.0
     # While no socket is open, the latest this many seconds of the caller's audio are held for the next one.
     HOLD_AUDIO_SECONDS: float = 5.0
+    # A tool still running when its socket is lost is waited for this long before the new socket is seeded, so the
+    # seed has its call and result and the model does not make the call again.
+    LOST_TOOL_WAIT_SECONDS: float = 2.0
     # Added to the conversation a reconnected socket is seeded with, so the agent can tell the caller; "" adds nothing.
     # The first when the caller was speaking as the line dropped, or said something while it was down; the second
     # when they were silent throughout, so they are not asked to repeat what they never said.
@@ -1274,6 +1277,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
 
         self._listen_task = asyncio.create_task(self._listen())
         self._watchdog = asyncio.create_task(self._watch_for_stalls())
+        await self._release_held()
 
     async def _open_socket(self, sdk_agent: Any, extra: list[types.Content] | None = None) -> bool:
         """Open a Live socket configured for ``sdk_agent`` and make it the agent answering.
@@ -1360,17 +1364,16 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         heard = f"{started - last:.0f} s ago" if last is not None else "never"
         self._log.warning(f"Gemini Live socket lost ({reason}); last message from Gemini {heard}. Reconnecting '{self._speaker()}'")
         self._connection = None
+        # Before anything is awaited: a tool that finishes while the old socket closes then finds its call lost,
+        # and a handoff it asked for is not performed while this replaces the socket.
+        self._set_aside_outstanding_calls()
         await self._stop_listening()
         try:
             await self._close_socket()
         except Exception as e:
             self._log.debug(f"Closing the lost socket failed: {e!r}")
-        # A tool still running for the lost socket reports to no socket; its result is kept for the history.
-        for call_id, batch in self._batches.items():
-            self._lost_batches[call_id] = (batch, getattr(self._callers.get(call_id), "name", None) or self._speaker())
-        self._batches.clear()
-        self._callers.clear()
-        self._transfers.clear()
+        # Any call the listener took in while it was being stopped.
+        self._set_aside_outstanding_calls()
         self._owed_since = None
         caller_was_speaking = bool("".join(self._user_words).strip())
         await self._end_turn_and_report()
@@ -1391,6 +1394,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             await self._callback("error", {"message": f"Gemini Live socket keeps dropping ({reason}); not reconnecting"})
             return
 
+        await self._wait_for_lost_calls()
         for attempt, delay in enumerate(self.RECONNECT_DELAYS_SECONDS[: self.RECONNECT_ATTEMPTS], start=1):
             await asyncio.sleep(delay)
             if self._closing:
@@ -1401,7 +1405,10 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
                 seeded = await asyncio.wait_for(self._open_socket(self._active, extra=note), timeout=self.RECONNECT_TIMEOUT_SECONDS)
             except Exception as e:
                 self._log.warning(f"Reconnect attempt {attempt} of {self.RECONNECT_ATTEMPTS} failed: {e!r}")
-                await self._close_socket()
+                try:
+                    await self._close_socket()
+                except Exception as close_error:
+                    self._log.debug(f"Closing the failed reconnect socket failed: {close_error!r}")
                 continue
             if self._closing:
                 await self._close_socket()
@@ -1415,6 +1422,28 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             return
         self._log.error(f"Gemini Live could not reconnect after {self.RECONNECT_ATTEMPTS} attempts")
         await self._callback("error", {"message": f"Gemini Live socket lost ({reason}) and could not reconnect"})
+
+    def _set_aside_outstanding_calls(self) -> None:
+        """A tool still running for the lost socket reports to no socket; its result is kept for the history."""
+        for call_id, batch in self._batches.items():
+            self._lost_batches[call_id] = (batch, getattr(self._callers.get(call_id), "name", None) or self._speaker())
+        self._batches.clear()
+        self._callers.clear()
+        self._transfers.clear()
+
+    async def _wait_for_lost_calls(self) -> None:
+        """Wait, up to ``LOST_TOOL_WAIT_SECONDS``, for the tools still running for the lost socket to finish.
+
+        Their calls and results then go into the history the new socket is seeded with: without them the model does
+        not know the call was made, and may make it again (a record written twice). A tool that takes longer is not
+        waited for; its result is still kept in the history when it comes.
+        """
+        deadline = time.monotonic() + self.LOST_TOOL_WAIT_SECONDS
+        while self._lost_batches and time.monotonic() < deadline and not self._closing:
+            await asyncio.sleep(self.STALL_CHECK_SECONDS / 20)
+        if self._lost_batches:
+            names = sorted({call.name for batch, _ in self._lost_batches.values() for call in batch.calls if call.id not in batch.results})
+            self._log.warning(f"Reconnecting while {names} still run for the lost socket; the new agent does not know of them")
 
     def _log_first_audio(self) -> None:
         """Log how long the caller waited for the agent to start speaking: after their last transcribed words, and
@@ -1465,13 +1494,17 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             self._held_audio.pop(0)
 
     async def _release_held(self) -> None:
-        """Send the new socket what the caller said, and any text sent, while there was none."""
-        audio, self._held_audio = self._held_audio, []
+        """Send the new socket what the caller said, and any text sent, while there was none.
+
+        The audio goes out oldest first, one chunk at a time: what the caller says meanwhile joins the end of what
+        is held (``append_audio``), so the socket hears it all in order. What a socket lost again meanwhile has not
+        sent stays held for the next one.
+        """
         texts, self._held_text = self._held_text, []
         mime = f"audio/pcm;rate={self.input_sample_rate}"
-        for chunk in audio:
-            if self._connection is not None:
-                await self._connection.send_realtime_input(audio=types.Blob(data=chunk, mime_type=mime))
+        while self._held_audio and self._connection is not None:
+            chunk = self._held_audio.pop(0)
+            await self._connection.send_realtime_input(audio=types.Blob(data=chunk, mime_type=mime))
         for text in texts:
             await self.send_text(text)
 
@@ -1620,7 +1653,8 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         return turns
 
     async def append_audio(self, base64_audio: str) -> None:
-        if self._connection:
+        # Audio still held for a new socket goes first (``_release_held``): this joins the end of it.
+        if self._connection and not self._held_audio:
             await self._connection.send_realtime_input(
                 audio=types.Blob(data=base64.b64decode(base64_audio), mime_type=f"audio/pcm;rate={self.input_sample_rate}")
             )

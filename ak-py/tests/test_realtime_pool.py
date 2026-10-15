@@ -316,6 +316,31 @@ class TestRealtimePoolSweep:
         ThreadRunner.shutdown_event.set()
         thread.join(timeout=5)
 
+    def test_the_sweep_closes_the_failed_connection_it_found_not_its_replacement(self):
+        """The sweep let go of its lock between finding a failed connection and removing it; a consumer that replaced
+        the connection meanwhile had its replacement removed and closed."""
+        pool = RealtimeConnectionPool()
+        failed = types.SimpleNamespace(closed=True, last_activity_at=time.time())
+        replacement = types.SimpleNamespace(closed=False, last_activity_at=time.time())
+        pool._connections["s1"] = failed
+
+        class ConsumerReplacesItWhenTheLockIsFree:
+            replaced = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                if not self.replaced:
+                    self.replaced = True
+                    pool._connections["s1"] = replacement
+
+        pool._conn_lock = ConsumerReplacesItWhenTheLockIsFree()
+        evicted = pool._evict_stale(time.time())
+
+        assert [(session_id, conn) for session_id, conn, _ in evicted] == [("s1", failed)]
+        assert pool._connections["s1"] is replacement
+
     def test_a_blocked_loop_is_reported(self, monkeypatch, caplog):
         monkeypatch.setattr(realtime_pool, "_LOOP_LAG_WARNING_SECONDS", 0.1)
         pool, thread = self._start(monkeypatch)
@@ -2606,6 +2631,124 @@ class TestADKRealtimeRecovery:
         assert len(client.sessions) == 2
         await runner.disconnect()
 
+    @pytest.mark.asyncio
+    async def test_a_handoff_that_finishes_while_the_lost_socket_closes_is_not_performed(self, monkeypatch):
+        """A tool that finished while recovery stopped the lost socket's listener still found its call outstanding, so
+        the handoff it asked for ran alongside the recovery, both opening sockets."""
+        client = _FakeLiveClient([[_live_tool_call("t1", "transfer_to_agent", agent_name="billing")]], [], [])
+        runner, events = await self._connect(monkeypatch, client)
+        await self._until(lambda: "t1" in runner._batches)
+        runner._transfers["t1"] = runner._active.find_agent("billing")  # as running the tool registers it
+
+        stop_listening = runner._stop_listening
+
+        async def tool_finishes_meanwhile():
+            await runner.send_tool_result("t1", "Transferring to billing.")
+            await stop_listening()
+
+        runner._stop_listening = tool_finishes_meanwhile
+        runner._recover_soon("test")
+        await self._until(lambda: any(kind == "reconnected" for kind, _ in events))
+
+        assert not any(kind == "agent_changed" for kind, _ in events)
+        assert len(client.sessions) == 2
+        assert client.configs[1][1].system_instruction.parts[0].text.startswith("Route the caller.")  # the same agent
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_tool_still_running_when_the_socket_is_lost_is_in_the_new_sockets_seed(self, monkeypatch):
+        """The new socket was seeded before the tool finished, so the model did not know the call was made and could
+        make it again: a record written twice."""
+        client = _FakeLiveClient([[_live_tool_call("c1", "record_story", title="Book online")]], [])
+        runner, events = await self._connect(monkeypatch, client)
+        await self._until(lambda: "c1" in runner._batches)
+
+        runner._recover_soon("test")
+        await asyncio.sleep(0.3)  # the tool is still running
+        await runner.send_tool_result("c1", "Recorded story S1.")
+        await self._until(lambda: len(client.sessions) == 2)
+
+        assert _seen(client.sessions[1].client_content[0][0])[-3:-1] == [
+            "[supervisor] called tool `record_story` with parameters: {'title': 'Book online'}",
+            "[supervisor] `record_story` tool returned result: {'result': 'Recorded story S1.'}",
+        ]
+        assert client.sessions[1].tool_responses == []  # kept in the seed, not answered again
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_tool_that_never_finishes_holds_up_the_reconnect_only_a_moment(self, monkeypatch, caplog):
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "LOST_TOOL_WAIT_SECONDS", 0.2)
+        client = _FakeLiveClient([[_live_tool_call("c1", "slow_report")]], [])
+        runner, events = await self._connect(monkeypatch, client)
+        await self._until(lambda: "c1" in runner._batches)
+
+        with caplog.at_level("WARNING", logger="ak.adk.realtime"):
+            runner._recover_soon("test")
+            await self._until(lambda: any(kind == "reconnected" for kind, _ in events))
+
+        assert "['slow_report'] still run for the lost socket" in caplog.text
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_reconnect_whose_socket_also_fails_to_close_is_retried(self, monkeypatch):
+        """The failed attempt's close raising ended the recovery: no next attempt and no error, so the call was left
+        with no socket and nothing to replace it."""
+        client = _FakeLiveClient([], [])
+        runner, events = await self._connect(monkeypatch, client)
+        open_socket, close_socket, opens, closes = runner._open_socket, runner._close_socket, [], []
+
+        async def first_attempt_fails(*args, **kwargs):
+            opens.append(True)
+            if len(opens) == 1:
+                raise ConnectionError("seeding failed")
+            return await open_socket(*args, **kwargs)
+
+        async def its_close_fails_too():
+            closes.append(True)
+            if len(closes) == 2:  # the first closes the lost socket, the second the failed attempt's
+                raise RuntimeError("close failed")
+            await close_socket()
+
+        runner._open_socket, runner._close_socket = first_attempt_fails, its_close_fails_too
+        runner._recover_soon("test")
+        await self._until(lambda: any(kind == "reconnected" for kind, _ in events))
+
+        assert len(opens) == 2 and not any(kind == "error" for kind, _ in events)
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_audio_held_for_a_new_socket_reaches_it_before_newer_audio(self, monkeypatch):
+        """The caller's newer audio went straight to the new socket while the held audio was still being sent: it
+        heard old, new, old."""
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "RECONNECT_DELAYS_SECONDS", (0.3,))
+        paused, resume = asyncio.Event(), asyncio.Event()
+        send = _FakeLiveSession.send_realtime_input
+
+        async def first_audio_is_slow(session, **kwargs):
+            if "audio" in kwargs and not paused.is_set():
+                paused.set()
+                await resume.wait()
+            await send(session, **kwargs)
+
+        monkeypatch.setattr(_FakeLiveSession, "send_realtime_input", first_audio_is_slow)
+        client = _FakeLiveClient([ConnectionError("dropped")], [])
+        runner, _ = await self._connect(monkeypatch, client)
+        await self._until(lambda: runner._connection is None)
+
+        for byte in (b"\x01", b"\x02"):
+            await runner.append_audio(base64.b64encode(byte * 320).decode())  # held: no socket
+        await self._until(paused.is_set)  # the new socket is being sent the first held chunk
+        await runner.append_audio(base64.b64encode(b"\x03" * 320).decode())  # the caller goes on talking
+        resume.set()
+        await self._until(lambda: len(client.sessions[1].realtime_audio) == 3)
+
+        assert client.sessions[1].realtime_audio == [b"\x01" * 320, b"\x02" * 320, b"\x03" * 320]
+        await runner.disconnect()
+
 
 class TestADKFirstAudioLog:
     """How long the caller waited for an agent to start speaking is logged, measured from the runner's own events."""
@@ -3256,6 +3399,7 @@ def _call_state(**state):
         is_responding=False,
         is_caller_speaking=False,
         last_model_output_at=None,
+        last_model_generated_at=None,
         last_caller_speech_at=None,
         last_edge_text_at=None,
         last_tool_result_at=None,
@@ -3294,9 +3438,19 @@ class TestRealtimeOutbox:
         conn, outbox = _call_state(**{given: 110.0}), self._outbox("J1 finished.")
 
         assert outbox.take(conn, now=120.0) is None  # unanswered for 10 s: still owed
-        conn.last_model_output_at = 121.0
+        conn.last_model_generated_at = conn.last_model_output_at = 121.0
         assert outbox.take(conn, now=122.0) is None  # answered, but only a second ago
         assert outbox.take(conn, now=122.6) == "J1 finished."
+
+    def test_words_still_playing_from_before_a_tool_result_are_no_answer_to_it(self):
+        """Audio generated before a handoff or a tool result was taken for the answer to it once it had played out,
+        and a post then cut off the answer the model still owed."""
+        conn = _call_state(last_model_generated_at=105.0, last_tool_result_at=106.0, last_model_output_at=107.0)
+        outbox = self._outbox("J1 finished.")
+
+        assert outbox.take(conn, now=110.0) is None  # quiet for 3 s, but the tool result is not answered yet
+        conn.last_model_generated_at = conn.last_model_output_at = 111.0
+        assert outbox.take(conn, now=112.6) == "J1 finished."
 
     def test_an_input_never_answered_stops_holding_the_call(self):
         """Noise or a silent turn must not keep every post waiting for ever."""
@@ -3309,7 +3463,7 @@ class TestRealtimeOutbox:
 
         assert outbox.take(conn, now=110.0) == "first"
         assert outbox.take(conn, now=112.0) is None  # the model owes a reply to the first
-        conn.last_model_output_at = 113.0
+        conn.last_model_generated_at = conn.last_model_output_at = 113.0
         assert outbox.take(conn, now=114.6) == "second"
 
     def test_a_newer_post_with_the_same_key_replaces_the_waiting_one(self):
@@ -3318,7 +3472,7 @@ class TestRealtimeOutbox:
 
         conn = _call_state()
         said = [outbox.take(conn, now=110.0)]
-        conn.last_model_output_at = 111.0
+        conn.last_model_generated_at = conn.last_model_output_at = 111.0
         said.append(outbox.take(conn, now=113.0))
         assert said == ["Build: 6 of 6 tests pass.", "Review started."]
 
