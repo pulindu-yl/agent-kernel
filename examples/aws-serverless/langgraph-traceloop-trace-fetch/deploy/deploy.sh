@@ -12,9 +12,9 @@ create_deployment_package() {
 	rm -rf dist
 	mkdir -p dist/data
 	uv export --no-dev --no-hashes >requirements.txt
-	uv pip install --compile-bytecode -r requirements.txt --target=dist/data
+	uv pip install -r requirements.txt --target=dist/data
 	if [[ ${LOCAL_BUILD-} == "local" ]]; then
-		uv pip install --compile-bytecode --force-reinstall --no-deps --no-index --target=dist/data --find-links ../../../ak-py/dist agentkernel
+		uv pip install --force-reinstall --no-deps --no-index --target=dist/data --find-links ../../../ak-py/dist agentkernel
 	fi
 	cp -r lambda.py fetch_api.py config.yaml dist/data
 	rm -f requirements.txt
