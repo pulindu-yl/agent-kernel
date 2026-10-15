@@ -1,0 +1,8 @@
+execution:
+  mode: "realtime"
+
+# The page and its call are served at the root (GET /, /voice), on this machine only: the call asks nobody
+# who is calling. Put authentication in front of it before opening it to a network.
+api:
+  host: "127.0.0.1"
+  custom_router_prefix: ""

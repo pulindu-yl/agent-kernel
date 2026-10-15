@@ -147,10 +147,12 @@ class RealtimeEvent(BaseModel):
     - ``agent_said``: an agent's words in one turn, as they reached the edge. ``interrupted`` when the caller
       talked over the agent; ``text`` is then only what was played before they did.
     - ``agent_changed``: the call moved to ``agent``. Also sent for the agent the call starts with.
+    - ``reconnected``: the model connection dropped or stalled and was replaced, with ``agent`` still on the call.
+      What the caller said while it was down may be lost (an adapter that recovers this way tells the agent).
     - ``disconnected``: the session's model connection closed: idle, failed, or shut down.
     """
 
-    type: Literal["connected", "caller_said", "edge_text", "agent_said", "agent_changed", "disconnected"]
+    type: Literal["connected", "caller_said", "edge_text", "agent_said", "agent_changed", "reconnected", "disconnected"]
     session_id: str
     agent: Optional[str] = None
     text: str = ""

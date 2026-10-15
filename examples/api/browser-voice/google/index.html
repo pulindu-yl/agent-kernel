@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browser voice</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { max-width: 640px; margin: 40px auto; padding: 0 16px; }
+      button { font-size: 1rem; padding: 10px 18px; border-radius: 8px; cursor: pointer; }
+      #status { margin-left: 12px; opacity: 0.7; }
+      #lines p { margin: 6px 0; }
+      .agent { font-weight: 600; }
+      .error { color: #dc2626; }
+    </style>
+  </head>
+  <body>
+    <h1>Talk to the agent</h1>
+    <p>Agent Kernel's browser voice edge: your microphone and the agent's voice over one WebSocket, no media server.</p>
+    <button id="start">Start talking</button><span id="status"></span>
+    <div id="lines"></div>
+    <script>
+      // The wire protocol (agentkernel.browser.BrowserVoiceEdge): binary frames are 16-bit mono PCM at 24 kHz both
+      // ways; text frames are JSON: "hello" and "text" up; "agent", "said", "interrupt" and "error" down.
+      const RATE = 24000;
+      const WORKLETS = `
+        class Capture extends AudioWorkletProcessor {
+          process(inputs) {
+            const input = inputs[0] && inputs[0][0];
+            if (input) this.port.postMessage(input.slice(0));
+            return true;
+          }
+        }
+        class Player extends AudioWorkletProcessor {
+          constructor() {
+            super(); this.queue = []; this.current = null; this.offset = 0;
+            this.port.onmessage = (e) => { if (e.data === "clear") { this.queue = []; this.current = null; } else this.queue.push(e.data); };
+          }
+          process(inputs, outputs) {
+            const out = outputs[0][0]; let i = 0;
+            while (i < out.length) {
+              if (!this.current) { this.current = this.queue.shift(); this.offset = 0; if (!this.current) break; }
+              const n = Math.min(out.length - i, this.current.length - this.offset);
+              out.set(this.current.subarray(this.offset, this.offset + n), i);
+              i += n; this.offset += n;
+              if (this.offset >= this.current.length) this.current = null;
+            }
+            out.fill(0, i);
+            return true;
+          }
+        }
+        registerProcessor("capture", Capture);
+        registerProcessor("player", Player);`;
+
+      // Linear resampling between the audio context's rate and 24 kHz, carried across blocks.
+      function resampler(ratio) {
+        let position = 0, last = 0;
+        return (input) => {
+          if (ratio === 1) return input;
+          const out = [];
+          for (; position < input.length; position += ratio) {
+            const index = Math.floor(position), fraction = position - index;
+            const before = index === 0 ? last : input[index - 1];
+            out.push(before + (input[index] - before) * fraction);
+          }
+          position -= input.length;
+          last = input[input.length - 1];
+          return Float32Array.from(out);
+        };
+      }
+
+      const lines = document.getElementById("lines");
+      const status = document.getElementById("status");
+      function show(who, text, error) {
+        const p = document.createElement("p");
+        if (who) p.innerHTML = `<span class="agent"></span>: `;
+        if (who) p.firstChild.textContent = who;
+        p.append(text);
+        if (error) p.className = "error";
+        lines.append(p);
+      }
+
+      document.getElementById("start").onclick = async (event) => {
+        event.target.disabled = true;
+        // Created from the click: browsers play audio only after the user acts.
+        const context = new AudioContext({ latencyHint: "interactive" });
+        const url = URL.createObjectURL(new Blob([WORKLETS], { type: "application/javascript" }));
+        await context.audioWorklet.addModule(url);
+        const player = new AudioWorkletNode(context, "player", { outputChannelCount: [1] });
+        player.connect(context.destination);
+        const up = resampler(context.sampleRate / RATE), down = resampler(RATE / context.sampleRate);
+
+        // Each tab is a session of its own.
+        const scheme = location.protocol === "https:" ? "wss" : "ws";
+        const socket = new WebSocket(`${scheme}://${location.host}/voice?session=${crypto.randomUUID()}`);
+        socket.binaryType = "arraybuffer";
+        socket.onclose = (e) => { status.textContent = `Call ended (${e.code})`; context.close(); };
+        socket.onmessage = ({ data }) => {
+          if (typeof data !== "string") {
+            const pcm = new Int16Array(data), samples = new Float32Array(pcm.length);
+            for (let i = 0; i < pcm.length; i++) samples[i] = pcm[i] / 0x8000;
+            player.port.postMessage(down(samples));
+            return;
+          }
+          const message = JSON.parse(data);
+          if (message.type === "said") show(message.agent, message.text);
+          if (message.type === "interrupt") player.port.postMessage("clear");
+          if (message.type === "error") show("", message.message, true);
+        };
+        await new Promise((resolve) => (socket.onopen = resolve));
+        socket.send(JSON.stringify({ type: "hello", name: "there" }));
+
+        // The browser's echo cancellation keeps the agent's voice, played by this page, out of the microphone.
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+        const capture = new AudioWorkletNode(context, "capture", { numberOfOutputs: 0 });
+        capture.port.onmessage = ({ data }) => {
+          if (socket.readyState !== WebSocket.OPEN) return;
+          const samples = up(data), pcm = new Int16Array(samples.length);
+          for (let i = 0; i < samples.length; i++) pcm[i] = Math.max(-1, Math.min(1, samples[i])) * 0x7fff;
+          socket.send(pcm.buffer);
+        };
+        context.createMediaStreamSource(stream).connect(capture);
+        status.textContent = "Connected: say hello";
+      };
+    </script>
+  </body>
+</html>

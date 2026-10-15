@@ -270,6 +270,7 @@ GoogleADKModule([pm]).realtime_hook(pm, [Transcript()])
 | `edge_text` | Text the edge sent into the call: what the caller typed, or a prompt the edge sends for them (the gateway's greeting) |
 | `agent_said` | An agent's words in one turn, as they reached the edge; `interrupted` when the caller talked over it |
 | `agent_changed` | The call moved to `event.agent`, and once for the agent it starts with |
+| `reconnected` | The model socket dropped or stopped answering and was replaced, with `event.agent` still on the call (Gemini: reconnected with the conversation, the agent told the line dropped) |
 
 Hooks are attached to the agent a call starts with and see its handoffs' turns too, named in `event.agent`.
 They run one event at a time, in order, on the pool's loop but off the audio path; keep them short. A hook that

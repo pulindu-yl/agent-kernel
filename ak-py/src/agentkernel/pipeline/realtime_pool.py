@@ -43,6 +43,8 @@ _POST_POLL_SECONDS = 0.25
 # A response whose ``done`` never arrives stops counting as under way once the model has generated
 # nothing for this long, so a lost ``done`` cannot hold a call busy for good.
 _UNFINISHED_RESPONSE_SECONDS = 15.0
+# The pool's loop paces every call's audio; a stall this long is logged, since every call waited behind it.
+_LOOP_LAG_WARNING_SECONDS = 1.0
 
 
 class RealtimeConnection:
@@ -285,6 +287,8 @@ class RealtimeConnection:
         elif event_type == "caller_transcript":
             if (data.get("text") or "").strip():
                 self._observe("caller_said", text=data["text"].strip())
+        elif event_type == "reconnected":
+            self._observe("reconnected", agent=data.get("agent"))
         elif event_type == "error":
             await self._fail(data.get("message") or "realtime model socket error")
 
@@ -797,7 +801,11 @@ class RealtimeConnectionPool:
                 self._deliver_posts(now)
             except Exception:
                 _log.exception("Failed to deliver posts into realtime calls")
+            before = time.monotonic()
             await asyncio.sleep(_POST_POLL_SECONDS)
+            lag = time.monotonic() - before - _POST_POLL_SECONDS
+            if lag > _LOOP_LAG_WARNING_SECONDS:
+                _log.warning(f"The realtime loop was blocked for {lag:.1f} s: every call's audio, replies and tools waited behind it")
 
     # Talking into a live call, for application code (see RealtimeCall)
 
@@ -820,6 +828,24 @@ class RealtimeConnectionPool:
         with self._outbox_lock:
             outbox = self._outboxes.get(session_id)
             return outbox.withdraw(key) if outbox is not None else False
+
+    def close(self, session_id: str) -> bool:
+        """End the session's call now: close its model connection and drop the posts still waiting for it.
+
+        Thread-safe. The hooks are told ``disconnected``, as for an idle eviction. The session's next input
+        starts a new call. Returns whether the session had a connection.
+        """
+        with self._conn_lock:
+            conn = self._connections.pop(session_id, None)
+        with self._outbox_lock:
+            self._outboxes.pop(session_id, None)
+        if conn is None:
+            return False
+        conn.closed = True
+        if self._loop is not None and not self._loop.is_closed() and not self._stopping.is_set():
+            asyncio.run_coroutine_threadsafe(conn.close(), self._loop)
+        _log.info(f"Realtime session {session_id} closed by the application")
+        return True
 
     def is_connected(self, session_id: str) -> bool:
         """Whether the session has a live call whose model socket is connected."""
@@ -1100,3 +1126,10 @@ class RealtimeCall:
         whether one was dropped."""
         pool = RealtimeConnectionPool.get()
         return pool.withdraw(self.session_id, key) if pool is not None else False
+
+    def close(self) -> bool:
+        """End the call now, such as when the application ends a meeting: its model connection is closed and the
+        posts still waiting for it are dropped. The session's next input starts a new call. Returns whether the
+        call was open."""
+        pool = RealtimeConnectionPool.get()
+        return pool.close(self.session_id) if pool is not None else False

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -1787,6 +1788,27 @@ class TestADKConnectConfig:
         assert config.realtime_input_config is None
         assert config.thinking_config is None
 
+    def test_the_calls_run_config_sets_turn_detection_and_transcription_for_every_socket(self):
+        from google.adk.agents.run_config import RunConfig
+        from google.genai import types as types_genai
+
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        detection = types_genai.RealtimeInputConfig(
+            automatic_activity_detection=types_genai.AutomaticActivityDetection(
+                end_of_speech_sensitivity=types_genai.EndSensitivity.END_SENSITIVITY_HIGH, silence_duration_ms=700
+            )
+        )
+        english = types_genai.AudioTranscriptionConfig(language_codes=["en-US"])
+        runner = GoogleADKRealtimeRunner()
+        runner._run_config = RunConfig(realtime_input_config=detection, input_audio_transcription=english)
+
+        config = runner._connect_config(self._agent(instruction="x").agent, seeded=True)  # a transfer's socket too
+
+        assert config.realtime_input_config == detection
+        assert config.input_audio_transcription.language_codes == ["en-US"]
+        assert config.output_audio_transcription is not None  # always on: the runner depends on it
+
     def test_a_callable_instruction_is_rejected_clearly(self):
         from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
 
@@ -1798,17 +1820,20 @@ class _FakeLiveSession:
     """A Gemini Live session replaying scripted turns: each receive() yields one turn's messages, and
     waits once they are spent, as an open socket does. A callable in the script is a wait: the next
     turn comes once it returns True for the session, as a model answers only after its tool calls are.
-    A number is a pause in seconds, as a caller listens before answering."""
+    A number is a pause in seconds, as a caller listens before answering. An exception is the socket dropping."""
 
     def __init__(self, turns):
         self.turns = list(turns)
         self.client_content = []
         self.realtime_text = []
+        self.realtime_audio = []
         self.tool_responses = []
         self.closed = False
         self._answered = asyncio.Event()
 
     async def receive(self):
+        if self.turns and isinstance(self.turns[0], Exception):
+            raise self.turns.pop(0)
         while self.turns and (callable(self.turns[0]) or isinstance(self.turns[0], float)):
             step = self.turns.pop(0)
             if isinstance(step, float):
@@ -1828,6 +1853,8 @@ class _FakeLiveSession:
     async def send_realtime_input(self, **kwargs):
         if "text" in kwargs:
             self.realtime_text.append(kwargs["text"])
+        if "audio" in kwargs:
+            self.realtime_audio.append(kwargs["audio"].data)
 
     async def send_tool_response(self, function_responses):
         self.tool_responses.append(function_responses)
@@ -1837,11 +1864,14 @@ class _FakeLiveSession:
 class _FakeLiveClient:
     """Stands in for ``genai.Client``: each live connect opens a session with the next script."""
 
-    def __init__(self, *scripts, fail_on=None):
+    def __init__(self, *scripts, fail_on=None, fail_from=None):
         self.scripts = list(scripts)
         self.sessions = []
         self.configs = []
         self.fail_on = fail_on
+        # Every connect from this one on is refused, as while the network is down.
+        self.fail_from = fail_from
+        self.attempts = 0
         self.aio = types.SimpleNamespace(live=types.SimpleNamespace(connect=self._connect), aclose=self._aclose)
 
     def _connect(self, model, config):
@@ -1850,7 +1880,8 @@ class _FakeLiveClient:
 
         class _ConnectManager:
             async def __aenter__(self):
-                if client.fail_on == len(client.configs) + 1:
+                client.attempts += 1
+                if client.fail_on == len(client.configs) + 1 or (client.fail_from is not None and client.attempts >= client.fail_from):
                     raise ConnectionError("Live connect refused")
                 client.sessions.append(session)
                 client.configs.append((model, config))
@@ -2246,6 +2277,210 @@ class TestADKRealtimeTransfers:
         body = json.loads(_drain_output(transport)[-1].body)
         assert "transfer to 'billing' failed" in body["error"]
         await conn.close()
+
+
+class TestADKRealtimeRecovery:
+    """A socket that drops or stalls is replaced without leaving the agent that had the call; what the caller says
+    meanwhile is held for the new socket."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, monkeypatch):
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "RECONNECT_DELAYS_SECONDS", (0.05, 0.05, 0.05))
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "STALL_CHECK_SECONDS", 0.05)
+
+    @staticmethod
+    async def _connect(monkeypatch, client):
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr("google.genai.Client", lambda *a, **k: client)
+        events = []
+
+        async def callback(event_type, data):
+            events.append((event_type, data))
+
+        supervisor, _, _ = TestADKRealtimeTransfers._graph()
+        runner = GoogleADKRealtimeRunner()
+        await runner.connect(Session("s1"), types.SimpleNamespace(name="supervisor", agent=supervisor), callback)
+        return runner, events
+
+    @staticmethod
+    async def _until(condition, seconds=3.0):
+        for _ in range(int(seconds / 0.02)):
+            if condition():
+                return
+            await asyncio.sleep(0.02)
+        raise AssertionError("timed out")
+
+    @staticmethod
+    def _spoken_turn():
+        return [
+            _live_transcript("input_transcription", "My bill is too high."),
+            _live_message(output_transcription=types.SimpleNamespace(text="Let me look.")),
+            _live_message(turn_complete=True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_socket_reconnects_the_same_agent_with_the_conversation_and_a_note(self, monkeypatch):
+        client = _FakeLiveClient([self._spoken_turn(), ConnectionError("1006 abnormal closure")], [])
+        runner, events = await self._connect(monkeypatch, client)
+
+        await self._until(lambda: ("reconnected", {"agent": "supervisor", "seconds": 0}) in events)
+
+        assert [kind for kind, _ in events if kind == "error"] == []  # recovered: the pool is never told it failed
+        assert len(client.sessions) == 2 and client.sessions[0].closed
+        assert client.configs[1][1].system_instruction.parts[0].text.startswith("Route the caller.")  # the same agent
+        seeded = _seen(client.sessions[1].client_content[0][0])
+        assert seeded[0] == "My bill is too high." and "Let me look." in seeded[1]
+        # The caller had finished their turn and said nothing while the line was down: they are not asked to repeat.
+        assert "connection dropped" in seeded[-1] and "did not speak meanwhile" in seeded[-1] and "repeat what" not in seeded[-1]
+        assert ("done", {"status": "reconnecting"}) in events  # the edge's turn is closed
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_what_the_caller_says_while_reconnecting_reaches_the_new_socket_its_latest_seconds_only(self, monkeypatch):
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "RECONNECT_DELAYS_SECONDS", (0.3,))
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "HOLD_AUDIO_SECONDS", 0.1)  # 3200 bytes at 16 kHz
+        client = _FakeLiveClient([ConnectionError("dropped")], [])
+        runner, events = await self._connect(monkeypatch, client)
+        await self._until(lambda: runner._connection is None)
+
+        for byte in (b"\x01", b"\x02", b"\x03"):
+            await runner.append_audio(base64.b64encode(byte * 1600).decode())  # 50 ms each
+        await runner.send_text("[Team update] typed meanwhile")
+        await self._until(lambda: len(client.sessions) == 2 and client.sessions[1].realtime_audio)
+
+        assert client.sessions[1].realtime_audio == [b"\x02" * 1600, b"\x03" * 1600]  # the oldest was dropped
+        assert _seen([client.sessions[1].client_content[-1][0]]) == ["[Team update] typed meanwhile"]
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_the_caller_is_asked_to_repeat_only_when_they_spoke_while_the_line_was_down(self, monkeypatch):
+        """Live: a client asked to repeat said "No, I didn't say anything"."""
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "RECONNECT_DELAYS_SECONDS", (0.3,))
+        client = _FakeLiveClient([ConnectionError("dropped")], [])
+        runner, _ = await self._connect(monkeypatch, client)
+        await self._until(lambda: runner._connection is None)
+
+        speech = (b"\x00\x40" * 800) + (b"\x00\xc0" * 800)  # loud samples, not the silence an edge also sends
+        await runner.append_audio(base64.b64encode(speech).decode())
+        await self._until(lambda: len(client.sessions) == 2)
+
+        seeded = _seen(client.sessions[1].client_content[0][0])
+        assert "ask them to repeat what they last said" in seeded[-1]
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_socket_that_stops_answering_is_replaced(self, monkeypatch):
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "STALL_SECONDS", 0.2)
+        client = _FakeLiveClient([], [])  # the first socket never says anything again
+        runner, events = await self._connect(monkeypatch, client)
+
+        await runner.send_text("Are you there?")  # owed an answer
+        await self._until(lambda: any(kind == "reconnected" for kind, _ in events))
+
+        assert len(client.sessions) == 2
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_an_answering_socket_is_not_taken_for_stalled(self, monkeypatch):
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "STALL_SECONDS", 0.2)
+        client = _FakeLiveClient([0.05, self._spoken_turn()])
+        runner, events = await self._connect(monkeypatch, client)
+
+        await runner.send_text("Are you there?")
+        await asyncio.sleep(0.5)
+
+        assert len(client.sessions) == 1 and not any(kind == "reconnected" for kind, _ in events)
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_socket_lost_again_soon_after_each_reconnect_is_given_up_on(self, monkeypatch, caplog):
+        """Live: out of quota, Gemini accepted each reconnect and closed it seconds later; the runner reconnected for
+        five minutes, resending the conversation each time, and never gave up."""
+        drops = [[ConnectionError("1011 You exceeded your current quota")] for _ in range(10)]
+        client = _FakeLiveClient(*drops)
+        with caplog.at_level("ERROR", logger="ak.adk.realtime"):
+            runner, events = await self._connect(monkeypatch, client)
+            await self._until(lambda: any(kind == "error" for kind, _ in events))
+            await asyncio.sleep(0.2)
+
+        # The first socket, then one reconnect per quick drop until RECONNECT_ATTEMPTS of them: no more.
+        assert len(client.sessions) == 1 + runner.RECONNECT_ATTEMPTS
+        [(_, error)] = [event for event in events if event[0] == "error"]
+        assert "keeps dropping" in error["message"]
+        assert sum(kind == "reconnected" for kind, _ in events) == runner.RECONNECT_ATTEMPTS
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_drop_long_after_a_reconnect_is_a_fresh_one(self, monkeypatch):
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "QUICK_DROP_SECONDS", 0.0)  # every drop is "long after"
+        drops = [[ConnectionError("dropped")] for _ in range(6)] + [[]]
+        client = _FakeLiveClient(*drops)
+        runner, events = await self._connect(monkeypatch, client)
+
+        await self._until(lambda: len(client.sessions) == 7)
+
+        assert not any(kind == "error" for kind, _ in events)  # each drop recovered on its own
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_when_every_attempt_fails_the_connection_fails(self, monkeypatch):
+        client = _FakeLiveClient([ConnectionError("dropped")], fail_from=2)
+        runner, events = await self._connect(monkeypatch, client)
+
+        await self._until(lambda: any(kind == "error" for kind, _ in events))
+
+        assert client.attempts == 1 + runner.RECONNECT_ATTEMPTS
+        [(_, error)] = [event for event in events if event[0] == "error"]
+        assert "could not reconnect" in error["message"]
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_what_the_caller_says_during_a_transfer_reaches_the_new_agent(self, monkeypatch):
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        client = _FakeLiveClient([], [])
+        runner, events = await self._connect(monkeypatch, client)
+        _, billing, _ = TestADKRealtimeTransfers._graph()
+        call = types.SimpleNamespace(id="c1", name="transfer_to_agent", args={"agent_name": "billing"})
+        batch = GoogleADKRealtimeRunner._ToolBatch(calls=[call], results={"c1": ""})
+
+        runner._connection = None  # the switch is under way: the old socket no longer takes input
+        await runner.append_audio(base64.b64encode(b"\x07" * 320).decode())
+        await runner._transfer(batch, billing)
+
+        assert client.sessions[1].realtime_audio == [b"\x07" * 320]
+        await runner.disconnect()
+
+
+class TestADKFirstAudioLog:
+    """How long the caller waited for an agent to start speaking is logged, measured from the runner's own events."""
+
+    @pytest.mark.asyncio
+    async def test_the_wait_after_the_callers_words_and_a_tool_result_is_logged_once_per_turn(self, monkeypatch, caplog):
+        audio = _live_message(model_turn=types.SimpleNamespace(parts=[types.SimpleNamespace(inline_data=types.SimpleNamespace(data=b"\x00\x00"))]))
+        client = _FakeLiveClient([[_live_transcript("input_transcription", "Book me in.")], 0.1, [audio, audio], [_live_message(turn_complete=True)]])
+
+        with caplog.at_level("INFO", logger="ak.adk.realtime"):
+            runner, _ = await TestADKRealtimeRecovery._connect(monkeypatch, client)
+            await TestADKRealtimeRecovery._until(lambda: any("started speaking" in r.message for r in caplog.records))
+            await asyncio.sleep(0.1)
+        await runner.disconnect()
+
+        [line] = [r.message for r in caplog.records if "started speaking" in r.message]
+        assert line.startswith("'supervisor' started speaking ") and "s after the caller's last words" in line
 
 
 class TestADKRealtimeToolCallbacks:

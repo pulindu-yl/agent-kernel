@@ -7,7 +7,9 @@ import functools
 import inspect
 import json
 import logging
+import math
 import time
+from array import array
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar, List, Literal, Mapping
@@ -939,10 +941,25 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
     a short gap while it connects; each agent speaks with its own model and, when its
     ``generate_content_config`` sets one, its own voice.
 
+    The call's own Live settings come from the ADK ``RunConfig`` its starting agent declares as a run option
+    (``Module.run_options(agent, run_config=RunConfig(...))``), the same option a non-live run reads: its
+    ``realtime_input_config`` (how the caller's turns are detected) and ``input_audio_transcription`` /
+    ``output_audio_transcription`` (such as the languages to expect), for every socket of the call.
+
     A tool call runs between the calling agent's ``before_tool_callback``, ``on_tool_error_callback``
     and ``after_tool_callback``, as on an ADK run, ``transfer_to_agent`` included: a before-callback
     that answers in the tool's place stops a transfer. ADK plugins do not run, since a Live socket
     has no ADK ``Runner`` to hold them.
+
+    A socket that drops, or stops answering (nothing for ``STALL_SECONDS`` after it was given something to answer:
+    a dead socket can take the websocket keepalive about 40 seconds to notice), is replaced without leaving the
+    agent that had the call: the runner reconnects that agent, seeded with the conversation and told the line
+    dropped (``RECONNECTED_NOTE``), up to ``RECONNECT_ATTEMPTS`` times, waiting ``RECONNECT_DELAYS_SECONDS``
+    between attempts, and reports ``reconnected``; only when every attempt fails, or reconnected sockets keep being
+    lost again within ``QUICK_DROP_SECONDS``, is it reported as an ``error``.
+    The server closing a connection at its time limit is recovered the same way. While no socket is open (a
+    reconnect, a transfer), what the caller says is held, its latest ``HOLD_AUDIO_SECONDS``, and sent to the next
+    socket, as is any text sent meanwhile.
 
     The caller starting a turn is reported as ``speech_started``, on the first transcription of
     their speech while the model is silent, and each later transcription as ``speech_heard``, so
@@ -955,6 +972,35 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
     input_sample_rate = 16000
     # How long a transfer may take to open the new agent's Live socket before the connection is failed.
     TRANSFER_CONNECT_TIMEOUT_SECONDS: float = 15.0
+    # Recovering a socket that dropped or stalled: attempts, the wait before each, and how long each may take.
+    RECONNECT_ATTEMPTS: int = 3
+    RECONNECT_DELAYS_SECONDS: tuple[float, ...] = (1.0, 2.0, 4.0)
+    RECONNECT_TIMEOUT_SECONDS: float = 10.0
+    # A reconnected socket lost again this soon counts as a failed reconnect, not a fresh drop: after
+    # RECONNECT_ATTEMPTS of those in a row the runner gives up. A service that accepts a connection and then closes it
+    # (out of quota, failing) would otherwise be reconnected forever, the conversation resent each time.
+    QUICK_DROP_SECONDS: float = 20.0
+    # A socket that answers nothing this long after it was given something to answer is taken for dead,
+    # checked this often.
+    STALL_SECONDS: float = 15.0
+    STALL_CHECK_SECONDS: float = 1.0
+    # While no socket is open, the latest this many seconds of the caller's audio are held for the next one.
+    HOLD_AUDIO_SECONDS: float = 5.0
+    # Added to the conversation a reconnected socket is seeded with, so the agent can tell the caller; "" adds nothing.
+    # The first when the caller was speaking as the line dropped, or said something while it was down; the second
+    # when they were silent throughout, so they are not asked to repeat what they never said.
+    RECONNECTED_NOTE: str = (
+        "[The call's connection dropped for about {seconds} seconds and is back. What the caller said meanwhile may "
+        "not have been heard: tell them in one short sentence that you lost them for a moment, and ask them to "
+        "repeat what they last said.]"
+    )
+    RECONNECTED_QUIET_NOTE: str = (
+        "[The call's connection dropped for about {seconds} seconds and is back; the caller did not speak meanwhile. "
+        "Carry on where you were without asking them to repeat anything; if you were cut off mid-sentence, finish "
+        "your point in one sentence.]"
+    )
+    # Held audio louder than this (the RMS of 16-bit samples, about -36 dBFS) in any chunk is taken for speech.
+    SPEECH_LEVEL: int = 500
 
     @dataclass
     class _ToolBatch:
@@ -980,6 +1026,8 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         self._log = logging.getLogger("ak.adk.realtime")
         self._callback: Callable | None = None
         self._agent = None
+        # The ADK RunConfig the call's starting agent declares (its ``run_config`` run option), or None.
+        self._run_config: RunConfig | None = None
         # The ADK session tools run in, owned by this connection like the socket: ADK builds a
         # tool's ToolContext from a session and its service, and neither outlives the connection.
         self._tool_session_service: InMemorySessionService | None = None
@@ -1014,6 +1062,22 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         self._history: list[GoogleADKRealtimeRunner._Said] = []
         self._user_words: list[str] = []
         self._model_words: list[str] = []
+        # Recovery: what the caller said and what was sent while no socket was open, the task replacing a
+        # lost socket, the task watching for a stalled one, when the server last sent anything, and since
+        # when it owes an answer (to a tool result or text), all in time.monotonic().
+        self._held_audio: list[bytes] = []
+        self._held_text: list[str] = []
+        self._recovery: asyncio.Task | None = None
+        self._watchdog: asyncio.Task | None = None
+        self._last_message_at: float | None = None
+        self._owed_since: float | None = None
+        # When the socket was last reconnected, and how many reconnected sockets in a row were lost again soon after.
+        self._reconnected_at: float | None = None
+        self._quick_drops = 0
+        # For the first-audio log: when the caller's words were last transcribed, and when the model was last
+        # given something to answer (a tool result, text), until its next turn starts speaking.
+        self._caller_words_at: float | None = None
+        self._given_at: float | None = None
 
     @staticmethod
     def _live_model(sdk_agent: Any) -> str:
@@ -1079,11 +1143,12 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         return name.startswith("gemini-3.") and "-live" in name and "translate" not in name
 
     def _connect_config(self, sdk_agent: Any, seeded: bool = False) -> types.LiveConnectConfig:
-        """Build the Live session config from the ADK agent's instruction, tools and voice.
+        """Build the Live session config from the ADK agent's instruction, tools and voice, and the call's ``RunConfig``.
 
-        Only what the agent declares is sent; everything else (turn detection, thinking) is left to
-        the Live API's own defaults. An agent with transfer targets also gets ADK's transfer
-        instructions and ``transfer_to_agent`` tool.
+        Only what is declared is sent; everything else (turn detection, thinking) is left to the Live
+        API's own defaults. The call's ``RunConfig`` sets turn detection (``realtime_input_config``) and
+        the transcription of both sides; transcription is always on, since the runner depends on it. An
+        agent with transfer targets also gets ADK's transfer instructions and ``transfer_to_agent`` tool.
 
         :param sdk_agent: The ADK agent the session is for.
         :param seeded: The socket is seeded with prior conversation (after a transfer); the server
@@ -1106,6 +1171,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             if declaration is not None:
                 declarations.append(declaration)
 
+        run_config = self._run_config
         config = types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             system_instruction=types.Content(parts=[types.Part(text=instruction)]) if instruction else None,
@@ -1113,8 +1179,9 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             speech_config=getattr(getattr(sdk_agent, "generate_content_config", None), "speech_config", None),
             # Input transcription drives early barge-in (``interim_input_transcription``) and the
             # history a transfer replays; output transcription is the transcript the edge publishes.
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
+            input_audio_transcription=(run_config and run_config.input_audio_transcription) or types.AudioTranscriptionConfig(),
+            output_audio_transcription=(run_config and run_config.output_audio_transcription) or types.AudioTranscriptionConfig(),
+            realtime_input_config=run_config.realtime_input_config if run_config else None,
         )
         # Older google-genai releases predate HistoryConfig.
         if seeded and hasattr(types, "HistoryConfig"):
@@ -1187,6 +1254,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
 
         self._callback = callback
         self._agent = agent
+        self._run_config = (getattr(agent, "run_options", None) or {}).get("run_config")
         root = getattr(agent, "agent", None)
         self._validate_transfers(root)
         # Opened before the socket, so a failure here leaves no live connection to clean up.
@@ -1200,6 +1268,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             raise
 
         self._listen_task = asyncio.create_task(self._listen())
+        self._watchdog = asyncio.create_task(self._watch_for_stalls())
 
     async def _open_socket(self, sdk_agent: Any) -> None:
         """Open a Live socket configured for ``sdk_agent`` and make it the agent answering.
@@ -1223,6 +1292,8 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             await connection.send_client_content(turns=turns, turn_complete=turn_complete)
             if turn_complete and self._is_gemini_3_live(model):
                 await connection.send_realtime_input(text=".")
+            if turn_complete:
+                self._owed_since = self._given_at = time.monotonic()
         self._connection = connection
 
     async def _close_socket(self) -> None:
@@ -1259,9 +1330,140 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         except Exception as e:
             self._log.error(f"Gemini Live socket error: {e}")
             if not self._closing:
-                await self._callback("error", {"message": f"Gemini Live socket error: {e}"})
+                self._recover_soon(f"socket error: {e}")
+
+    def _recover_soon(self, reason: str) -> None:
+        """Start replacing the socket, unless that is already under way or the connection is closing."""
+        if self._closing or (self._recovery is not None and not self._recovery.done()):
+            return
+        self._recovery = asyncio.create_task(self._recover(reason))
+
+    async def _recover(self, reason: str) -> None:
+        """Reconnect the agent that had the call, seeded with the conversation and told the line dropped.
+
+        What was outstanding on the lost socket is dropped (a tool result it was owed, a transfer it asked
+        for), and the turn under way is ended, so what was said in it is kept and the edge's turn closes.
+        """
+        started = time.monotonic()
+        last = self._last_message_at
+        heard = f"{started - last:.0f} s ago" if last is not None else "never"
+        self._log.warning(f"Gemini Live socket lost ({reason}); last message from Gemini {heard}. Reconnecting '{self._speaker()}'")
+        self._connection = None
+        await self._stop_listening()
+        try:
+            await self._close_socket()
+        except Exception as e:
+            self._log.debug(f"Closing the lost socket failed: {e!r}")
+        self._batches.clear()
+        self._callers.clear()
+        self._transfers.clear()
+        self._owed_since = None
+        caller_was_speaking = bool("".join(self._user_words).strip())
+        await self._end_turn_and_report()
+        self._interrupted_this_turn = False
+        self._model_speaking = False
+        self._caller_turn_reported = False
+        await self._callback("done", {"status": "reconnecting"})
+
+        if self._reconnected_at is not None and started - self._reconnected_at < self.QUICK_DROP_SECONDS:
+            self._quick_drops += 1
+        else:
+            self._quick_drops = 0
+        if self._quick_drops >= self.RECONNECT_ATTEMPTS:
+            self._log.error(
+                f"Gemini Live socket lost again within {self.QUICK_DROP_SECONDS:.0f} s of reconnecting, "
+                f"{self._quick_drops} times in a row: not reconnecting ({reason})"
+            )
+            await self._callback("error", {"message": f"Gemini Live socket keeps dropping ({reason}); not reconnecting"})
+            return
+
+        for attempt, delay in enumerate(self.RECONNECT_DELAYS_SECONDS[: self.RECONNECT_ATTEMPTS], start=1):
+            await asyncio.sleep(delay)
+            if self._closing:
+                return
+            heard = caller_was_speaking or self._held_speech()
+            note = self._reconnected_note(time.monotonic() - (last if last is not None else started), heard)
+            if note is not None:
+                self._history.append(note)
+            try:
+                await asyncio.wait_for(self._open_socket(self._active), timeout=self.RECONNECT_TIMEOUT_SECONDS)
+            except Exception as e:
+                self._log.warning(f"Reconnect attempt {attempt} of {self.RECONNECT_ATTEMPTS} failed: {e!r}")
+                if note is not None:
+                    self._history.remove(note)
+                await self._close_socket()
+                continue
+            if self._closing:
+                await self._close_socket()
+                return
+            self._listen_task = asyncio.create_task(self._listen())
+            self._reconnected_at = time.monotonic()
+            seconds = round(time.monotonic() - started)
+            self._log.info(f"Reconnected '{self._speaker()}' to Gemini Live after {seconds} s")
+            await self._callback("reconnected", {"agent": self._speaker(), "seconds": seconds})
+            await self._release_held()
+            return
+        self._log.error(f"Gemini Live could not reconnect after {self.RECONNECT_ATTEMPTS} attempts")
+        await self._callback("error", {"message": f"Gemini Live socket lost ({reason}) and could not reconnect"})
+
+    def _log_first_audio(self) -> None:
+        """Log how long the caller waited for the agent to start speaking: after their last transcribed words, and
+        after the model was last given something to answer (a tool result or text). Measured, not guessed from
+        when a turn's words end."""
+        now = time.monotonic()
+        waits = []
+        if self._caller_words_at is not None:
+            waits.append(f"{now - self._caller_words_at:.1f} s after the caller's last words")
+        if self._given_at is not None:
+            waits.append(f"{now - self._given_at:.1f} s after its last tool result or text")
+        if waits:
+            self._log.info(f"'{self._speaker()}' started speaking {', '.join(waits)}")
+        self._caller_words_at = self._given_at = None
+
+    def _reconnected_note(self, seconds: float, caller_spoke: bool) -> "GoogleADKRealtimeRunner._Said | None":
+        note = self.RECONNECTED_NOTE if caller_spoke else self.RECONNECTED_QUIET_NOTE
+        if not note:
+            return None
+        text = note.format(seconds=max(1, round(seconds)))
+        return self._Said("user", types.Content(role="user", parts=[types.Part(text=text)]))
+
+    def _held_speech(self) -> bool:
+        """Whether the audio held while no socket was open has speech in it, not only the silence an edge sends."""
+        for chunk in self._held_audio:
+            samples = array("h", chunk[: len(chunk) - len(chunk) % 2])
+            if samples and math.sqrt(sum(sample * sample for sample in samples) / len(samples)) > self.SPEECH_LEVEL:
+                return True
+        return False
+
+    async def _watch_for_stalls(self) -> None:
+        """Replace a socket that has answered nothing for ``STALL_SECONDS`` since it was given something to answer."""
+        while not self._closing:
+            await asyncio.sleep(self.STALL_CHECK_SECONDS)
+            owed = self._owed_since
+            if owed is not None and self._connection is not None and time.monotonic() - owed > self.STALL_SECONDS:
+                self._recover_soon(f"no answer from Gemini in {self.STALL_SECONDS:.0f} s")
+
+    def _hold_audio(self, pcm: bytes) -> None:
+        """Keep what the caller says while no socket is open: its latest ``HOLD_AUDIO_SECONDS``."""
+        self._held_audio.append(pcm)
+        limit = int(self.HOLD_AUDIO_SECONDS * self.input_sample_rate * 2)
+        while sum(len(chunk) for chunk in self._held_audio) > limit and len(self._held_audio) > 1:
+            self._held_audio.pop(0)
+
+    async def _release_held(self) -> None:
+        """Send the new socket what the caller said, and any text sent, while there was none."""
+        audio, self._held_audio = self._held_audio, []
+        texts, self._held_text = self._held_text, []
+        mime = f"audio/pcm;rate={self.input_sample_rate}"
+        for chunk in audio:
+            if self._connection is not None:
+                await self._connection.send_realtime_input(audio=types.Blob(data=chunk, mime_type=mime))
+        for text in texts:
+            await self.send_text(text)
 
     async def _handle_message(self, message: types.LiveServerMessage) -> None:
+        self._last_message_at = time.monotonic()
+        self._owed_since = None
         server_content = getattr(message, "server_content", None)
         if server_content is not None:
             # Barge-in. The server signals it on ``interrupted``; its low-latency
@@ -1296,6 +1498,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             input_transcription = getattr(server_content, "input_transcription", None)
             if input_transcription is not None and input_transcription.text:
                 self._user_words.append(input_transcription.text)
+                self._caller_words_at = time.monotonic()
 
             output_transcription = getattr(server_content, "output_transcription", None)
             if output_transcription is not None and output_transcription.text:
@@ -1308,6 +1511,8 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
                 for part in model_turn.parts:
                     inline = getattr(part, "inline_data", None)
                     if inline is not None and inline.data:
+                        if not self._model_speaking:
+                            self._log_first_audio()
                         self._model_speaking = True
                         self._caller_turn_reported = False
                         audio_b64 = base64.b64encode(inline.data).decode("utf-8")
@@ -1390,12 +1595,17 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             await self._connection.send_realtime_input(
                 audio=types.Blob(data=base64.b64decode(base64_audio), mime_type=f"audio/pcm;rate={self.input_sample_rate}")
             )
+        elif not self._closing:
+            self._hold_audio(base64.b64decode(base64_audio))
 
     async def send_text(self, text: str) -> None:
         if self._connection:
             await self._end_turn_and_report()
             self._history.append(self._Said("user", types.Content(role="user", parts=[types.Part(text=text)])))
             await self._connection.send_client_content(turns=types.Content(role="user", parts=[types.Part(text=text)]), turn_complete=True)
+            self._owed_since = self._given_at = time.monotonic()
+        elif not self._closing:
+            self._held_text.append(text)
 
     async def send_tool_result(self, call_id: str, result: str) -> None:
         """Record one function call's result; answer its tool_call message once every call in it has one.
@@ -1426,6 +1636,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         await self._report_caller(self._record_tool_turn(batch, responses))
         if self._connection:
             await self._connection.send_tool_response(function_responses=responses)
+            self._owed_since = self._given_at = time.monotonic()
 
     def _record_tool_turn(self, batch: GoogleADKRealtimeRunner._ToolBatch, responses: list[types.FunctionResponse]) -> str:
         """Add a tool-call turn to the history, as ADK's session records it.
@@ -1451,8 +1662,8 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         """Move the conversation to ``target`` on a socket configured for it.
 
         The old socket's listener is stopped first, so nothing it still says is credited to the new
-        agent and its close is not reported as a failure; input arriving during the switch is
-        dropped. The turn is ended (``done``) and the change reported before the new socket opens,
+        agent and its close is not reported as a failure; what the caller says during the switch is
+        held and sent to the new agent. The turn is ended (``done``) and the change reported before the new socket opens,
         which is seeded with the conversation, the turn's calls and their results included, as ADK
         replays them. A socket that fails to open within the timeout is reported as an ``error``, so
         the pool replaces the connection.
@@ -1487,6 +1698,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             await self._close_socket()
             return
         self._listen_task = asyncio.create_task(self._listen())
+        await self._release_held()
 
     async def execute_tool(self, name: str, arguments: str, context: AKToolContext, call_id: str) -> str:
         """Invoke an ADK tool through ADK's own ``run_async`` with a real ToolContext.
@@ -1581,6 +1793,10 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
 
     async def disconnect(self) -> None:
         self._closing = True
+        watchdog, self._watchdog = self._watchdog, None
+        recovery, self._recovery = self._recovery, None
+        await self._cancel_and_wait(watchdog)
+        await self._cancel_and_wait(recovery)
         await self._stop_listening()
         await self._close_socket()
         if self._client is not None:
