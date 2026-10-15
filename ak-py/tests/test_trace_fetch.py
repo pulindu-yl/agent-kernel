@@ -91,6 +91,10 @@ class TestTraceQuery:
         with pytest.raises(ValueError, match="non-empty"):
             TraceQuery(**filters)
 
+    def test_rejects_unknown_filters(self):
+        with pytest.raises(ValueError, match="session"):
+            TraceQuery(session="s-1")
+
 
 # --- OTelSpanClassifier (attribute shapes taken from captured AK runs) ------------------------------------
 
@@ -194,6 +198,12 @@ class TestTraceFetch:
             Trace(tracer).fetch_spans(TraceQuery(limit=5), session_id="s-1")
         assert tracer.queries == []
 
+    def test_unknown_keyword_filter_raises(self):
+        tracer = _FetchingTrace()
+        with pytest.raises(ValueError, match="session"):
+            Trace(tracer).fetch_spans(session="s-1")
+        assert tracer.queries == []
+
     def test_base_trace_without_fetch_raises_not_implemented(self):
         class SendOnly(_FetchingTrace):
             fetch_spans = BaseTrace.fetch_spans
@@ -294,6 +304,18 @@ class TestTraceFetchTraces:
     def test_rejects_per_span_filters(self, filters):
         with pytest.raises(ValueError, match="kinds or name"):
             Trace(_FetchingTrace()).fetch_traces(**filters)
+
+    def test_query_with_keyword_filters_raises(self):
+        tracer = _FetchingTrace()
+        with pytest.raises(ValueError, match="not both"):
+            Trace(tracer).fetch_traces(TraceQuery(), session_id="s-1", limit=1)
+        assert tracer.queries == []
+
+    def test_unknown_keyword_filter_raises(self):
+        tracer = _FetchingTrace()
+        with pytest.raises(ValueError, match="session"):
+            Trace(tracer).fetch_traces(session="s-1")
+        assert tracer.queries == []
 
     def test_disabled_tracing_raises(self):
         with pytest.raises(AKConfigError):
@@ -708,6 +730,14 @@ class TestTraceloopFetcher:
         spans = TraceloopTraceFetcher(api_key="key", transport=transport).fetch_spans(TraceQuery(start=START, end=END))
 
         assert [span.status for span in spans] == [SpanStatus.ERROR, SpanStatus.UNSET]
+
+    def test_maps_a_zero_duration_to_an_end_time(self):
+        data = [{**_item("instant", 1), "duration_ms": 0}]
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"spans": {"data": data, "next_cursor": None}}))
+
+        (span,) = TraceloopTraceFetcher(api_key="key", transport=transport).fetch_spans(TraceQuery(start=START, end=END))
+
+        assert span.end_time == span.start_time == _ts(1)
 
     def test_trace_ids_filter_uses_values(self):
         # verified live: "in" rejects a "value" array ("cannot unmarshal array") and needs "values"

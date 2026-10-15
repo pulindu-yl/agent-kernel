@@ -84,7 +84,9 @@ class TraceloopTraceFetcher(TraceFetcher):
         if isinstance(attributes, str):
             attributes = json.loads(attributes)
         start_time = self._timestamp(item.get("timestamp"))
-        duration_ms = item.get("duration_ms") or item.get("duration")
+        duration_ms = item.get("duration_ms")
+        if duration_ms is None:
+            duration_ms = item.get("duration")
         span_input, span_output = OTelSpanClassifier.io(attributes)
         return FetchedSpan(
             provider=self.provider,

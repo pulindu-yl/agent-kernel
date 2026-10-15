@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, ClassVar, Iterable, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class SpanKind(str, Enum):
@@ -52,6 +52,9 @@ class SpanStatus(str, Enum):
 
 class TraceQuery(BaseModel):
     """Generic filter for ``Trace.fetch_spans()`` and ``Trace.fetch_traces()``; each tracer translates it to its provider's API."""
+
+    # a misspelled filter must fail, not silently widen the query
+    model_config = ConfigDict(extra="forbid")
 
     start: Optional[datetime] = Field(default=None, description="Inclusive lower bound on span start time; defaults to end - last")
     end: Optional[datetime] = Field(default=None, description="Exclusive upper bound on span start time; defaults to now")

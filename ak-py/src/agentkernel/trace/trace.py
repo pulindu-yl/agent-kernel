@@ -149,6 +149,8 @@ class Trace(BaseTrace):
         :return: The traces, each with its spans oldest first.
         :raises ValueError: When both ``query`` and keyword filters are given, or ``kinds`` / ``name`` is set.
         """
+        if query is not None and filters:
+            raise ValueError("pass either a TraceQuery or keyword filters, not both")
         query = query if query is not None else TraceQuery(**filters)
         if query.kinds is not None or query.name is not None:
             raise ValueError("fetch_traces does not take kinds or name; filter the returned trace's spans instead")
