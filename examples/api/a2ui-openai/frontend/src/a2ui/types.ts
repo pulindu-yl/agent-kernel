@@ -47,13 +47,16 @@ export interface ThreadSummary {
   updated_at: string;
 }
 
+/** Both read routes page at 50 and hand back a cursor for the next page, or null on the last. */
 export interface ThreadListResponse {
   threads: ThreadSummary[];
+  next_cursor?: string | null;
 }
 
 export interface ThreadResponse {
   session_id: string;
   messages: ThreadMessage[];
+  next_cursor?: string | null;
 }
 
 export const A2UI_MEDIA_TYPE = "application/a2ui+json";

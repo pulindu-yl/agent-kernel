@@ -91,7 +91,7 @@ keeping them separate means a missing or broken npm never blocks the Python side
 
 ## The frontend
 
-~465 lines of React, counting the thread rail and the catalog:
+~500 lines of React, counting the thread rail and the catalog:
 
 ```
 frontend/src/
@@ -184,6 +184,11 @@ Two more details in the replay, both in `turnsFromThread`:
   cannot be answered twice.
 - **Opening a thread sets the session id**, so the conversation genuinely resumes — the agent's own
   memory is keyed by the same id the thread is, not merely by what the transcript shows.
+
+Both read routes are paginated — 50 threads, and 50 messages oldest-first — so `fetchAll` in
+[`App.tsx`](frontend/src/App.tsx) follows `next_cursor` to the end before rendering anything. That
+is not tidiness: the rule above only holds over a *complete* transcript, and a form that happened
+to sit at message 50 would otherwise replay as live and be answerable a second time.
 
 `thread.type: in_memory` keeps this to one command. History survives a reload of the page, which is
 what is being demonstrated, but not a restart of `app.py`. Switch to `redis`, `valkey`, `dynamodb`,

@@ -26,6 +26,31 @@ type Turn =
   | { kind: "surface"; message: A2UIMessage; submitted: boolean }
   | { kind: "error"; text: string };
 
+/**
+ * Read every page of a cursor-paginated route, in order.
+ *
+ * Both thread routes cap a page at 50 and hand back `next_cursor`. Taking only the first page
+ * hides the oldest conversations from the list, and — because messages come back oldest-first —
+ * drops the *newest* turns from a transcript, which would leave an already-answered form looking
+ * like the last thing that happened.
+ */
+async function fetchAll<Row, Body extends { next_cursor?: string | null }>(
+  url: string,
+  rows: (body: Body) => Row[],
+): Promise<Row[]> {
+  const all: Row[] = [];
+  let cursor: string | null | undefined;
+  do {
+    const page = cursor ? `${url}${url.includes("?") ? "&" : "?"}cursor=${encodeURIComponent(cursor)}` : url;
+    const response = await fetch(page);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body: Body = await response.json();
+    all.push(...rows(body));
+    cursor = body.next_cursor;
+  } while (cursor);
+  return all;
+}
+
 function turnFor(value: string | A2UIMessage, mediaType: string | undefined, submitted = false): Turn {
   if (mediaType === A2UI_MEDIA_TYPE && typeof value === "object") {
     return { kind: "surface", message: value, submitted };
@@ -139,10 +164,11 @@ export default function App(): JSX.Element {
   const [busy, setBusy] = useState(false);
 
   const refreshThreads = useCallback(async () => {
-    const response = await fetch(`/api/v1/threads?user_id=${encodeURIComponent(USER_ID)}`);
-    if (!response.ok) return;
-    const body: ThreadListResponse = await response.json();
-    setThreads(body.threads);
+    try {
+      setThreads(await fetchAll<ThreadSummary, ThreadListResponse>(`/api/v1/threads?user_id=${encodeURIComponent(USER_ID)}`, (body) => body.threads));
+    } catch {
+      // The rail is a convenience; a failed refresh leaves the last list rather than emptying it.
+    }
   }, []);
 
   useEffect(() => {
@@ -171,14 +197,25 @@ export default function App(): JSX.Element {
     }
   }
 
-  /** Sets the session id too, so the agent's own memory resumes — not just the transcript. */
+  /**
+   * Sets the session id too, so the agent's own memory resumes — not just the transcript.
+   *
+   * Holds `busy` for the whole load. Left free, Send stays enabled while the pages arrive and a
+   * reply can be appended to a transcript that is about to be replaced, landing it in the wrong
+   * conversation.
+   */
   async function openThread(id: string) {
     if (busy) return;
-    const response = await fetch(`/api/v1/threads/${encodeURIComponent(id)}`);
-    if (!response.ok) return;
-    const body: ThreadResponse = await response.json();
-    setSessionId(id);
-    setTurns(turnsFromThread(body.messages));
+    setBusy(true);
+    try {
+      const messages = await fetchAll<ThreadMessage, ThreadResponse>(`/api/v1/threads/${encodeURIComponent(id)}`, (body) => body.messages);
+      setSessionId(id);
+      setTurns(turnsFromThread(messages));
+    } catch (error) {
+      setTurns((previous) => [...previous, { kind: "error", text: String(error) }]);
+    } finally {
+      setBusy(false);
+    }
   }
 
   function newThread() {
@@ -215,8 +252,10 @@ export default function App(): JSX.Element {
         </p>
 
         <ol className="transcript">
+          {/* Keyed by session: the catalog's inputs are uncontrolled, so without the prefix React
+              reuses the DOM between two threads of the same shape and carries typed values across. */}
           {turns.map((turn, index) => (
-            <li key={index} className={turn.kind}>
+            <li key={`${sessionId}-${index}`} className={turn.kind}>
               <TurnView turn={turn} follows={turns[index - 1]?.kind} onSubmit={(event) => onSubmitSurface(event, index)} />
             </li>
           ))}
