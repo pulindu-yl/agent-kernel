@@ -142,6 +142,34 @@ Both are settable from the environment too (`AK_EXECUTION__REALTIME__PLAYBACK_LE
 `AK_EXECUTION__REALTIME__INPUT_BATCH_MS`). A larger playback lead is smoother but adds a little
 latency at the start of each response.
 
+### Live settings (Google ADK)
+
+How Gemini detects the caller's turns, and which languages it transcribes, come from the ADK
+`RunConfig` the call's starting agent declares as a run option, the same option a non-live run
+reads. It applies to every socket of the call, the sockets a transfer or a reconnect opens included:
+
+```python
+from google.adk.agents.run_config import RunConfig
+from google.genai import types
+
+module.run_options(
+    supervisor,
+    run_config=RunConfig(
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                silence_duration_ms=800,
+            )
+        ),
+        input_audio_transcription=types.AudioTranscriptionConfig(language_codes=["en-US"]),
+    ),
+)
+```
+
+Agent Kernel reads `realtime_input_config`, `input_audio_transcription` and `output_audio_transcription`;
+transcription of both sides stays on when they are unset, since the runner depends on it. A run-options
+factory is not called for realtime calls: the call has no per-run requests to give it.
+
 ### Tools and framework context
 
 Realtime tool calls receive the session's `framework_context` as their run context, as unary runs
@@ -278,13 +306,16 @@ raises is logged, and the next one still runs.
 
 ## Example Projects
 
-Complete working examples (with In-Memory, Kafka, NATS, and AWS SQS architectures) are available in the **examples/api/livekit-voice** directory. The `openai/handoffs` and `google/handoffs` variants show multi-agent handoffs with an internet support line (supervisor, billing and tech support).
+Complete working examples (with In-Memory, Kafka, NATS, and AWS SQS architectures) are available in the **examples/api/livekit-voice** directory. The `openai/handoffs` and `google/handoffs` variants show multi-agent handoffs with an internet support line (supervisor, billing and tech support). `google/handoffs` also refuses a handoff until the caller's account is verified (a `before_tool_callback`), confirms a technician visit from a background job with `RealtimeCall.post_when_idle`, and logs the call with a `RealtimeHook`.
 
 ## Limitations
 
-- **No guardrails or hooks on realtime turns**: voice and chat turns go to the model socket directly, not through `Runtime.run()`, so input/output guardrails, pre/post hooks and the multimodal pre-hook do not run.
+- **No guardrails or pre/post hooks on realtime turns**: voice and chat turns go to the model socket directly, not through `Runtime.run()`, so input/output guardrails, pre/post hooks and the multimodal pre-hook do not run. [Realtime hooks](#watching-a-live-call) do: they observe the call, and cannot change what is said.
 - **Tool limits**: OpenAI tools that need approval or have tool guardrails are not offered in realtime mode (a warning is logged), and ADK toolsets such as MCP are not supported. Plain function tools work on both frameworks.
 - **One room per gateway**: each `LiveKitEdgeGateway` joins one room, and all audio in that room goes to one session.
-- **History is held by the model connection**: the conversation lives in the model's own session (for a Google ADK transfer, Agent Kernel replays it into the new agent's socket). A new connection (after the connection is idle, or after a socket failure or the model's session time limit) starts with no earlier turns, at the entry agent.
+- **History is held by the model connection**: the conversation lives in the model's own session (for a Google ADK transfer, Agent Kernel replays it into the new agent's socket).
+  - **Google ADK**: a Gemini socket that drops, stalls or reaches the Live API's connection time limit (about 10 minutes) is replaced with the same agent, seeded with the conversation and a short note that the line dropped (see [Connection recovery](../architecture/realtime-internals.md#connection-recovery-google-adk)); what the caller says meanwhile is held and passed on. Only when every attempt fails, or the new sockets keep dropping, is the call failed.
+  - **OpenAI**, and any adapter after a failed call: the next connection starts with no earlier turns, at the entry agent. So does a call evicted after five idle minutes.
+  - The replayed conversation is text: tone of voice is not carried over, and a very long call replays a long history on every transfer or reconnect.
 - **One LiveKit connection per agent**: with handoffs, every agent in the team is a participant for the whole call, and LiveKit bills connection minutes for each.
 - **Single replicas**: one Agent Runner replica and one IOHandler process, as described above.

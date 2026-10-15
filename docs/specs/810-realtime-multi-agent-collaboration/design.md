@@ -92,13 +92,13 @@ flowchart TB
 
 ### Live settings from `RunConfig` (`GoogleADKRealtimeRunner`)
 
-- The starting agent's `run_config` run option applies to every socket of the call: `realtime_input_config`, `input_audio_transcription`, `output_audio_transcription` (transcription stays on), `session_resumption`, `context_window_compression`
+- The starting agent's `run_config` run option applies to every socket of the call: `realtime_input_config`, `input_audio_transcription`, `output_audio_transcription` (transcription stays on)
 - A run-options factory is not called for realtime calls; documented
 
 ### Connection recovery (`GoogleADKRealtimeRunner`)
 
-- A socket that drops, is closed by the server, says `go_away` or stalls is replaced without leaving the agent that had the call
-- With `session_resumption` set, the runner resumes the session with its latest resumable handle and sends nothing else; without one, or when resuming fails, it replays the conversation with a one-time note that the line dropped
+- A socket that drops, is closed by the server (its ~10 minute limit included) or stalls is replaced without leaving the agent that had the call
+- The new socket is seeded with the conversation and a one-time note that the line dropped, as a transfer's socket is seeded
 - Bounded attempts; repeated quick drops give up as an `error`, which fails the connection as today
 - What the caller says while no socket is open is held and sent to the next socket; a tool result that arrives after its socket was lost is kept in the history
 - A stall is no model progress for a while after the model was given something to answer, or mid-response; a voice turn the model never answers is not detected (documented)
@@ -112,19 +112,19 @@ flowchart TB
 ### Configuration
 
 - **No new configuration fields.** Reason each candidate was rejected:
-  - Turn detection, languages, resumption, compression: ADK's `RunConfig` already holds them, carried by `Module.run_options`
+  - Turn detection, languages: ADK's `RunConfig` already holds them, carried by `Module.run_options`
   - Post timing, reconnect and stall thresholds: values settled in live runs, kept as constants rather than knobs nobody has asked to tune
 - No new extra; existing YAML and `AK_*` env vars stay valid
 
 ### Example (`examples/api/livekit-voice/google/handoffs/`)
 
-- The existing handoffs example gains: a `before_tool_callback` that refuses a handoff past a limit, a technician booking that a background job confirms through `post_when_idle`, a `RealtimeHook` that logs the call, and `session_resumption` in its `RunConfig`
+- The existing handoffs example gains: a `before_tool_callback` that refuses a handoff to a specialist until the caller's account is verified, a technician booking that a background job confirms through `post_when_idle`, and a `RealtimeHook` that logs the call
 - Offline tests; the example runs them in the CI e2e matrix
 
 ### Tests
 
 - Offline, against scripted sockets: `ak-py/tests/test_realtime_pool.py`, `test_tool.py`, `test_tool_adk.py`, `test_module.py`, `test_livekit_gateway.py`, `test_ecs_akagentrunner_realtime.py`; the example's `server_test.py`
-- Live runs on `gemini-3.1-flash-live-preview`, done by the maintainer: handoffs, a background post, a forced drop, a resumed session past 10 minutes
+- Live runs on `gemini-3.1-flash-live-preview`, done by the maintainer: handoffs, a background post, a forced drop, a call past 10 minutes
 
 ### Documentation and skills
 
@@ -137,6 +137,7 @@ flowchart TB
 - `RealtimeCall` across processes: it reaches a call only in the process running the realtime pool
 - ADK plugins in realtime; recovery for the OpenAI realtime adapter
 - Detecting a voice turn the model never answers; bounding the replayed history
+- Gemini's native session resumption: a follow-up. A handoff needs a new socket for the new agent anyway, and the replay already recovers a drop and the ~10 minute limit; resumption would also need context window compression (an audio session ends at 15 minutes without it) and is unproven on the preview Live model
 - A browser voice edge (a web page carrying a call with no media server); an application can build one on the public edge seam (`StatefulEdgeAdapter`, `StatefulEdgeRegistry`)
 - The application that drove these changes
 
@@ -144,8 +145,6 @@ flowchart TB
 
 - Resolved: one PR (#818) for all of it; the parts depend on each other (posts on recovery, the example on posts and hooks)
 - Resolved: no browser voice edge in this change. AG-UI cannot carry a voice call (no audio events; one HTTP request per turn; the stream path, not the realtime pool), and a browser edge is a new integration that needs its own design: hosting next to `GatewayRunner`, authentication, and the integration checklist. A separate issue if the team wants one
-- Resolved: resumption only when the call's `RunConfig` asks for it, ADK's own default being off
-- Resolved: replay stays the fallback, with its one-time note
+- Resolved: no native session resumption in this change (Non-goals); recovery replays the conversation with a one-time note
 - Resolved: a late tool result is kept in the history, not sent to the recovered socket (unverified on Gemini 3.x Live)
 - Resolved: tool calls Gemini writes into its words (`transfer_to_agent{...}`) are not stripped in the adapter; edges filter what they show
-- Does session resumption hold on `gemini-3.1-flash-live-preview`, including after a 1011 close? Answered by the live check in `plan.md` before resumption is built on

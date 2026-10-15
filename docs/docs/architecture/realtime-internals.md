@@ -71,7 +71,8 @@ A `RealtimeRunner` adapter talks to the model and reports what it does through t
 | `audio_delta` | A piece of the model's audio | Paced at playback speed |
 | `transcript_delta` | A piece of the model's transcript | In order with its audio |
 | `tool_call` | The model called a function (a tool, or a handoff) | Runs `execute_tool()`, then `send_tool_result()` |
-| `done` | The model's turn ended | In order, after its audio |
+| `done` | The model's turn ended; with status `reconnecting`, because the adapter lost its socket and is replacing it | In order, after its audio. A `reconnecting` one also marks the connection not ready for posts until `reconnected` or `error` |
+| `reconnected` | Optional: the adapter replaced a lost socket, and `agent` still has the call; `seeded` when the new socket was given the conversation to answer (see [Connection recovery](#connection-recovery-google-adk)) | Nothing reaches the edge; the connection is ready again, a `seeded` one owes a reply first, and the realtime hooks get `reconnected` |
 | `interrupt` / `speech_started` | The caller started speaking: over the model (`interrupt`), or while it is silent (`speech_started`, reported once per caller turn by both adapters) | An `interrupt`, or a `speech_started` while paced audio is still queued, drops unheard audio and text and keeps `done` and `agent_changed`. Either one marks when the caller last spoke (see [Turn state](#turn-state)) |
 | `speech_heard` / `speech_stopped` | The caller is still speaking (`speech_heard`: Gemini, on each later transcription of their words), or has stopped (`speech_stopped`: OpenAI's server VAD, from an adapter with `reports_speech_stopped`) | Nothing reaches the edge; both mark when the caller last spoke, and `speech_stopped` ends `is_caller_speaking` |
 | `agent_changed` | A handoff moved the call to another agent | In order: after the old agent's output, before the new agent's |
@@ -98,7 +99,7 @@ On a barge-in, the queued audio and transcript are dropped (the caller will not 
 
 ## Turn state
 
-Code that talks into a live call from outside it, such as a background job reporting its result, must wait for a quiet moment. Text sent into a call starts a model response, so sending it while the model or the caller is speaking cuts one of them off; on Gemini Live, text sent as a completed turn interrupts any response the model is still generating, even one that has produced no audio yet. `RealtimeConnection` exposes read-only properties for that, safe to read from any thread:
+Code that talks into a live call from outside it, such as a background job reporting its result, must wait for a quiet moment. Text sent into a call starts a model response, so sending it while the model or the caller is speaking cuts one of them off; on Gemini Live, text sent as a completed turn interrupts any response the model is still generating, even one that has produced no audio yet. `RealtimeConnection` keeps that state, internal to the pool (`RealtimeConnection` is not exported) and safe to read from any thread:
 
 | Property | Is |
 |---|---|
@@ -110,10 +111,12 @@ Code that talks into a live call from outside it, such as a background job repor
 | `is_caller_speaking` | True from the caller starting to speak until the adapter reports they stopped, on an adapter that reports it (`reports_speech_stopped`: OpenAI). Always false on Gemini Live, which does not signal the end of speech |
 | `last_caller_speech_at` | When the caller was last heard speaking: their start (`speech_started` or `interrupt`), each later transcription of their words (`speech_heard`, Gemini), and their stop (`speech_stopped`, OpenAI). On Gemini it keeps moving through a long answer only as far as the model sends transcriptions while the caller speaks |
 | `last_edge_text_at` | When text from the edge last reached the model: text the caller typed, or a prompt the edge sends for them (such as the LiveKit gateway's greeting). Not text the application sends itself with `send_text` |
+| `last_reconnect_at` | When the adapter last replaced a lost socket by replaying the conversation into a new one (`reconnected` with `seeded`). The model owes a reply to that seed, as to a tool result |
+| `is_ready` | The model socket has connected, the connection is not closed, and the adapter is not recovering a lost socket |
 
 `last_activity_at` cannot serve here: every caller audio frame moves it, silence included.
 
-The pool cannot see the model generating before its first output, after the caller speaks or types or a tool result is sent. So deciding the call is quiet also checks that the model owes no reply: its last output is later than the caller's last speech, the edge's last text, the last tool result, and the last post (each waited for at most `RealtimeOutbox.REPLY_TIMEOUT_SECONDS`, since an input the model never answers must not hold the call forever). It also waits while `is_responding` or `is_caller_speaking`, and until nothing has happened for `RealtimeOutbox.QUIET_SECONDS`.
+The pool cannot see the model generating before its first output, after the caller speaks or types or a tool result is sent. So deciding the call is quiet also checks that the model owes no reply: its last output is later than the caller's last speech, the edge's last text, the last tool result, the last replayed reconnect, and the last post (each waited for at most `RealtimeOutbox.REPLY_TIMEOUT_SECONDS`, since an input the model never answers must not hold the call forever). It also waits while `is_responding` or `is_caller_speaking`, and until nothing has happened for `RealtimeOutbox.QUIET_SECONDS`.
 
 Applications do not read these properties themselves: `RealtimeCall` (see [Talking into a live call](../integrations/livekit.md#talking-into-a-live-call)) is the public face of this rule. Its `post_when_idle` queues text in the session's `RealtimeOutbox`, which the pool keeps per session rather than per connection, so posts survive a reconnect. Every `_POST_POLL_SECONDS` the pool's loop says each session's next post if `RealtimeOutbox.quiet_for` finds the call quiet long enough, with `RealtimeConnection.send_text`. `RealtimeCall.quiet_for()` and `agent_has_spoken` read the same state.
 
@@ -241,7 +244,19 @@ The history the adapter keeps and replays is what ADK's session records, minus t
 
 Each entry remembers who it came from: the caller, or the agent that said it or made the call. A new socket is seeded the way ADK seeds a Live socket after a transfer: the caller's words go as they are, and every agent's turn, the new agent's own included, goes on the caller's side as context naming its author (`[architect] said: ...`, `[pm] called tool ...`), fenced as data by ADK's own presenter. So an agent can tell a teammate's words from its own, and answer a question a teammate put to it before handing the call over.
 
-The caller hears a short gap (about 1 to 2 seconds) while the new socket opens; what the caller says during it is not heard.
+The caller hears a short gap (about 1 to 2 seconds) while the new socket opens; what the caller says during it is held, its latest 5 seconds, and sent to the new agent's socket.
+
+## Connection recovery (Google ADK)
+
+A Gemini socket can be lost in the middle of a call: the network drops, the Live API closes a connection at its time limit (about 10 minutes), or the socket stops answering. The adapter replaces it without leaving the agent that had the call, much as a transfer replaces a socket with another agent's:
+
+1. **Detect.** A socket error or close ends the listener. A stall is no progress from the model (audio, its transcript, a tool call, the end of its turn, an interruption) for `STALL_SECONDS` (15 s) after it was given something to answer (a tool result, text, a seeded turn), or in the middle of a response. A turn the caller speaks and the model never answers is not detected: Gemini Live does not signal the end of the caller's speech. A dead socket is also caught by the websocket keepalive, after about 40 seconds.
+2. **Close the turn.** The turn under way is ended with `done` (status `reconnecting`), so the edge closes it, and the pool posts nothing into the call until the new socket is up. Tool calls the lost socket was still owed results for are set aside.
+3. **Reconnect.** Up to `RECONNECT_ATTEMPTS` (3), waiting `RECONNECT_DELAYS_SECONDS` (1, 2, 4) before each. The new socket is configured for the same agent and seeded with the conversation, plus a note for that socket only: if the caller was speaking, or spoke while the line was down, the agent is asked to say it lost them and ask them to repeat; otherwise to carry on without asking. The note is never kept in the history, so later sockets do not see it. Setting `RECONNECTED_NOTE` / `RECONNECTED_QUIET_NOTE` to `""` sends none.
+4. **Resume.** The adapter reports `reconnected`, and sends the new socket what the caller said meanwhile (its latest `HOLD_AUDIO_SECONDS`, 5 s) and any text sent. A result that arrives for a call made on the lost socket is kept in the history, so a later socket sees it; the new socket is not sent it, and the agent may call the tool again.
+5. **Give up.** When every attempt fails, or reconnected sockets keep being lost within `QUICK_DROP_SECONDS` (20 s) of reconnecting three times in a row (a service that accepts a connection and then closes it, such as one out of quota), the adapter reports `error`: the edge is told, and the next input starts a new call at the entry agent. The pool releases a failed connection on its next sweep, whether or not more input comes.
+
+The replay is the same as a transfer's: text, not the original audio. Gemini's own session resumption, which keeps the server-side session across connections, is not used.
 
 ## OpenAI and Google ADK side by side
 
@@ -255,6 +270,7 @@ The caller hears a short gap (about 1 to 2 seconds) while the new socket opens; 
 | Voice | One voice for every agent | Each agent's own voice |
 | Checked at connect | Handoffs that filter or nest the history are rejected | Every reachable agent must be an `LlmAgent` with a Live model and a string instruction |
 | Refusing a handoff | An `on_handoff` that raises; the agent stays and the model gets the error | A `before_tool_callback` that answers for `transfer_to_agent` |
+| Lost model socket | The call fails; the next input starts at the entry agent | Reconnected with the same agent and the conversation (see [Connection recovery](#connection-recovery-google-adk)) |
 
 ## Where each piece lives
 

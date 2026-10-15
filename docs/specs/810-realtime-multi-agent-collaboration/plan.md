@@ -41,7 +41,7 @@ before the code they describe.
 - **Files:** `adk.py`
 - **Steps:**
   1. Keep `_Said` entries and seed through `_presented_history()`, per spec.md "Authored history".
-  2. Read the `run_config` run option at connect and set turn detection and transcription in `_connect_config`, per spec.md "Live settings" (resumption and compression come in Iteration 7).
+  2. Read the `run_config` run option at connect and set turn detection and transcription in `_connect_config`, per spec.md "Live settings".
 - **Verify:** `TestADKRealtimeTransfers`, `TestADKConnectConfig`.
 
 ## Iteration 5: Talking into a live call and realtime hooks
@@ -62,23 +62,12 @@ before the code they describe.
 - **Steps:**
   1. Add the recovery constants, `_recover_soon`, `_recover` (steps 1 to 4, and the replay of step 5) and the stall watchdog, per spec.md "Recovery".
   2. Pass the replay note to `_open_socket` as `extra`, so it never enters `_history`.
-  3. Keep `_lost_batches` and record their late results, per Rule 3.
-  4. Apply the stall wait of Rule 4 and the held input of Rule 5; cancel both tasks in `disconnect()` (Rule 6).
+  3. Keep `_lost_batches` and record their late results, per Rule 1.
+  4. Apply the stall wait of Rule 2 and the held input of Rule 3; cancel both tasks in `disconnect()` (Rule 4).
   5. Report `reconnected` with `seeded`; in the pool, mark the connection recovering between `reconnecting` and `reconnected`, and count a seeded reconnect as owed a reply, per the "Turn state" table and "Outbox" step 3.
 - **Verify:** `TestADKRealtimeRecovery` (the replay cases), `TestRealtimeTurnState` (recovering), `TestRealtimeOutbox` (a seeded reconnect).
 
-## Iteration 7: Native session resumption
-
-- **Goal:** with `session_resumption` in the call's `RunConfig`, a lost, stalled or expiring socket resumes the same session without replaying.
-- **Files:** `adk.py`, `docs/specs/810-realtime-multi-agent-collaboration/research/gemini-live-resumption.md` (new)
-- **Steps:**
-  1. Live check first, per spec.md "Live check": on `gemini-3.1-flash-live-preview`, record how often `resumable` is false, a forced drop resumed with the handle, the `go_away` near 10 minutes, a resume after a 1011 close, and a call past 20 minutes with compression. If resuming does not hold, stop here: keep replay, and record why in `design.md` and spec.md "Open items for review".
-  2. Pass `session_resumption` (with the current handle) and `context_window_compression` in `_connect_config`, per spec.md "Live settings".
-  3. Keep the handle and the resumable state, and recover on `go_away`, per spec.md "Recovery" Rules 1 and 2.
-  4. Resume before replaying in `_recover`, per step 5.1; a transfer clears the handle.
-- **Verify:** the resumption cases of `TestADKRealtimeRecovery` and `TestADKConnectConfig`; the research note's checks pass.
-
-## Iteration 8: LiveKit tokens and alias
+## Iteration 7: LiveKit tokens and alias
 
 - **Goal:** an application signs its users' tokens through the gateway and imports it by its public name.
 - **Files:** `ak-py/src/agentkernel/integration/livekit/adapter.py`, `ak-py/src/agentkernel/livekit.py` (new), `examples/api/livekit-voice/**`
@@ -87,17 +76,17 @@ before the code they describe.
   2. Add the alias; switch the LiveKit examples to the public aliases and the `sqs` token handlers to `participant_token`.
 - **Verify:** `cd ak-py && uv run pytest tests/test_livekit_gateway.py`.
 
-## Iteration 9: Example
+## Iteration 8: Example
 
-- **Goal:** `examples/api/livekit-voice/google/handoffs/` shows a refused handoff, a background post, the call log and resumption, and its offline tests run in CI.
-- **Files:** `examples/api/livekit-voice/google/handoffs/{server.py,server_test.py,pyproject.toml,README.md}`, `.github/test-config.yaml`
+- **Goal:** `examples/api/livekit-voice/google/handoffs/` shows a refused handoff, a background post and the call log, and its offline tests run in CI.
+- **Files:** `examples/api/livekit-voice/google/handoffs/{server.py,server_test.py,README.md}`, `.github/test-config.yaml`
 - **Steps:**
-  1. Add `limit_handoffs`, the background confirmation in `book_technician`, `CallLog` and the `RunConfig`, per the spec.md "Example" table.
-  2. Write `server_test.py` per spec.md "New: `examples/api/livekit-voice/google/handoffs/server_test.py`", with a dummy LiveKit key and secret set before the server is imported.
+  1. Add `verify_account`, `require_account`, the background confirmation in `book_technician` and `CallLog`, and build the gateway under `__main__`, per the spec.md "Example" table.
+  2. Write `server_test.py` per spec.md "New: `examples/api/livekit-voice/google/handoffs/server_test.py`".
   3. Build ak-py (`ak-py/build.sh`), then run `./build.sh local` in the example; register it in `.github/test-config.yaml`.
 - **Verify:** `cd examples/api/livekit-voice/google/handoffs && uv run pytest -s` passes offline; with a LiveKit room and a Gemini key, a call shows the refused handoff, the dispatch post and the call log.
 
-## Iteration 10: Tests
+## Iteration 9: Tests
 
 - **Goal:** every case in spec.md "Testing" exists and passes, the whole suite is green, and the live check holds.
 - **Steps:**
@@ -106,7 +95,7 @@ before the code they describe.
   3. Do the live check with the maintainer's keys, per spec.md "Live check".
 - **Verify:** every command exits 0; in CI, the only red jobs are e2e jobs that also fail on `develop`.
 
-## Iteration 11: Sync docs and skills
+## Iteration 10: Sync docs and skills
 
 - **Goal:** every surface in spec.md "Migration surface" describes the change as built.
 - **Files:** everything in spec.md "Migration surface"
