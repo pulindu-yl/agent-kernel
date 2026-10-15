@@ -304,9 +304,6 @@ jobs:
           TF_VAR_langfuse_public_key: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
           TF_VAR_langfuse_secret_key: ${{ secrets.LANGFUSE_SECRET_KEY }}
           TF_VAR_langfuse_base_url: ${{ vars.LANGFUSE_BASE_URL }}
-          TF_VAR_logfire_token: ${{ secrets.LOGFIRE_TOKEN }}
-          TF_VAR_logfire_read_token: ${{ secrets.LOGFIRE_READ_TOKEN }}
-          TF_VAR_traceloop_api_key: ${{ secrets.TRACELOOP_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_SIGNING_SECRET: ${{ secrets.SLACK_SIGNING_SECRET }}
           ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
@@ -330,11 +327,11 @@ jobs:
             ARGS+=(--request-handler-security-group-id "${{ needs.get-base-outputs.outputs.request_handler_security_group_id }}")
           fi
           # The base deployment runs in queue_mode, so it also exposes an agent runner and response
-          # handler security group — but only scalable-openai, schedule-openai and the three
-          # *-trace-evaluation examples (the queue-mode examples in the weekly matrix) have those tiers
+          # handler security group — but only scalable-openai, schedule-openai and
+          # openai-langfuse-trace-evaluation (the queue-mode examples in the weekly matrix) have those tiers
           # to reuse them on. Every other aws-serverless example is queue_mode = false and only has a
           # request handler tier.
-          if [[ "${{ matrix.path }}" == "examples/aws-serverless/scalable-openai" || "${{ matrix.path }}" == "examples/aws-serverless/schedule-openai" || "${{ matrix.path }}" == "examples/aws-serverless/openai-langfuse-trace-evaluation" || "${{ matrix.path }}" == "examples/aws-serverless/adk-cloudwatch-trace-evaluation" || "${{ matrix.path }}" == "examples/aws-serverless/pydanticai-logfire-trace-evaluation" ]]; then
+          if [[ "${{ matrix.path }}" == "examples/aws-serverless/scalable-openai" || "${{ matrix.path }}" == "examples/aws-serverless/schedule-openai" || "${{ matrix.path }}" == "examples/aws-serverless/openai-langfuse-trace-evaluation" ]]; then
             ARGS+=(--agent-runner-security-group-id "${{ needs.get-base-outputs.outputs.agent_runner_security_group_id }}" --response-handler-security-group-id "${{ needs.get-base-outputs.outputs.response_handler_security_group_id }}")
           fi
           python .github/scripts/run_single_test.py "${ARGS[@]}"
@@ -349,9 +346,6 @@ jobs:
           TF_VAR_langfuse_public_key: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
           TF_VAR_langfuse_secret_key: ${{ secrets.LANGFUSE_SECRET_KEY }}
           TF_VAR_langfuse_base_url: ${{ vars.LANGFUSE_BASE_URL }}
-          TF_VAR_logfire_token: ${{ secrets.LOGFIRE_TOKEN }}
-          TF_VAR_logfire_read_token: ${{ secrets.LOGFIRE_READ_TOKEN }}
-          TF_VAR_traceloop_api_key: ${{ secrets.TRACELOOP_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_SIGNING_SECRET: ${{ secrets.SLACK_SIGNING_SECRET }}
           ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
@@ -376,9 +370,6 @@ jobs:
           TF_VAR_langfuse_public_key: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
           TF_VAR_langfuse_secret_key: ${{ secrets.LANGFUSE_SECRET_KEY }}
           TF_VAR_langfuse_base_url: ${{ vars.LANGFUSE_BASE_URL }}
-          TF_VAR_logfire_token: ${{ secrets.LOGFIRE_TOKEN }}
-          TF_VAR_logfire_read_token: ${{ secrets.LOGFIRE_READ_TOKEN }}
-          TF_VAR_traceloop_api_key: ${{ secrets.TRACELOOP_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_SIGNING_SECRET: ${{ secrets.SLACK_SIGNING_SECRET }}
           ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
@@ -393,7 +384,7 @@ jobs:
           if [[ "${{ matrix.type }}" == "aws-serverless" ]]; then
             ARGS+=(--request-handler-security-group-id "${{ needs.get-base-outputs.outputs.request_handler_security_group_id }}")
           fi
-          if [[ "${{ matrix.path }}" == "examples/aws-serverless/scalable-openai" || "${{ matrix.path }}" == "examples/aws-serverless/schedule-openai" || "${{ matrix.path }}" == "examples/aws-serverless/openai-langfuse-trace-evaluation" || "${{ matrix.path }}" == "examples/aws-serverless/adk-cloudwatch-trace-evaluation" || "${{ matrix.path }}" == "examples/aws-serverless/pydanticai-logfire-trace-evaluation" ]]; then
+          if [[ "${{ matrix.path }}" == "examples/aws-serverless/scalable-openai" || "${{ matrix.path }}" == "examples/aws-serverless/schedule-openai" || "${{ matrix.path }}" == "examples/aws-serverless/openai-langfuse-trace-evaluation" ]]; then
             ARGS+=(--agent-runner-security-group-id "${{ needs.get-base-outputs.outputs.agent_runner_security_group_id }}" --response-handler-security-group-id "${{ needs.get-base-outputs.outputs.response_handler_security_group_id }}")
           fi
           python .github/scripts/run_single_test.py "${ARGS[@]}"

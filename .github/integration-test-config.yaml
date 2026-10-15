@@ -78,15 +78,6 @@ weekly:
     - type: aws-serverless
       path: examples/aws-serverless/openai-langfuse-trace-evaluation
       deploy_dir: deploy
-    - type: aws-serverless
-      path: examples/aws-serverless/adk-cloudwatch-trace-evaluation
-      deploy_dir: deploy
-    - type: aws-serverless
-      path: examples/aws-serverless/pydanticai-logfire-trace-evaluation
-      deploy_dir: deploy
-    - type: aws-serverless
-      path: examples/aws-serverless/langgraph-traceloop-trace-fetch
-      deploy_dir: deploy
 
     # Memory options
     - type: aws-serverless
