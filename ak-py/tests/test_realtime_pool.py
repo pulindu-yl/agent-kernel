@@ -2453,6 +2453,25 @@ class TestADKRealtimeRecovery:
         await runner.disconnect()
 
     @pytest.mark.asyncio
+    async def test_text_sent_to_a_silent_socket_does_not_hold_off_its_replacement(self, monkeypatch):
+        """Live: an application nudged a silent agent every 15 s; each nudge restarted the 15 s wait, so a socket
+        that had stopped answering was replaced only 46 s after it fell silent."""
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "STALL_SECONDS", 0.3)
+        client = _FakeLiveClient([], [])  # the first socket never says anything again
+        runner, events = await self._connect(monkeypatch, client)
+
+        for _ in range(6):  # a nudge every 0.2 s, more often than the stall wait
+            await runner.send_text("[The call has gone quiet; it is your turn]")
+            await asyncio.sleep(0.2)
+            if any(kind == "reconnected" for kind, _ in events):
+                break
+
+        assert any(kind == "reconnected" for kind, _ in events)
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
     async def test_an_answering_socket_is_not_taken_for_stalled(self, monkeypatch):
         from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
 

@@ -1632,7 +1632,11 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             await self._end_turn_and_report()
             self._history.append(self._Said("user", types.Content(role="user", parts=[types.Part(text=text)])))
             await self._connection.send_client_content(turns=types.Content(role="user", parts=[types.Part(text=text)]), turn_complete=True)
-            self._owed_since = self._given_at = time.monotonic()
+            # A wait already running is kept: only the model's progress moves it. Otherwise text sent every so often
+            # to a socket that has stopped answering (an application's nudges) keeps it from being taken for stalled.
+            if self._owed_since is None:
+                self._owed_since = time.monotonic()
+            self._given_at = time.monotonic()
         elif not self._closing:
             self._held_text.append(text)
 
