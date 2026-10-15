@@ -1,0 +1,36 @@
+[project]
+name = "aws-serverless-langgraph-traceloop-trace-fetch"
+version = "0.1.0"
+description = "Agent Kernel LangGraph agent on AWS Lambda whose Traceloop (OpenLLMetry) spans are read back on a /fetch route"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "agentkernel[aws,langgraph,redis,openllmetry]>=0.9.5",
+    "langchain-openai>=1.1.16",
+    "langgraph-supervisor>=0.0.29",
+]
+
+[dependency-groups]
+dev = [
+    "agentkernel[test]>=0.9.5",
+    "httpx>=0.27.0",
+    "black==26.5.1",
+    "isort>=5.0.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+# Show the fetched spans and the polling progress as the live test runs
+log_cli = true
+log_cli_level = "INFO"
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.black]
+line-length = 120
+target-version = ["py312"]
