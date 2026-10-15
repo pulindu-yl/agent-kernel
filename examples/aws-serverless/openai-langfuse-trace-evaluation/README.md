@@ -210,12 +210,6 @@ limit is 400 KB) by dropping tool calls and shortening `input`/`output`, so a la
 
 ## Test
 
-Unit tests (no cloud access; the judges, Langfuse and DynamoDB are faked, DynamoDB with `moto`):
-
-```bash
-./build.sh local && uv run --no-sync pytest tests/
-```
-
 The integration test first sends one question under a throwaway session and waits 2 minutes, so cold starts
 (which can outlast API Gateway's 29 s) hit it rather than the graded requests. It then sends the three
 questions, waits, runs up to three `/eval` rounds, and passes once `/check` reports every request graded. It runs in the weekly integration tests;
