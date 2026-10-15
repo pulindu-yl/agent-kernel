@@ -222,7 +222,7 @@ Each agent participant needs a token of its own, so the gateway needs `AK_LIVEKI
 | | OpenAI Agents SDK | Google ADK |
 |---|---|---|
 | Handoff | Same model socket; the session is switched to the new agent's instructions and tools | A new Gemini Live socket for the new agent, seeded with the conversation so far |
-| Gap the caller hears | None | About 1 to 2 seconds; what the caller says during it is not heard |
+| Gap the caller hears | None | About 1 to 2 seconds; what the caller says during it is held (its latest 5 seconds) and sent to the new agent |
 | Voice and model | Every agent speaks with the entry agent's model and voice | Each agent its own model and voice (`generate_content_config.speech_config`) |
 | Rejected when the call connects | A handoff with `input_filter` or `nest_handoff_history`, which realtime cannot apply | Any reachable agent that is not an `LlmAgent` with a Gemini Live model and a string `instruction` |
 

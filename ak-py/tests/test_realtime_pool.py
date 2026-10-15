@@ -2692,6 +2692,26 @@ class TestADKRealtimeRecovery:
         await runner.disconnect()
 
     @pytest.mark.asyncio
+    async def test_a_post_whose_send_fails_reaches_the_next_socket(self, monkeypatch):
+        """The pool takes a post out of its outbox before the send: text is kept in the history before it is sent, so
+        a socket that fails while it is sent loses nothing; the next socket is seeded with it, and answers it."""
+        client = _FakeLiveClient([], [])
+        runner, events = await self._connect(monkeypatch, client)
+
+        async def socket_closed(*args, **kwargs):
+            raise ConnectionError("1006 abnormal closure")
+
+        client.sessions[0].send_client_content = socket_closed
+        with pytest.raises(ConnectionError):
+            await runner.send_text("[Team update] J1 finished.")
+        runner._recover_soon("socket error: 1006 abnormal closure")  # as the failing socket's listener does
+        await self._until(lambda: any(kind == "reconnected" for kind, _ in events))
+
+        turns, turn_complete = client.sessions[1].client_content[0]
+        assert "[Team update] J1 finished." in _seen(turns) and turn_complete
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
     async def test_a_failed_reconnect_whose_socket_also_fails_to_close_is_retried(self, monkeypatch):
         """The failed attempt's close raising ended the recovery: no next attempt and no error, so the call was left
         with no socket and nothing to replace it."""
