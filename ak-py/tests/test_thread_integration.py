@@ -296,6 +296,31 @@ class TestEndToEnd:
         assert listing.status_code == 200
         assert [t["session_id"] for t in listing.json()["threads"]] == ["s-e2e"]
 
+    def test_a_labelled_reply_replays_as_an_object_with_its_label(self, thread_enabled, registered_agent):
+        """The whole point of #763: what rendered live must render again on reload.
+
+        Both messages go into one thread deliberately — the unlabelled one is the guarantee that an
+        application which never opted into A2UI reads exactly what it read before.
+        """
+        handler = AgentThreadRequestHandler()
+        handler.chat_service = FakeChatService(reply=AgentReplyAny(content={"version": "v1.0"}, media_type=MEDIA_TYPE))
+        app = FastAPI()
+        app.include_router(handler.get_router())
+        client = TestClient(app)
+        chat = {"session_id": "s-label", "user_id": "alice", "agent": registered_agent.name}
+
+        assert client.post("/api/v1/chat", json={**chat, "prompt": "show me the form"}).status_code == 200
+        handler.chat_service = FakeChatService(reply=AgentReplyText(response="plain words"))
+        assert client.post("/api/v1/chat", json={**chat, "prompt": "and in words"}).status_code == 200
+
+        messages = client.get("/api/v1/threads/s-label").json()["messages"]
+        labelled, unlabelled = messages[1], messages[3]
+
+        assert labelled["content"] == {"version": "v1.0"}
+        assert labelled["media_type"] == MEDIA_TYPE
+        assert unlabelled["content"] == "plain words"
+        assert "media_type" not in unlabelled
+
 
 class TestThreadMessageShape:
     """What ``ThreadMessage`` accepts, refuses, and puts on the wire (#763).
