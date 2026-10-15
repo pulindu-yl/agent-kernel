@@ -144,7 +144,7 @@ class TestThreadRecorder:
 
         recorder.post_run(req, AgentReplyText(response="agent says hi"))
 
-        manager.append_message.assert_called_once_with("s1", "assistant", "agent says hi")
+        manager.append_message.assert_called_once_with("s1", "assistant", "agent says hi", media_type=None)
 
 
 class TestAgentThreadRequestHandler:
@@ -362,54 +362,46 @@ class TestThreadMessageShape:
 
 
 class TestThreadContentEncoding:
-    """Both recording paths must store the same bytes for the same reply.
+    """Both recording paths must store the same content and label for the same reply.
 
     ``ThreadRecorder.post_run`` is called with three different types — an ``AgentReply`` from the
     direct handler, the accumulated text from the streaming one, and the response body's ``result``
     value from the queue runner, which for a labelled reply is a dict.
     """
 
-    def test_agent_reply_records_json(self):
-        from agentkernel.core.model import AgentReplyAny
-        from agentkernel.integration.thread.recorder import ThreadRecorder
+    def test_a_labelled_reply_records_the_object_and_its_label(self):
+        """The direct handler's shape: the reply carries its own label."""
+        reply = AgentReplyAny(content={"a": 1}, media_type=MEDIA_TYPE)
 
-        assert ThreadRecorder._as_thread_content(AgentReplyAny(content={"a": 1})) == '{"a": 1}'
+        assert ThreadRecorder._as_thread_message(reply) == ({"a": 1}, MEDIA_TYPE)
+
+    def test_a_labelled_queue_body_records_the_object_and_its_label(self):
+        """The queue runner's shape: the label arrives beside the result, not on it."""
+        assert ThreadRecorder._as_thread_message({"a": 1}, MEDIA_TYPE) == ({"a": 1}, MEDIA_TYPE)
+
+    def test_an_unlabelled_agent_reply_records_json(self):
+        """The label is the switch: without one, a structured reply is still text."""
+        assert ThreadRecorder._as_thread_message(AgentReplyAny(content={"a": 1})) == ('{"a": 1}', None)
 
     def test_text_reply_records_its_text(self):
-        from agentkernel.core.model import AgentReplyText
-        from agentkernel.integration.thread.recorder import ThreadRecorder
-
-        assert ThreadRecorder._as_thread_content(AgentReplyText(response="hello")) == "hello"
+        assert ThreadRecorder._as_thread_message(AgentReplyText(response="hello")) == ("hello", None)
 
     def test_accumulated_stream_text_passes_through(self):
-        from agentkernel.integration.thread.recorder import ThreadRecorder
+        assert ThreadRecorder._as_thread_message("hel" + "lo") == ("hello", None)
 
-        assert ThreadRecorder._as_thread_content("hel" + "lo") == "hello"
+    def test_an_unlabelled_dict_records_json_not_a_python_repr(self):
+        content, label = ThreadRecorder._as_thread_message({"root": None, "ok": True})
 
-    def test_dict_records_json_not_a_python_repr(self):
-        from agentkernel.integration.thread.recorder import ThreadRecorder
-
-        content = ThreadRecorder._as_thread_content({"root": None, "ok": True})
-
-        assert content == '{"root": null, "ok": true}'
+        assert (content, label) == ('{"root": null, "ok": true}', None)
         assert "'" not in content
         assert "None" not in content
 
-    def test_both_paths_record_identical_bytes(self):
+    def test_both_paths_record_the_same_pair(self):
         """The queue path and the direct path hold different types for the same reply."""
-        import json
-
-        from agentkernel.core.model import AgentReplyAny
-        from agentkernel.integration.thread.recorder import ThreadRecorder
-
         content = {"version": "v1.0", "createSurface": {"surfaceId": "s1"}}
-        reply = AgentReplyAny(content=content, media_type="application/a2ui+json")
+        reply = AgentReplyAny(content=content, media_type=MEDIA_TYPE)
 
-        direct = ThreadRecorder._as_thread_content(reply)
-        queue = ThreadRecorder._as_thread_content(content)
-
-        assert direct == queue
-        assert json.loads(direct) == content
+        assert ThreadRecorder._as_thread_message(reply) == ThreadRecorder._as_thread_message(content, MEDIA_TYPE) == (content, MEDIA_TYPE)
 
 
 class TestThreadPauseAndResume:
