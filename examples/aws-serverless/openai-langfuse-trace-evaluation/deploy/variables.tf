@@ -17,6 +17,7 @@ variable "is_production" {
 variable "openai_api_key" {
   description = "OpenAI API Key, used by the agent and the judges"
   type        = string
+  sensitive   = true
 }
 
 variable "langfuse_public_key" {

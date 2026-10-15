@@ -358,8 +358,9 @@ class LogfireTraceFetcher(TraceFetcher):
   §Configuration). The secret manager reads the environment first, so an `env` deployment behaves as
   a plain `os.getenv`, and an `aws_ssm` deployment reads the token from SSM without exporting it. A
   `None` token raises `AKConfigError` naming `LOGFIRE_READ_TOKEN` in the constructor.
-- Client: `from logfire.experimental.query_client import LogfireQueryClient`. That path exists in
-  every `logfire>=3.0`; `logfire.query_client` is a later alias. Used as a context manager, with
+- Client: `from logfire.query_client import LogfireQueryClient`, falling back to
+  `logfire.experimental.query_client` when that import fails: logfire 5 removed the experimental path,
+  and versions before the alias have only it. Used as a context manager, with
   `base_url=None` letting the SDK take the region from the token.
 - SQL shape:
   `SELECT {_COLUMNS} FROM records WHERE kind = 'span' AND … ORDER BY start_timestamp DESC LIMIT {page}`,
@@ -446,11 +447,13 @@ class TraceloopTraceFetcher(TraceFetcher):
   - `from_timestamp_sec` / `to_timestamp_sec`: `int(start.timestamp())` / `math.ceil(end.timestamp())`, so
     the last partial second isn't cut off; the exact end is applied locally
   - `limit`: `min(500, query.limit)`
-  - `sort_by=timestamp`, `sort_order=desc`
+  - `sort_order=DESC`, with no `sort_by`: although documented, every `sort_by` value (`timestamp`
+    included) makes the API return no spans, while `sort_order` alone orders by timestamp (checked live)
   - `span_name`: when `name` is set
-  - `filters`: a JSON list of `{id, operator, value}`:
+  - `filters`: a JSON list of `{id, operator, value}`, or `{id, operator, values}` for `in`:
     - `session_id` → `_SESSION_ATTRIBUTE equals …`
-    - `trace_ids` → `trace_id in […]`
+    - `trace_ids` → `trace_id in […]`, in `values`: the API reference shows `value`, but the API rejects
+      that with a 400
     - No kind filter: `kinds` is applied only locally, by `matches`.
       - A span's kind can come from either `gen_ai.operation.name` or `traceloop.span.kind`
         (`OTelSpanClassifier` rows 2 and 3). The SDK's own `@tool` / `@agent` decorators set only

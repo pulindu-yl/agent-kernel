@@ -710,7 +710,7 @@ yours:
 ```python
 import pytest
 
-from agentkernel.trace import FetchedSpan, TraceQuery
+from agentkernel.trace import BaseTrace, FetchedSpan, TraceQuery
 from agentkernel.trace.testing import TraceFetchContract
 
 
