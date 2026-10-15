@@ -100,7 +100,7 @@ Wraps a framework-specific agent. Key properties:
 Encapsulates framework-specific execution logic:
 
 - **`run(agent, session, requests) -> AgentReply`**: Async method that executes the agent with the given requests within a session context
-- **`stream(agent, session, requests) -> AsyncGenerator[StreamEvent, None]`**: Abstract async generator that yields AK stream events (`core/event.py`: `MessageStart`/`TextDelta`/`MessageEnd`, `ReasoningStart`/`ReasoningDelta`/`ReasoningEnd`, `ToolCallStart`/`ToolCallArgs`/`ToolCallEnd`/`ToolCallResult`, `StepStart`/`StepEnd`) for streaming execution (`execution.mode: stream`) — never a bare `str`; `StreamChunk.event` is a discriminated union and rejects one with a `ValidationError`. Frameworks without native token streaming (CrewAI, smolagents) implement it by raising `NotImplementedError`
+- **`stream(agent, session, requests) -> AsyncGenerator[StreamEvent, None]`**: Abstract async generator that yields AK stream events (`core/event.py`: `MessageStart`/`TextDelta`/`MessageEnd`, `ReasoningStart`/`ReasoningDelta`/`ReasoningEnd`, `ToolCallStart`/`ToolCallArgs`/`ToolCallEnd`/`ToolCallResult`, `StepStart`/`StepEnd`, `DataMessage`) for streaming execution (`execution.mode: stream`) — never a bare `str`; `StreamChunk.event` is a discriminated union and rejects one with a `ValidationError`. Frameworks without native token streaming (CrewAI, smolagents) implement it by raising `NotImplementedError`
 - **Human in the loop** (#606): **`supports_pause`** is a `Runner` property defaulting to **`False`** — unlike `supports_streaming`, which defaults True, because `stream()` is abstract while `resume()` is a non-abstract raising default, and a True default would have a bring-your-own runner advertise a capability it lacks. **`resume(agent, session, requests, decisions, record)`** and **`resume_stream(...)`** continue a paused run; both raise by default. **`Runner.CANCELLED_DECISION_MESSAGE`** is the wording sent when a human *cancels* rather than denies — only LangGraph carries three-valued decisions natively, so on the others this is what keeps "nobody decided" from reading as a refusal; override per runner.
   - Each adapter's `resume()` mirrors its own `run()` envelope — same `ToolContext`, same framework-context load/store, same resolved run options — and writes/clears the record **inside the `try` after a successful call**, never in a `finally`. Framework-specific rejections go **above the `try`**, because the adapter's blanket `except Exception` would otherwise flatten them into a generic reply.
   - **Clearing is the adapter's alone — `Runtime` does not tidy up afterwards.** It cannot tell a failure from an ordinary reply, since an adapter reports framework failures as `AgentReplyText`, so a fallback there would delete the record on a transient error and leave the human's decision unappliable. The record surviving *is* the retry signal. An adapter that forgets to clear leaves a phantom pause; one that clears too early loses a retry.
@@ -143,7 +143,7 @@ Global orchestrator and agent registry:
   3. **Every** event passes through `PostHook.on_stream_event()` (return the event to pass it, a modified event of the same `type` to rewrite it, `None` to drop the whole chunk, or a `list[StreamEvent]` to emit several in its place — a list is emitted as-is and ends the chain for that event). A post-hook raising `StreamHalt` ends the run: `StreamBoundaryTracker` (`core/runtime.py`, not a module of its own, unexported) supplies the closes for any boundary still open, then one `StreamChunk(error=..., done=True)` is yielded and the session is **not** stored; any other exception propagates unchanged
   4. Yields a `StreamChunk(delta=..., event=...)` per event — `delta` is populated only for `TextDelta` (every other event type carries `event` alone) — then a final `StreamChunk(done=True)`
   5. Stores session and clears volatile cache in `finally`, same as `run()`
-- **System hooks**: Automatically includes `InputGuardrailFactory` as system pre-hook, `OutputGuardrailFactory` as system post-hook
+- **System hooks**: Automatically includes `InputGuardrailFactory`, `MultimodalPreHookFactory` and `SandboxPreHookFactory` as system pre-hooks, and `OutputGuardrailFactory` then `A2UIPostHookFactory` as system post-hooks. Both lists are built once per process and cached on the class (`_get_system_pre_hooks` / `_get_system_post_hooks`), so a hook factory reads the config at first use, not at import. Order is load-bearing on the post-hook side: the output guardrail inspects the reply before the A2UI hook can relabel it as a structured payload
 - **Context manager**: `with Runtime(sessions):` sets an isolated runtime as current
 
 ### AgentService (`ak-py/src/agentkernel/core/service.py`)
@@ -272,7 +272,7 @@ Pydantic-based configuration:
 - **Auto-initialized** at import time via `AKConfig._set()`
 - **Config sources** (priority order): environment variables (`AK_` prefix) → config file (YAML/JSON, default `config.yaml`) → defaults
 - **Override path**: Set `AK_CONFIG_PATH_OVERRIDE` env var
-- **Key sections**: `session`, `api`, `websocket_api`, `a2a`, `mcp`, `slack`, `whatsapp`, `messenger`, `instagram`, `telegram`, `teams`, `gmail`, `multimodal`, `thread`, `schedule`, `okf`, `trace`, `guardrail`, `sandbox`, `secret`, `execution`, `logging`. Every messaging block carries an `outbound_adapter` dotted-path override (#524)
+- **Key sections**: `session`, `api`, `websocket_api`, `a2a`, `mcp`, `a2ui`, `slack`, `whatsapp`, `messenger`, `instagram`, `telegram`, `teams`, `gmail`, `multimodal`, `thread`, `schedule`, `okf`, `trace`, `guardrail`, `sandbox`, `secret`, `execution`, `logging`. Every messaging block carries an `outbound_adapter` dotted-path override (#524)
 - **Optional (capability-gating) sections**: `thread`, `schedule` and `okf` are `Optional` — the presence of the block is the enabled-check, so they have no default value
 
 ## Request/Reply Model (`ak-py/src/agentkernel/core/model.py`)
@@ -282,7 +282,7 @@ Pydantic-based configuration:
   - `AgentReplyText`, 
   - `AgentReplyImage`
   - `AgentPausedReplyAny` (#606): a **subclass of `AgentReplyAny`**, not a new union member, so the `AgentReply` union and every `isinstance` tuple over it are untouched. Carries `run_id`, `session_id`, `agent`, `interruptions: list[PausedInterruption]`; `content` is derived from those by a validator and never set independently. The opaque per-framework resume state is **never** on it — a reply crosses the queue transport and reaches clients
-  - `AgentReplyAny`: `content: dict`: returned when the agent is configured for structured output (OpenAI `output_type`, LangGraph `response_format`, ADK `output_schema`, CrewAI module-level `output_pydantic`/`output_json`, Smolagents dict/Pydantic `final_answer`, Pydantic AI `output_type`); `str(reply)` returns the JSON-serialized content. Non-streaming only.
+  - `AgentReplyAny`: `content: dict | list` + `media_type: str | None`: returned when the agent is configured for structured output (OpenAI `output_type`, LangGraph `response_format`, ADK `output_schema`, CrewAI module-level `output_pydantic`/`output_json`, Smolagents dict/Pydantic `final_answer`, Pydantic AI `output_type`); `str(reply)` returns the JSON-serialized content. Non-streaming only. `content` is a `JSONPayload` (`core/util/payload.py`), so it is normalised to plain JSON types on validation and a value with no JSON form — including `NaN` — raises at construction; `from_output` still returns `None` for a bare list, so no adapter's behaviour changed. `media_type` is unset by default and never set by an adapter: a post-hook applies it, and `ResponseBuilder.build_response` puts `content` in `result` as an object only when it is set. Without it every surface serialises exactly as it did before the field existed.
   - `StreamChunk`: `delta: str | None`, `event: StreamEvent | None`, `done: bool`, `error: str | None`, `session_id: str | None`: yielded by `Runtime.stream()` / `AgentService.stream_multi()` for streaming; `delta` is populated only for `TextDelta` events (back-compat for plain-text consumers), `event` carries the full `StreamEvent` (including tool calls and reasoning)
 - Type aliases: `AgentRequest = Union[...]`, `AgentReply = Union[...]`
 
@@ -982,6 +982,11 @@ ak-py/src/agentkernel/
 │   ├── adk/                 # Google ADK adapter
 │   ├── smolagents/          # Smolagents adapter
 │   └── pydanticai/          # Pydantic AI adapter
+├── a2ui/                    # A2UI labelling capability: A2UIPostHook (labels a parsed JSON reply
+│   │                        #   `application/a2ui+json`), NoOpA2UIPostHook, A2UIPostHookFactory.
+│   │                        #   A capability, not an integration — it adds no surface of its own,
+│   │                        #   and it is the only place in src/ that names A2UI
+│   └── hook.py
 ├── api/                     # API layers
 │   ├── handler.py           # REST API handler
 │   ├── http.py              # RESTAPI class (run() delegates to pipeline IOHandler: see activation rule)
