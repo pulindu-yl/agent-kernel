@@ -1,16 +1,28 @@
+import datetime
+import decimal
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from agentkernel.core.base import Agent, Runner
 from agentkernel.core.config import AKConfig, _ThreadStoreConfig
 from agentkernel.core.model import AgentReplyAny, AgentReplyText, AgentRequestText, BaseRunRequest, ScheduleSpec, StreamChunk
 from agentkernel.core.runtime import Runtime
-from agentkernel.integration.thread import AgentThreadRequestHandler, ConversationThreadManager, ThreadNamingStrategy, ThreadRecorder
+from agentkernel.integration.thread import (
+    AgentThreadRequestHandler,
+    ConversationThreadManager,
+    ThreadAttachment,
+    ThreadMessage,
+    ThreadNamingStrategy,
+    ThreadRecorder,
+)
 from agentkernel.integration.thread.store.in_memory import InMemoryThreadStore
+
+MEDIA_TYPE = "application/a2ui+json"
 
 
 class EchoNaming(ThreadNamingStrategy):
@@ -283,6 +295,70 @@ class TestEndToEnd:
         listing = client.get("/api/v1/threads", params={"user_id": "alice"})
         assert listing.status_code == 200
         assert [t["session_id"] for t in listing.json()["threads"]] == ["s-e2e"]
+
+
+class TestThreadMessageShape:
+    """What ``ThreadMessage`` accepts, refuses, and puts on the wire (#763).
+
+    The union is the part worth pinning rather than trusting: ``str | JSONPayload`` leans on
+    pydantic's smart union to keep a string a string, and a reply whose text happens to look like
+    JSON is exactly the value that would be wrong to promote to an object.
+    """
+
+    def test_text_content_stays_text(self):
+        assert ThreadMessage(role="assistant", content="hello").content == "hello"
+
+    def test_a_json_looking_string_is_not_promoted_to_an_object(self):
+        message = ThreadMessage(role="assistant", content='{"a": 1}')
+
+        assert message.content == '{"a": 1}'
+        assert message.media_type is None
+
+    def test_object_content_is_normalised_like_a_reply(self):
+        """The same normalisation ``AgentReplyAny.content`` runs, so neither store holds a datetime."""
+        raw = {"submittedAt": datetime.datetime(2026, 9, 22, 14, 30), "amount": decimal.Decimal("250.00")}
+
+        message = ThreadMessage(role="assistant", content=raw, media_type=MEDIA_TYPE)
+
+        assert message.content == AgentReplyAny(content=raw).content
+        assert message.content == {"submittedAt": "2026-09-22T14:30:00", "amount": "250.00"}
+
+    def test_a_scalar_is_refused(self):
+        with pytest.raises(ValidationError):
+            ThreadMessage(role="assistant", content=42)
+
+    def test_an_object_without_a_label_is_refused(self):
+        with pytest.raises(ValidationError, match="media_type is unset"):
+            ThreadMessage(role="assistant", content={"a": 1})
+
+    def test_a_label_over_text_is_refused(self):
+        with pytest.raises(ValidationError, match="content is text"):
+            ThreadMessage(role="assistant", content="hello", media_type=MEDIA_TYPE)
+
+    def test_a_row_written_before_the_field_existed_still_reads(self):
+        message = ThreadMessage.model_validate_json('{"message_id": "m1", "role": "assistant", "content": "hi"}')
+
+        assert (message.content, message.media_type) == ("hi", None)
+
+    def test_the_wire_form_omits_an_unset_label(self):
+        wire = ThreadMessage(role="assistant", content="hello").to_wire()
+
+        assert "media_type" not in wire
+        assert wire["content"] == "hello"
+
+    def test_the_wire_form_carries_a_set_label(self):
+        wire = ThreadMessage(role="assistant", content={"a": 1}, media_type=MEDIA_TYPE).to_wire()
+
+        assert wire["media_type"] == MEDIA_TYPE
+        assert wire["content"] == {"a": 1}
+
+    def test_the_wire_form_keeps_an_attachments_unset_fields(self):
+        """The regression guard for excluding a named field rather than ``exclude_none``, which recurses."""
+        attachment = ThreadAttachment(attachment_id="a1")
+
+        wire = ThreadMessage(role="assistant", content="hello", attachments=[attachment]).to_wire()
+
+        assert wire["attachments"] == [{"attachment_id": "a1", "name": None, "mime_type": None}]
 
 
 class TestThreadContentEncoding:
