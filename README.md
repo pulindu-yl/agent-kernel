@@ -43,7 +43,7 @@ Most agent frameworks help you build a *prototype*. **Agent Kernel is the platfo
 | 🧠 **Stateful & Knowledge-Aware** | Pluggable session stores (Redis, Valkey, DynamoDB, Cosmos DB) + knowledge bases (ChromaDB, Neo4j, Starburst, Open Knowledge Format bundles). |
 | 💬 **Channels Built-In** | Slack, WhatsApp, Teams, Telegram, Gmail, Messenger, Instagram, and LiveKit — out of the box. |
 | 🔍 **Production Observability** | LangFuse, OpenLLMetry, Pydantic Logfire, and AWS CloudWatch tracing wired in. Every agent run — visible, with LLM and tool calls where the framework supports it. |
-| 🤝 **Open Standards** | Native **MCP** (Model Context Protocol), **A2A** (Agent-to-Agent), and **AG-UI** (streamed event protocol for agent-facing frontends) support. |
+| 🤝 **Open Standards** | Native **MCP** (Model Context Protocol), **A2A** (Agent-to-Agent), **AG-UI** (streamed event protocol for agent-facing frontends), and **A2UI** (generative UI documents, labelled from config) support. |
 | 🆓 **Apache 2.0** | No licensing fees. No vendor lock-in. Production-ready open source. |
 
 > ⭐ **If Agent Kernel is solving real problems for you, please star the repo — it's the single best way to help us grow.**
