@@ -51,6 +51,7 @@ export interface AgentKernelArchDiagramProps {
   accentColor?: string;
 }
 
+/** Render framework, runtime capability, and deployment layers with animation when scrolled into view. */
 export default function AgentKernelArchDiagram({ accentColor }: AgentKernelArchDiagramProps) {
   const sectionRef = useRef<HTMLElement>(null);
   const [visible, setVisible] = useState(false);

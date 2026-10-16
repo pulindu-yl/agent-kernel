@@ -781,6 +781,7 @@ function ProblemTable() {
 
 /* ─── Core Features ─────────────────────────────────────────────────────── */
 
+/** Render core capability cards with links to their documentation. */
 function CoreFeatures() {
   const sectionRef = useRef<HTMLElement>(null);
 
@@ -1166,6 +1167,7 @@ function SandboxSection() {
 
 /* ─── Framework Support ─────────────────────────────────────────────────── */
 
+/** Render supported framework links and the card for running multiple frameworks together. */
 function FrameworkSupport() {
   const sectionRef = useRef<HTMLElement>(null);
 

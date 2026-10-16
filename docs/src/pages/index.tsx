@@ -1060,6 +1060,7 @@ function Levels() {
 
 /* ─── Page Export ───────────────────────────────────────────────────────── */
 
+/** Render the landing page using the configured site title and tagline. */
 export default function Home() {
   const { siteConfig } = useDocusaurusContext();
   const backgroundRef = useRef<{

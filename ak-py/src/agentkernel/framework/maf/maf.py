@@ -58,6 +58,7 @@ class MAFSession:
     """
 
     def __init__(self) -> None:
+        """Initialize session data with no stored native state."""
         self._state: dict[str, Any] | None = None
 
     def get_state(self) -> dict[str, Any] | None:
@@ -79,6 +80,7 @@ class MAFRunner(Runner):
     """
 
     def __init__(self) -> None:
+        """Initialize the runner under the MAF session key."""
         # Must match the session key: Session.get_framework_session() resolves it via the runner name.
         super().__init__(FRAMEWORK)
 
@@ -100,10 +102,12 @@ class MAFRunner(Runner):
     def _attachment_content(data: str, mime_type: str | None, kind: str) -> Content:
         """
         Converts one image or file attachment into a MAF Content item.
-        :param data: A URL, a data URI, or raw base64 data.
-        :param mime_type: The MIME type declared on the request, if any.
+        :param data: An HTTP, HTTPS, or S3 URL, a data URI, or raw base64 data.
+        :param mime_type: The MIME type for URLs or raw base64 data; data URIs supply their own MIME type.
         :param kind: "image" or "file", used in error messages.
         :return: A URI Content item for URLs, otherwise a data Content item.
+        :raises ValueError: If raw base64 data has no MIME type or the encoded data contains non-ASCII characters.
+        :raises binascii.Error: If base64 decoding fails, for example because of incorrect padding.
         """
         if data.startswith(("http://", "https://", "s3://")):
             return Content.from_uri(uri=data, media_type=mime_type)
@@ -118,8 +122,12 @@ class MAFRunner(Runner):
     def _process_requests(cls, requests: list[AgentRequest]) -> tuple[str, list[str | Content]]:
         """
         Process requests and extract prompt text and MAF Content items.
+        Unsupported request types, including AgentRequestAny, are ignored. The prompt joins text and attachment
+        labels with newlines; the contents retain request order and carry the actual attachments.
         :param requests: The requests to process.
         :return: Tuple of (prompt, contents of the single user message sent to MAF).
+        :raises ValueError: If an attachment has no data, raw base64 data has no MIME type, or encoded data is not ASCII.
+        :raises binascii.Error: If an attachment cannot be base64-decoded.
         """
         prompt_parts: list[str] = []
         inputs: list[str | Content] = []
@@ -154,7 +162,9 @@ class MAFRunner(Runner):
         :param session: The AK session, or None for a stateless run.
         :param options: The run options resolved for this run.
         :param state: A serialized native session to restore instead of the stored one: a paused run's snapshot.
+            An empty state starts a new native session.
         :return: Tuple of (native run kwargs, native session or None, framework context loaded this turn).
+        :raises TypeError: If the stored framework context is not a dict.
         """
         if session is None:
             return self._native_kwargs(options), None, None
@@ -202,10 +212,13 @@ class MAFRunner(Runner):
     async def run(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AgentReply:
         """
         Runs the MAF agent with the provided multi modal inputs.
+        No supported input returns a text reply explaining that no valid content was found. Errors during request
+        preparation, option resolution, native execution, or session finalization are converted to text error replies.
         :param agent: The MAF agent to run.
         :param session: The session to use for the agent.
         :param requests: The requests to the agent.
         :return: The result of the agent's execution, or a paused reply when a tool needs approval.
+        :raises ValueError: If this runner has an unanswered paused run in the session.
         """
         self._reject_while_a_decision_is_outstanding(session)
 
@@ -237,10 +250,15 @@ class MAFRunner(Runner):
     async def stream(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AsyncGenerator[StreamEvent, None]:
         """
         Streams the MAF agent response as Agent Kernel stream events, ending in `RunPaused` when a tool needs approval.
+        No supported input yields no events. Request preparation, option resolution, and native execution errors
+        propagate during iteration; session finalization errors are suppressed after the native stream completes.
         :param agent: The MAF agent to run.
         :param session: The session to use for the agent.
         :param requests: The requests to the agent.
         :return: An async generator yielding StreamEvent objects.
+        :raises ValueError: If this runner has an unanswered pause, attachment validation fails, or a new pause has no session.
+        :raises TypeError: If the stored framework context is not a dict.
+        :raises binascii.Error: If an attachment cannot be base64-decoded.
         """
         self._reject_while_a_decision_is_outstanding(session)
 
@@ -283,12 +301,16 @@ class MAFRunner(Runner):
 
         The native session is restored from the record's snapshot, not the stored one, so the pause stays
         resumable whatever the session does next; the decisions travel as one user message of approval responses.
+        Preparation, native execution, and finalization errors become text error replies. A native execution failure
+        leaves the paused record available for retry; once the conversation holding the outcome is stored, the record is
+        cleared before the framework context is written, so a context write-back failure cannot make an approved tool run twice.
         :param agent: The agent that paused.
         :param session: The session holding the record.
         :param requests: The hook-processed request list, carrying the resume request.
         :param decisions: One per interruption being answered.
         :param record: The record Runtime validated.
         :return: The continued run's reply, which may itself be paused again.
+        :raises ValueError: If any pending approval is unanswered, a decision has a payload, or requests include a nonempty text prompt.
         """
         self._reject_unresumable(decisions, record, requests)
 
@@ -319,12 +341,17 @@ class MAFRunner(Runner):
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Streaming counterpart of `resume()`, mapping events exactly as `stream()` does.
+        Restores the paused snapshot. Preparation and native execution errors propagate during iteration and leave the
+        record for a retry; after the stream drains, the record is cleared once the conversation is stored, before the
+        framework context, whose write-back errors are logged rather than raised.
         :param agent: The agent that paused.
         :param session: The session holding the record.
         :param requests: The hook-processed request list, carrying the resume request.
         :param decisions: One per interruption being answered.
         :param record: The record Runtime validated.
         :return: The events the continued run produces, ending in RunPaused if it pauses again.
+        :raises ValueError: If any pending approval is unanswered, a decision has a payload, or requests include a nonempty text prompt.
+        :raises TypeError: If the stored framework context is not a dict.
         """
         self._reject_unresumable(decisions, record, requests)
 
@@ -357,6 +384,8 @@ class MAFRunner(Runner):
         none); tool events are correlated by MAF's own `call_id`. `streams` / `open_calls` / `call_ids` are locals —
         the runner is shared across sessions. The pause is read off the final response, as `run()` reads it, so the
         streamed and non-streamed paths cannot drift apart.
+        Native execution and event mapping errors propagate. Session finalization errors are logged rather than raised;
+        after a normal drain a resumed record is cleared once the conversation is stored, and kept if storing it fails.
         :param agent: The agent being run.
         :param session: The AK session.
         :param message: The user message to send: the prompt, or the approval responses on a resume.
@@ -401,6 +430,7 @@ class MAFRunner(Runner):
         :param result: The native `AgentResponse`.
         :param prompt: The text prompt sent to the agent.
         :return: A paused reply, a structured reply, or a text reply.
+        :raises ValueError: If the result requires approval but an AK or native session is missing.
         """
         approvals = self._approval_requests(result)
         if approvals:
@@ -416,7 +446,7 @@ class MAFRunner(Runner):
     def _approval_requests(result: AgentResponse) -> list[Content]:
         """
         :param result: The native `AgentResponse`.
-        :return: The tool approvals the run is waiting on; empty when it finished.
+        :return: The tool approvals the run is waiting on; empty when no function approvals are requested.
         """
         return [request for request in result.user_input_requests if request.type == "function_approval_request"]
 
@@ -429,7 +459,7 @@ class MAFRunner(Runner):
         Replaces rather than appends: MAF keeps one conversation per session, so an earlier pause of this runner
         could never be resumed. Scoped to this runner, since a pause another framework holds on the same session
         is a separate conversation and still answerable. The record carries the native session snapshot and the
-        pending requests, so the resume needs nothing else from the session.
+        pending requests, so the native conversation can be restored on another replica.
         :param agent: The agent that paused.
         :param session: The session the record is written to.
         :param native_session: The native session holding the pending tool calls.
@@ -684,6 +714,7 @@ class MAFAgent(BaseAgent):
     def __init__(self, name: str, runner: Runner, agent: Agent):
         """
         Initializes a MAFAgent instance.
+        Attaches configured system tools and appends system instructions to the supplied native agent.
         :param name: The name the agent is registered under.
         :param runner: The runner that executes the agent.
         :param agent: The native MAF agent.
@@ -725,6 +756,7 @@ class MAFAgent(BaseAgent):
         MAF rejects duplicate tool names at run time, so a tool whose name is already taken is skipped: silently
         when it wraps the same function (the native agent was wrapped before), with a warning otherwise.
         :param tool: Raw Python callable to attach.
+        :raises TypeError: If tool is not callable.
         """
         tools = self.agent.default_options.setdefault("tools", [])
         for wrapped in MAFToolBuilder.bind([tool]):
@@ -761,9 +793,11 @@ class MAFModule(Module):
 
     def __init__(self, agents: list[Agent], runner: MAFRunner | None = None):
         """
-        Initializes a MAFModule instance.
+        Initializes a MAFModule instance and registers its agents in the current runtime.
         :param agents: List of MAF agents in the module.
-        :param runner: Custom runner associated with the module.
+        :param runner: Custom runner; when omitted, uses the configured tracer's MAF runner or an untraced MAFRunner.
+        :raises ValueError: If a native agent's name is None.
+        :raises Exception: If an agent name is already registered in the current runtime.
         """
         super().__init__()
         if runner is not None:
@@ -780,6 +814,7 @@ class MAFModule(Module):
         :param agent: The native MAF agent; it must have an explicit name.
         :param agents: All agents in the module.
         :return: The MAFAgent wrapper.
+        :raises ValueError: If the native agent's name is None.
         """
         if agent.name is None:
             raise ValueError("MAF agents passed to MAFModule must have an explicit name= — AK registers agents by name immediately.")
@@ -788,8 +823,12 @@ class MAFModule(Module):
     def load(self, agents: list[Agent]) -> MAFModule:
         """
         Loads and registers the native MAF agents, replacing the current ones.
+        Existing agents are unloaded first. If wrapping or registration fails, newly registered agents are unloaded
+        and the error propagates.
         :param agents: List of native MAF agents.
         :return: This module.
+        :raises ValueError: If a native agent's name is None.
+        :raises Exception: If an agent name is already registered in the current runtime.
         """
         super().load(agents)
         return self
