@@ -378,6 +378,16 @@ class TestTraceFetcher:
         assert [span.span_id for span in spans] == ["b", "c"]
         assert fetcher.fetch_spans(TraceQuery(start=START, end=END))[0] is first_a
 
+    def test_fetch_warns_only_when_the_limit_is_reached(self, caplog):
+        fetcher = _ScriptedFetcher([_span("a", 1), _span("b", 2), _span("c", 3)])
+        with caplog.at_level("WARNING", logger="ak.trace.fetch"):
+            fetcher.fetch_spans(TraceQuery(start=START, end=END, limit=4))
+        assert "reached its limit" not in caplog.text
+        with caplog.at_level("WARNING", logger="ak.trace.fetch"):
+            spans = fetcher.fetch_spans(TraceQuery(start=START, end=END, limit=2))
+        assert [span.span_id for span in spans] == ["b", "c"]
+        assert "fake fetch reached its limit of 2 spans" in caplog.text
+
     def test_fetch_keeps_spans_sharing_an_id_across_traces(self):
         fetcher = _ScriptedFetcher([_span("a", 1, trace_id="t1"), _span("a", 2, trace_id="t2")])
         spans = fetcher.fetch_spans(TraceQuery(start=START, end=END))

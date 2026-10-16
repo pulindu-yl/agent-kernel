@@ -608,7 +608,7 @@ for span in tool_calls:
 | `session_id` | Only spans of this AK session |
 | `trace_ids` | Only spans of these traces (fetch tool calls first, then their whole traces) |
 | `name` | Exact span name |
-| `limit` | Maximum spans returned (default 1000); the most recent are kept |
+| `limit` | Maximum spans returned (default 1000); the most recent are kept, and a warning is logged when a fetch reaches it |
 
 Each result is a `FetchedSpan` (trace/span/parent ids, name, kind, status, start/end time, session id, input, output,
 usage, attributes) plus `raw`, the provider's full record. Its `provider` is the tracer's `trace.type` name

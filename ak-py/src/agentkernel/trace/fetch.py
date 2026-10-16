@@ -339,7 +339,7 @@ class TraceFetcher(ABC):
     def fetch_spans(self, query: TraceQuery) -> list[FetchedSpan]:
         """
         Fetches the spans matching the query, oldest first. When more than ``limit`` match, the most
-        recent ones are kept.
+        recent ones are kept, and a warning is logged when the result reaches the limit.
         """
         # matches() resolves window() on every call, so a defaulted end (now) would move between calls
         start, end = query.window()
@@ -347,7 +347,16 @@ class TraceFetcher(ABC):
         spans_by_id: dict[tuple[str, str], FetchedSpan] = {}
         for span in self._query_provider(query):
             spans_by_id.setdefault(self._span_key(span), span)
-        return FetchedSpan.oldest_first(spans_by_id.values())[-query.limit :]
+        spans = FetchedSpan.oldest_first(spans_by_id.values())[-query.limit :]
+        if len(spans) >= query.limit:
+            # the paging stops at the limit, so whether older spans matched is unknown, only possible
+            self._log.warning(
+                "The %s fetch reached its limit of %d spans; older matching spans may be left out, "
+                "and their traces may come back without a root. Narrow the window or raise limit",
+                self.provider,
+                query.limit,
+            )
+        return spans
 
     @abstractmethod
     def _query_provider(self, query: TraceQuery) -> Iterable[FetchedSpan]:
