@@ -33,7 +33,9 @@ class CloudWatchTraceFetcher(TraceFetcher):
     _FAILED = {"Failed", "Cancelled", "Timeout", "Unknown"}
 
     # Logs Insights equivalents of OTelSpanClassifier for the conventions CloudWatch runners emit
-    # (OpenInference instrumentors, Pydantic AI GenAI spans), so kind filtering happens server side
+    # (OpenInference instrumentors, Pydantic AI GenAI spans), so kind filtering happens server side.
+    # Traceloop (traceloop.span.kind) and Logfire (message template, tags) kinds are not matched: a
+    # kinds= fetch skips such spans, which only custom instrumentation sends to CloudWatch
     _KIND_FILTERS = {
         SpanKind.TOOL: '(attributes.gen_ai.operation.name = "execute_tool" or attributes.openinference.span.kind = "TOOL")',
         SpanKind.LLM: '(attributes.gen_ai.operation.name in ["chat", "text_completion", "generate_content"] '

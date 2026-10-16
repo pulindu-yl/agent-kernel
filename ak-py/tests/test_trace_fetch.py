@@ -151,6 +151,11 @@ class TestOTelSpanClassifier:
     def test_usage_keeps_partial_values_without_inventing_a_total(self):
         assert SpanUsage.of(input_tokens=5) == SpanUsage(input_tokens=5)
 
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e400", float("nan"), float("inf")])
+    def test_usage_ignores_non_finite_values(self, value):
+        assert SpanUsage.of(input_tokens=value, output_tokens=value, total_tokens=value, cost=value) is None
+        assert SpanUsage.of(input_tokens=3, cost=value) == SpanUsage(input_tokens=3)
+
 
 # --- Trace facade -----------------------------------------------------------------------------------------
 

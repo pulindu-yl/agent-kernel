@@ -44,6 +44,10 @@ The session and response stores use the Redis cluster of the base `openai` deplo
 
 Nothing runs on a schedule: grading happens only when `/eval` is called.
 
+> **Warning:** the routes have no authorizer, like the base `openai` example. Anyone with the URL can call `/eval`,
+> and every call spends OpenAI tokens on the LLM judges. Destroy the stack when you're done, or put an authorizer
+> (or an API key) in front of the API before leaving it deployed.
+
 ## The evaluation run
 
 `/eval` runs `TraceEvaluationJob.prepare_traces`, inside the request:
@@ -52,7 +56,9 @@ Nothing runs on a schedule: grading happens only when `/eval` is called.
    Agent Kernel groups the spans by trace and finds each trace's root span. The fetch keeps at most the newest 1,000
    spans, which a demo session never reaches.
 2. A trace with a root span is one request (`TraceCase`); a trace without one gets no row, and the next `/eval` fetches it
-   again.
+   again. That retry only helps while the root is still being ingested: once a session passes 1,000 spans, its oldest
+   traces lose their root spans to the limit, get no row (or, if already queued, are marked `failed` with
+   `trace not found in the fetch`), and stay that way while the session grows. Keep evaluated sessions short.
 3. Sets each trace's `progress`:
 
    | Current row | Trace | New `progress` |

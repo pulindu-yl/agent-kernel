@@ -698,6 +698,9 @@ Provider limits to keep in mind:
   you point `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` at a collector, it has to forward to X-Ray. Without
   `aws/spans`, `fetch_spans` raises an `AKConfigError` telling you to enable Transaction Search. Logs Insights returns at most 10,000 rows per query, so larger fetches are paged automatically,
   and each query is billed by the data it scans.
+  `kinds` is filtered server side on the OpenInference and OTel GenAI attributes the CloudWatch runners
+  emit, so spans that carry only Traceloop or Logfire kind attributes (custom instrumentation) are not
+  returned by a kind-filtered fetch; fetch without `kinds` to get them.
 
 Every built-in fetcher re-checks each filter on the spans it gets back, so no provider's own boundary rules leak
 into the result.

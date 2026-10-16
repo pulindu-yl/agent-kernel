@@ -11,6 +11,7 @@ fetchers share.
 from __future__ import annotations
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -140,9 +141,11 @@ class SpanUsage(BaseModel):
         if value is None or isinstance(value, bool):
             return None
         try:
-            return float(value)
+            number = float(value)
         except (TypeError, ValueError):
             return None
+        # NaN or infinity would break int() and poison a trace's summed usage
+        return number if math.isfinite(number) else None
 
 
 class FetchedSpan(BaseModel):
