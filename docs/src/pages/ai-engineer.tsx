@@ -37,6 +37,7 @@ import FrameworkSelector from "../components/FrameworkSelector";
 import heroStyles from "../components/HeroAnimation/styles.module.css";
 import { FaGithub } from "react-icons/fa";
 
+/** Render the AI engineer guide with framework examples and interactive architecture tabs. */
 export default function AIEngineerPage() {
   const history = useHistory();
   const contentRef = useRef<HTMLDivElement>(null);

@@ -5,7 +5,7 @@ from agentkernel.maf import MAFModule, MAFToolBuilder
 
 
 def get_weather(location: str) -> str:
-    """Get the current weather for a location."""
+    """Return a fixed example weather report for the requested location."""
     return f"The weather in {location} is 72 degrees and sunny."
 
 

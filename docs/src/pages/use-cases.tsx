@@ -36,6 +36,7 @@ type ParticleBackgroundHandle = {
 
 /* ─── Hero ──────────────────────────────────────────────────────────────── */
 
+/** Render the introductory hero for the use cases page. */
 function Hero() {
   return (
     <HeroAnimation

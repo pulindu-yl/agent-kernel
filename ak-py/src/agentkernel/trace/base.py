@@ -55,6 +55,8 @@ class BaseTrace(ABC):
 
     def maf(self) -> Runner:
         """
-        Initialize Microsoft Agent Framework instrumentation
+        Provide a Microsoft Agent Framework runner in supporting trace implementations.
+
+        :raises NotImplementedError: Unless overridden by the trace implementation.
         """
         raise NotImplementedError

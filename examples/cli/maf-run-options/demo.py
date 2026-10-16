@@ -30,6 +30,10 @@ def get_weather(city: str) -> str:
 # needs nothing from Agent Kernel. Both run inside the Agent Kernel run, so Session.current() resolves.
 @chat_middleware
 async def count_model_requests(context: ChatContext, call_next):
+    """Count the attempted model request and cache its max_tokens option before awaiting the next middleware.
+
+    Without an active session, skip recording statistics. Errors from the next middleware propagate.
+    """
     cache = _cache()
     if cache is not None:
         cache.set("llm_calls", (cache.get("llm_calls") or 0) + 1)
@@ -39,6 +43,10 @@ async def count_model_requests(context: ChatContext, call_next):
 
 @function_middleware
 async def count_tool_calls(context: FunctionInvocationContext, call_next):
+    """Count the attempted tool call and cache its tenant argument before awaiting the next middleware.
+
+    Without an active session, skip recording statistics. Errors from the next middleware propagate.
+    """
     cache = _cache()
     if cache is not None:
         cache.set("tool_calls", (cache.get("tool_calls") or 0) + 1)
@@ -50,6 +58,10 @@ class AppendRunStatsPostHook(PostHook):
     """Append a deterministic 'Run stats:' line to every reply, read from the volatile cache the middleware filled."""
 
     async def on_run(self, session, requests, agent, agent_reply):
+        """Append cached run statistics to a text reply in place and return the same reply.
+
+        Return the reply unchanged when no session is supplied or the reply is not text.
+        """
         if session is None or not isinstance(agent_reply, AgentReplyText):
             return agent_reply
         cache = session.get_volatile_cache()
@@ -66,6 +78,7 @@ class AppendRunStatsPostHook(PostHook):
         return agent_reply
 
     def name(self) -> str:
+        """Return the fixed name identifying this post hook."""
         return "append_run_stats"
 
 
