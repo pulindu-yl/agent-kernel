@@ -125,10 +125,11 @@ class TestIterateAsyncSync:
 
         def _consume():
             items = list(iterate_async_sync(_agen()))
-            # The loop the bridge supplied stays installed: see TestTheWorkerThreadKeepsOneLoop.
-            return items, asyncio.get_event_loop().is_closed()
+            with pytest.raises(RuntimeError):
+                asyncio.get_event_loop()
+            return items
 
-        assert _in_fresh_thread(_consume) == (["a", "b"], False)
+        assert _in_fresh_thread(_consume) == ["a", "b"]
 
     def test_reuses_an_existing_loop_and_leaves_it_open(self):
         async def _agen():
@@ -236,81 +237,6 @@ class TestIterateAsyncSync:
         assert [item for item, _ in seen] == [0, 1, 2]
         assert seen[0][1] > 0, "the heartbeat got no loop time while the first item was awaited"
         assert seen[-1][1] > seen[0][1], "the heartbeat stopped advancing once items started arriving"
-
-
-class TestTheWorkerThreadKeepsOneLoop:
-    """A worker thread serves many calls on one loop, not a fresh one per call.
-
-    A loop closed at the end of a call is collected, and CPython gives the next loop the
-    address it freed. An SDK that caches a loop-bound HTTP client under ``id(running_loop)``
-    — litellm's ``LLMClientCache``, which holds the client and not the loop — then hits that
-    cache for a loop that no longer exists and sends a request on a connection pool belonging
-    to a closed one: ``RuntimeError: Event loop is closed``, which is what the pipeline's
-    consumer threads produced on every second agent run.
-
-    Identity is therefore the thing to assert, not the results, and it is asserted on the live
-    loop object rather than on ``id()`` — which is exactly the value that is not unique once a
-    loop has been freed.
-    """
-
-    @staticmethod
-    def _loops_seen(bridge_call, times=4):
-        """Drive the bridge `times` times on one worker thread, collecting each running loop."""
-        loops = []
-
-        def _collect():
-            for _ in range(times):
-                bridge_call(loops)
-            return loops
-
-        return _in_fresh_thread(_collect)
-
-    def test_run_async_sync_drives_every_call_on_the_same_live_loop(self):
-        async def _coro(loops):
-            loops.append(asyncio.get_running_loop())
-
-        loops = self._loops_seen(lambda seen: run_async_sync(_coro(seen)))
-
-        assert len(loops) == 4
-        assert all(loop is loops[0] for loop in loops), "a call ran on a different loop"
-        assert not loops[0].is_closed(), "the loop was closed out from under the next call"
-
-    def test_iterate_async_sync_drives_every_run_on_the_same_live_loop(self):
-        async def _agen(loops):
-            loops.append(asyncio.get_running_loop())
-            yield "a"
-
-        loops = self._loops_seen(lambda seen: list(iterate_async_sync(_agen(seen))))
-
-        assert all(loop is loops[0] for loop in loops), "a run streamed on a different loop"
-        assert not loops[0].is_closed()
-
-    def test_the_two_bridges_share_the_threads_loop(self):
-        """A consumer thread handles streamed and non-streamed messages; one loop serves both."""
-
-        async def _coro(loops):
-            loops.append(asyncio.get_running_loop())
-
-        async def _agen(loops):
-            loops.append(asyncio.get_running_loop())
-            yield "a"
-
-        def _both(seen):
-            run_async_sync(_coro(seen))
-            list(iterate_async_sync(_agen(seen)))
-
-        loops = self._loops_seen(_both, times=2)
-
-        assert all(loop is loops[0] for loop in loops)
-
-    def test_each_thread_gets_its_own_loop(self):
-        async def _coro(loops):
-            loops.append(asyncio.get_running_loop())
-
-        first = self._loops_seen(lambda seen: run_async_sync(_coro(seen)), times=1)
-        second = self._loops_seen(lambda seen: run_async_sync(_coro(seen)), times=1)
-
-        assert first[0] is not second[0], "two threads shared one loop"
 
 
 class TestRunAsyncSync:

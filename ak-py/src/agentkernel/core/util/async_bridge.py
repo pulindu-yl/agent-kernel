@@ -20,44 +20,13 @@ from typing import Any, AsyncGenerator, Coroutine, Generator, Optional
 
 _log = logging.getLogger("ak.core.async_bridge")
 
-# Per-thread attribute storage: every thread reads and writes its own `.loop` on this one
-# object, and a thread that has not set it yet sees no attribute at all — hence the getattr.
-_thread_loop = threading.local()
-
-
-def _owned_thread_loop() -> asyncio.AbstractEventLoop:
-    """Return the calling thread's own event loop, creating and installing it on first use.
-
-    A worker thread starts with no loop, so a bridge call has to supply one. Supplying a fresh
-    one per call and closing it — what ``asyncio.run`` does — is the wrong shape for a thread
-    that serves many calls, because a closed loop's object is collected and CPython hands the
-    next loop the same address. An SDK that caches a loop-bound HTTP client under
-    ``id(running_loop)`` (litellm's ``LLMClientCache`` does exactly that, and holds the client
-    rather than the loop) then gets a cache hit for a loop that no longer exists and sends a
-    request on a connection pool belonging to a closed one: ``RuntimeError: Event loop is
-    closed``. One loop for the life of the thread keeps that identity stable, which is what a
-    server's loop already gives the async surfaces.
-
-    The trade-off is that a task the previous call left pending is no longer cancelled between
-    calls — it carries on across them, as it would on a server — so a caller that wants work
-    abandoned must cancel it itself.
-
-    :return: The loop belonging to the calling thread.
-    """
-    loop = getattr(_thread_loop, "loop", None)
-    if loop is None or loop.is_closed():
-        loop = asyncio.new_event_loop()
-        _thread_loop.loop = loop
-    asyncio.set_event_loop(loop)
-    return loop
-
 
 def run_async_sync(coro: Coroutine) -> Any:
     """Run a coroutine from sync code, handling event loop state.
 
-    Only a RuntimeError from get_event_loop() itself (no loop in this thread) falls back to the
-    thread's own loop: a RuntimeError raised by the coroutine must propagate as-is, not trigger
-    a second await of the already-consumed coroutine.
+    Only a RuntimeError from get_event_loop() itself (no loop in this thread) falls back to
+    asyncio.run: a RuntimeError raised by the coroutine must propagate as-is, not trigger a
+    second await of the already-consumed coroutine.
 
     :param coro: Coroutine to execute.
     :return: Result of the coroutine.
@@ -65,9 +34,10 @@ def run_async_sync(coro: Coroutine) -> Any:
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
-        return _owned_thread_loop().run_until_complete(coro)
+        return asyncio.run(coro)
     if loop.is_closed():
-        return _owned_thread_loop().run_until_complete(coro)
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        return asyncio.run(coro)
     return loop.run_until_complete(coro)
 
 
@@ -82,13 +52,11 @@ def iterate_async_sync(agen: AsyncGenerator) -> Generator[Any, None, None]:
     loop time, because the loop runs for the whole of each await; only the caller's own
     handling of a yielded item happens with the loop stopped.
 
-    A loop this thread already had is reused and left as it was found. A worker thread with
-    none gets the one `_owned_thread_loop` keeps for it, for the loop-identity reason given
-    there. Only the main thread falls back to a loop owned for the duration of the run:
-    asyncio.Runner owns that one, so it is torn down exactly as asyncio.run tears down its own
-    (pending tasks cancelled, async generators shut down, loop closed, thread left with no
-    current loop). See _open_loop for why "already had" is narrower than what
-    asyncio.get_event_loop() hands back, and why the main thread is the exception.
+    A loop this thread already had is reused and left as it was found; otherwise a loop is
+    owned for the duration of the run. asyncio.Runner owns that one, so it is torn down
+    exactly as asyncio.run tears down its own (pending tasks cancelled, async generators shut
+    down, loop closed, thread left with no current loop). See _open_loop for why "already had"
+    is narrower than what asyncio.get_event_loop() hands back.
 
     :param agen: Async generator to consume.
     :return: Generator yielding each item the async generator produces.
@@ -96,9 +64,6 @@ def iterate_async_sync(agen: AsyncGenerator) -> Generator[Any, None, None]:
     loop = _open_loop()
     if loop is not None:
         yield from _pump(loop, agen)
-        return
-    if threading.current_thread() is not threading.main_thread():
-        yield from _pump(_owned_thread_loop(), agen)
         return
     with asyncio.Runner() as runner:
         yield from _pump(runner.get_loop(), agen)
