@@ -57,8 +57,8 @@ Nothing runs on a schedule: grading happens only when `/eval` is called.
    spans, which a demo session never reaches.
 2. A trace with a root span is one request (`TraceCase`); a trace without one gets no row, and the next `/eval` fetches it
    again. That retry only helps while the root is still being ingested: once a session passes 1,000 spans, its oldest
-   traces lose their root spans to the limit, get no row (or, if already queued, are marked `failed` with
-   `trace not found in the fetch`), and stay that way while the session grows. Keep evaluated sessions short.
+   traces lose their root spans to the limit, get no row, and stay that way while the session grows (Agent Kernel
+   logs a warning when a fetch reaches its limit). Keep evaluated sessions short.
 3. Sets each trace's `progress`:
 
    | Current row | Trace | New `progress` |
@@ -77,7 +77,7 @@ Nothing runs on a schedule: grading happens only when `/eval` is called.
 
 `/grade` is registered like the other routes (`lambda_request_handler.py`), so the stock `Lambda.handler`
 routes the invocation to it. It is not in the API Gateway's endpoints, so it can't be called from outside.
-It runs `TraceEvaluationJob.grade_traces`. It re-fetches the session, judges each trace that is still
+It runs `TraceEvaluationJob.grade_traces`. It re-fetches the claimed traces by id, judges each one that is still
 `grading`, and writes its row in one `PutItem`. That is bound by the request handler's timeout (10 minutes), not by
 API Gateway's 29 seconds.
 

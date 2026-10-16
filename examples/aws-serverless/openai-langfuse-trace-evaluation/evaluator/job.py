@@ -72,7 +72,7 @@ class TraceEvaluationJob:
     def prepare_traces(self, session_id: str) -> PrepareSummary:
         """Gives every found trace of the session its row and progress; returns the traces to grade."""
         now = self._clock()
-        traces = self._fetch_session_traces(session_id)
+        traces = self._fetch_traces(session_id=session_id)
         cases, rootless_traces = self._build_cases(traces)
         summary = PrepareSummary(
             session_id=session_id,
@@ -111,21 +111,22 @@ class TraceEvaluationJob:
             return summary
 
         try:
-            cases, _ = self._build_cases(self._fetch_session_traces(session_id))
+            # by id, not by session: a long session's oldest traces fall outside the fetch limit
+            cases, _ = self._build_cases(self._fetch_traces(trace_ids=grading_ids))
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
-            _log.exception(f"grade: fetching session {session_id} failed")
+            _log.exception(f"grade: fetching the traces of session {session_id} failed")
             self._store.mark_failed(grading_ids, error, self._clock())
             summary.failed = len(grading_ids)
             return summary
 
-        case_by_id = {case.trace_id: case for case in cases}
-        missing_ids = [trace_id for trace_id in grading_ids if trace_id not in case_by_id]
+        found_ids = {case.trace_id for case in cases}
+        missing_ids = [trace_id for trace_id in grading_ids if trace_id not in found_ids]
         if missing_ids:
             self._store.mark_failed(missing_ids, "trace not found in the fetch", self._clock())
             summary.failed += len(missing_ids)
 
-        for case in (case for case in cases if case.trace_id in grading_ids):
+        for case in cases:
             try:
                 results = self._run_evaluators(case)
                 self._store.save_results(case, results, self._clock())
@@ -139,9 +140,9 @@ class TraceEvaluationJob:
         _log.info(f"grade: {summary.model_dump_json()}")
         return summary
 
-    def _fetch_session_traces(self, session_id: str) -> list[FetchedTrace]:
-        """Fetches the session's traces from the last FETCH_WINDOW."""
-        return self._trace.fetch_traces(session_id=session_id, last=self.FETCH_WINDOW)
+    def _fetch_traces(self, **filters) -> list[FetchedTrace]:
+        """Fetches the traces matching the filters (session_id or trace_ids) from the last FETCH_WINDOW."""
+        return self._trace.fetch_traces(last=self.FETCH_WINDOW, **filters)
 
     @staticmethod
     def _build_cases(traces: list[FetchedTrace]) -> tuple[list[TraceCase], int]:

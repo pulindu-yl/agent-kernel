@@ -349,7 +349,7 @@ class TraceFetcher(ABC):
             spans_by_id.setdefault(self._span_key(span), span)
         spans = FetchedSpan.oldest_first(spans_by_id.values())[-query.limit :]
         if len(spans) >= query.limit:
-            # the paging stops at the limit, so whether older spans matched is unknown, only possible
+            # the paging stops at the limit, so it can't tell whether older spans also matched
             self._log.warning(
                 "The %s fetch reached its limit of %d spans; older matching spans may be left out, "
                 "and their traces may come back without a root. Narrow the window or raise limit",
