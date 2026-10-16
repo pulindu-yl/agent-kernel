@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import json
 import logging
@@ -274,8 +275,12 @@ class MAFRunner(Runner):
             options = await agent.resolve_run_options(session, requests)
             kwargs, native_session, incoming = self._prepare_session(session, options)
 
-            async for event in self._stream_turn(agent, session, Message("user", inputs), kwargs, native_session, incoming, None):
-                yield event
+            # aclosing: a client disconnect closes this generator, and the turn (with the provider stream) must close with it.
+            async with contextlib.aclosing(
+                self._stream_turn(agent, session, Message("user", inputs), kwargs, native_session, incoming, None)
+            ) as turn:
+                async for event in turn:
+                    yield event
         finally:
             if context is not None:
                 context.reset()
@@ -361,8 +366,10 @@ class MAFRunner(Runner):
             options = await agent.resolve_run_options(session, requests)
             kwargs, native_session, incoming = self._prepare_session(session, options, state=record.payload["session"])
 
-            async for event in self._stream_turn(agent, session, self._approval_message(decisions, record), kwargs, native_session, incoming, record):
-                yield event
+            turn = self._stream_turn(agent, session, self._approval_message(decisions, record), kwargs, native_session, incoming, record)
+            async with contextlib.aclosing(turn) as events:
+                async for event in events:
+                    yield event
         finally:
             if context is not None:
                 context.reset()
@@ -402,12 +409,17 @@ class MAFRunner(Runner):
         open_calls: dict[str, None] = {}  # insertion-ordered set of call ids awaiting a result
         call_ids: dict[Any, str] = {}  # tool_call_index -> call id; the None key holds the latest call
 
-        async for update in stream_result:
-            for event in self._map_update(update, fallback_id, streams, open_calls, call_ids):
+        try:
+            async for update in stream_result:
+                for event in self._map_update(update, fallback_id, streams, open_calls, call_ids):
+                    yield event
+            for event in self._close_streams(streams, open_calls):
                 yield event
-        for event in self._close_streams(streams, open_calls):
-            yield event
-        final = await stream_result.get_final_response()
+            final = await stream_result.get_final_response()
+        finally:
+            # Releases the provider stream when the turn is interrupted (an error, a disconnect, a StreamHalt);
+            # MAF's close() is idempotent, so a normally drained stream is unaffected.
+            await stream_result.close()
 
         # After a normal drain only — disconnect/error leaves the stored session, context and record intact.
         try:

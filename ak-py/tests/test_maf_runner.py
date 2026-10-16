@@ -945,3 +945,27 @@ class TestHumanInTheLoopThroughRuntime:
         assert refunded == ["A1"]
         assert "".join(c.delta or "" for c in chunks) == "done: refunded A1"
         assert PausedRunState.list(session) == []
+
+
+@pytest.mark.asyncio
+async def test_a_client_disconnect_closes_the_native_stream(runner, session, maf_agent, native_agent):
+    # A consumer that stops early (a client disconnect) must release the provider stream at once, not at garbage
+    # collection; and an interrupted turn must not write the session back.
+    closed = []
+
+    async def updates():
+        try:
+            yield AgentResponseUpdate(message_id="m1", contents=[Content.from_text("Hello")])
+            yield AgentResponseUpdate(message_id="m1", contents=[Content.from_text(" world")])
+        finally:
+            closed.append(True)
+
+    native_agent.run.return_value = ResponseStream(updates(), finalizer=AgentResponse.from_updates)
+
+    events = runner.stream(maf_agent, session, [AgentRequestText(prompt="Hi")])
+    first = [await events.__anext__(), await events.__anext__()]  # MessageStart, the first TextDelta
+    await events.aclose()
+
+    assert isinstance(first[1], TextDelta)
+    assert closed == [True]
+    assert runner._session(session).get_state() is None
