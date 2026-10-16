@@ -39,7 +39,7 @@ class TraceFetchContract:
 
     @staticmethod
     def contract_span(
-        span_id: str, minute: float, kind: SpanKind = SpanKind.SPAN, trace_id: str = "t1", session_id: str | None = "s1", name: str | None = None
+        span_id: str, minute: float, kind: SpanKind = SpanKind.OTHER, trace_id: str = "t1", session_id: str | None = "s1", name: str | None = None
     ) -> FetchedSpan:
         """A span starting ``minute`` minutes after the contract window's start, lasting 30 seconds."""
         start = _START + timedelta(minutes=minute)
@@ -96,13 +96,13 @@ class TraceFetchContract:
                 self.contract_span("tool", 10, SpanKind.TOOL),
                 self.contract_span("llm", 11, SpanKind.LLM),
                 self.contract_span("agent", 12, SpanKind.AGENT),
-                self.contract_span("plain", 13, SpanKind.SPAN),
+                self.contract_span("plain", 13, SpanKind.OTHER),
             ],
         )
 
         assert [span.span_id for span in tracer.fetch_spans(self.window(kinds=[SpanKind.TOOL]))] == ["tool"]
         assert [span.span_id for span in tracer.fetch_spans(self.window(kinds=[SpanKind.LLM, SpanKind.AGENT]))] == ["llm", "agent"]
-        assert [span.span_id for span in tracer.fetch_spans(self.window(kinds=[SpanKind.SPAN]))] == ["plain"]
+        assert [span.span_id for span in tracer.fetch_spans(self.window(kinds=[SpanKind.OTHER]))] == ["plain"]
 
     def test_contract_session_filter(self, tracer):
         self.seed(

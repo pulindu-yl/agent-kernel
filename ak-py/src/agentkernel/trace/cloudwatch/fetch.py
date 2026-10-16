@@ -117,7 +117,7 @@ class CloudWatchTraceFetcher(TraceFetcher):
 
     def _insights(self, query: TraceQuery, limit: int) -> str:
         filters = []
-        if query.kinds is not None and SpanKind.SPAN not in query.kinds:
+        if query.kinds is not None and SpanKind.OTHER not in query.kinds:
             filters.append(" or ".join(self._KIND_FILTERS[kind] for kind in query.kinds))
         if query.name:
             filters.append(f"name = {self._literal(query.name)}")

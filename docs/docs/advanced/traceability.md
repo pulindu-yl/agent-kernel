@@ -604,7 +604,7 @@ for span in tool_calls:
 |--------|---------|
 | `start` / `end` | Span start time window (`end` defaults to now, `start` to `end - last`) |
 | `last` | Look-back window when `start` is not given (default 1 hour) |
-| `kinds` | `SpanKind.AGENT`, `LLM`, `TOOL` or `SPAN` (everything else); `None` returns all |
+| `kinds` | `SpanKind.AGENT`, `LLM`, `TOOL` or `OTHER` (everything else); `None` returns all |
 | `session_id` | Only spans of this AK session |
 | `trace_ids` | Only spans of these traces (fetch tool calls first, then their whole traces) |
 | `name` | Exact span name |

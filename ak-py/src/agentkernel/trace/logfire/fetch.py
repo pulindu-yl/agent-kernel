@@ -74,11 +74,11 @@ class LogfireTraceFetcher(TraceFetcher):
 
     def _sql(self, query: TraceQuery, limit: int, upper_bound: datetime) -> str:
         conditions = ["kind = 'span'"]
-        if query.kinds is not None and SpanKind.SPAN not in query.kinds:
+        if query.kinds is not None and SpanKind.OTHER not in query.kinds:
             conditions.append("(" + " OR ".join(self._KIND_SQL[kind] for kind in query.kinds) + ")")
         elif query.kinds is not None:
             others = " OR ".join(self._KIND_SQL.values())
-            wanted = [self._KIND_SQL[kind] for kind in query.kinds if kind != SpanKind.SPAN]
+            wanted = [self._KIND_SQL[kind] for kind in query.kinds if kind != SpanKind.OTHER]
             conditions.append("(" + " OR ".join([f"NOT COALESCE({others}, false)", *wanted]) + ")")
         if query.name:
             # the same value _to_span writes to name, so matches() keeps every row this selects

@@ -63,7 +63,7 @@ class TestInMemoryTraceContract(TraceFetchContract):
 class _FakeObservations:
     """Langfuse's v2 get_many: single-value filters, newest first, cursor pages."""
 
-    _TYPES = {SpanKind.AGENT: "AGENT", SpanKind.LLM: "GENERATION", SpanKind.TOOL: "TOOL", SpanKind.SPAN: "SPAN"}
+    _TYPES = {SpanKind.AGENT: "AGENT", SpanKind.LLM: "GENERATION", SpanKind.TOOL: "TOOL", SpanKind.OTHER: "SPAN"}
 
     def __init__(self):
         self.observations = []

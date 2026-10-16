@@ -81,7 +81,7 @@ The provider packages' `__init__.py` files are empty today and stay empty. So
 
 ```python
 class SpanKind(str, Enum):
-    AGENT = "agent"; LLM = "llm"; TOOL = "tool"; SPAN = "span"
+    AGENT = "agent"; LLM = "llm"; TOOL = "tool"; OTHER = "other"
 
 class SpanStatus(str, Enum):                  # the OpenTelemetry span status
     UNSET = "unset"; OK = "ok"; ERROR = "error"
@@ -101,7 +101,6 @@ class TraceQuery(BaseModel):
     limit: int = Field(default=1000, gt=0)
 
     def window(self) -> tuple[datetime, datetime]: ...   # UTC-aware; ValueError if start >= end
-    def accepts(self, kind: SpanKind) -> bool: ...       # kinds is None or kind in kinds
     def matches(self, span: FetchedSpan) -> bool: ...    # start <= start_time < end, session, trace ids, name, kind;
                                                           # an active filter needs a matching reported value:
                                                           # a None start_time, session_id or name is rejected
@@ -122,7 +121,7 @@ class FetchedSpan(BaseModel):
     span_id: str
     parent_span_id: Optional[str] = None
     name: Optional[str] = None
-    kind: SpanKind = SpanKind.SPAN
+    kind: SpanKind = SpanKind.OTHER
     status: SpanStatus = SpanStatus.UNSET     # mapped from the provider's own field (see each fetcher)
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -204,7 +203,7 @@ class TraceFetcher(ABC):                      # base of the four built-in fetche
   | 6 | — | span |
 
   - Values outside a row's mapping fall through to the next row. For example, OpenInference `CHAIN`
-    and Traceloop `workflow` fall through and end as `span`.
+    and Traceloop `workflow` fall through and end as `other`.
 - `OTelSpanClassifier.io`: the first `(input key, output key)` pair where either key is present:
   1. `gen_ai.tool.call.arguments` / `.result`
   2. `input.value` / `output.value`
@@ -308,7 +307,7 @@ class LangfuseTraceFetcher(TraceFetcher):
 
     def __init__(self, client: "Langfuse"): ...
     def _collect(self, query: TraceQuery) -> Iterable[FetchedSpan]: ...
-    def _types(self, query) -> list[str | None]: ...      # [None] when kinds is None or contains SPAN
+    def _types(self, query) -> list[str | None]: ...      # [None] when kinds is None or contains OTHER
     def _page(self, query, langfuse_type, trace_id, cursor) -> tuple[list[Any], str | None]: ...
     def _to_span(self, observation) -> FetchedSpan: ...
 ```
@@ -329,7 +328,7 @@ class LangfuseTraceFetcher(TraceFetcher):
   |---|---|
   | `trace_id`, `span_id` | `trace_id`, `id` |
   | `parent_span_id` | `parent_observation_id` |
-  | `kind` | `_TYPES` reversed, default `span`. Not re-classified from attributes: a span Langfuse types `SPAN` stays `span` (design.md §Span kinds) |
+  | `kind` | `_TYPES` reversed, default `other`. Not re-classified from attributes: a span Langfuse types `SPAN` stays `other` (design.md §Span kinds) |
   | `status` | `ERROR` when `level` is `ERROR`, else `UNSET`. `level` is in the `basic` field group, which `_FIELDS` already requests |
   | `session_id`, `input`, `output` | same-named fields, read with `getattr`, default `None` |
   | `usage` | `_usage`: `SpanUsage.of(usage_details["input"], ["output"], ["total"], cost=total_cost, else cost_details["total"])` |
@@ -368,8 +367,8 @@ class LogfireTraceFetcher(TraceFetcher):
 
   | Query field | Condition |
   |---|---|
-  | `kinds` without `span` | `(_KIND_SQL[k1] OR _KIND_SQL[k2] …)` |
-  | `kinds` with `span` | `(NOT COALESCE(<all three _KIND_SQL OR'd>, false) OR <requested non-span kinds>)` |
+  | `kinds` without `other` | `(_KIND_SQL[k1] OR _KIND_SQL[k2] …)` |
+  | `kinds` with `other` | `(NOT COALESCE(<all three _KIND_SQL OR'd>, false) OR <the other requested kinds>)` |
   | `name` | `COALESCE(message, span_name) = 'x'`, the same value `_to_span` writes to `name`, so `matches` keeps every row it selects |
   | `trace_ids` | `trace_id IN ('a', 'b')` |
   | `session_id` | `trace_id IN (SELECT trace_id FROM records WHERE attributes->>'session_id' = 's')` |
@@ -540,8 +539,8 @@ class CloudWatch(BaseTrace):
   | Part | Logs Insights |
   |---|---|
   | always | `fields @timestamp, @message` … `sort @timestamp desc` … `limit {page}` |
-  | `kinds` without `span` | `filter <_KIND_FILTERS[k1]> or <_KIND_FILTERS[k2]> …` |
-  | `kinds` with `span` | no kind filter; kinds are checked locally |
+  | `kinds` without `other` | `filter <_KIND_FILTERS[k1]> or <_KIND_FILTERS[k2]> …` |
+  | `kinds` with `other` | no kind filter; kinds are checked locally |
   | `name` | `filter name = "x"` |
   | `trace_ids` | `filter traceId in ["a", "b"]` |
   | `session_id` | `filter attributes.session.id = "s"` |
@@ -585,7 +584,7 @@ class TraceFetchContract:                          # not prefixed Test: pytest c
     def tracer(self) -> BaseTrace: ...             # subclasses override
     def seed(self, tracer: BaseTrace, spans: list[FetchedSpan]) -> None: ...   # subclasses override
     @staticmethod
-    def contract_span(span_id, minute, kind=SpanKind.SPAN, trace_id="t1", session_id="s1", name=None) -> FetchedSpan: ...
+    def contract_span(span_id, minute, kind=SpanKind.OTHER, trace_id="t1", session_id="s1", name=None) -> FetchedSpan: ...
     @staticmethod
     def window(**filters) -> TraceQuery: ...       # 2026-01-01 11:00–12:00 UTC plus filters
 
@@ -778,7 +777,7 @@ async def run(self, agent, session, requests):
   - cursor followed
   - parameter translation
   - one request per type × trace id
-  - `span` kind → `type=None` plus local filtering
+  - `other` kind → `type=None` plus local filtering
   - `limit=1` keeps the newest span and stops after one page
   - `usage_details` + `total_cost` mapped to `SpanUsage`; an observation without them → `None`
   - `level` `ERROR` → `status` `ERROR`, any other level → `UNSET`
@@ -790,7 +789,7 @@ async def run(self, agent, session, requests):
   - backward paging past a patched `_MAX_ROWS = 2`, with boundary dedupe and the `start_timestamp <=`
     cursor
   - literal escaping
-  - `NOT COALESCE` for `span`
+  - `NOT COALESCE` for `other`
   - the `name` condition is `COALESCE(message, span_name)`
   - a row at exactly `end` (as an inclusive `max_timestamp` would return it) is dropped by `matches`
   - `gen_ai.usage.*` attributes mapped to `usage`
@@ -818,7 +817,7 @@ async def run(self, agent, session, requests):
   - `Failed` status → `RuntimeError`; `timeout=0` → `stop_query` then `TimeoutError`
   - `ResourceNotFoundException` from `start_query` → `AKConfigError` mentioning Transaction Search; an
     `AccessDeniedException` propagates as `ClientError`
-  - literal escaping, `traceId in [...]`, and no kind filter when `span` is requested
+  - literal escaping, `traceId in [...]`, and no kind filter when `other` is requested
 - `FetchedSpan.oldest_first` with a missing `start_time`.
 - `TestTraceFetcher` (a minimal in-test subclass with scripted pages):
   - `fetch` pins a defaulted `end` once (a clock that advances between calls doesn't move the window),

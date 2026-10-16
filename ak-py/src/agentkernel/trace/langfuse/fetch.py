@@ -45,8 +45,8 @@ class LangfuseTraceFetcher(TraceFetcher):
         return spans
 
     def _types(self, query: TraceQuery) -> list[Optional[str]]:
-        # SPAN means "everything Langfuse doesn't type as agent/llm/tool", which no single type covers
-        if query.kinds is None or SpanKind.SPAN in query.kinds:
+        # OTHER means "everything Langfuse doesn't type as agent/llm/tool", which no single type covers
+        if query.kinds is None or SpanKind.OTHER in query.kinds:
             return [None]
         return [self._TYPES[kind] for kind in query.kinds]
 
@@ -90,7 +90,7 @@ class LangfuseTraceFetcher(TraceFetcher):
             span_id=observation.id,
             parent_span_id=observation.parent_observation_id,
             name=observation.name,
-            kind=self._KINDS.get(observation.type, SpanKind.SPAN),
+            kind=self._KINDS.get(observation.type, SpanKind.OTHER),
             status=SpanStatus.ERROR if str(getattr(observation, "level", None)).upper().endswith("ERROR") else SpanStatus.UNSET,
             start_time=observation.start_time,
             end_time=observation.end_time,

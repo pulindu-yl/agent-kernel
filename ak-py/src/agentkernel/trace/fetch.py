@@ -26,7 +26,7 @@ class SpanKind(str, Enum):
     AGENT = "agent"
     LLM = "llm"
     TOOL = "tool"
-    SPAN = "span"  # anything else: AK wrapper spans, turns, chains, workflows
+    OTHER = "other"  # anything else: AK wrapper spans, turns, chains, workflows
 
 
 class SpanStatus(str, Enum):
@@ -82,9 +82,6 @@ class TraceQuery(BaseModel):
             raise ValueError(f"fetch window start ({start.isoformat()}) must be before end ({end.isoformat()})")
         return start, end
 
-    def accepts(self, kind: SpanKind) -> bool:
-        return self.kinds is None or kind in self.kinds
-
     def matches(self, span: FetchedSpan) -> bool:
         """Whether a fetched span satisfies every filter, for fetchers whose server-side filters are approximate.
 
@@ -100,7 +97,7 @@ class TraceQuery(BaseModel):
             return False
         if self.name is not None and span.name != self.name:
             return False
-        return self.accepts(span.kind)
+        return self.kinds is None or span.kind in self.kinds
 
     @staticmethod
     def _utc(value: datetime) -> datetime:
@@ -160,7 +157,7 @@ class FetchedSpan(BaseModel):
     span_id: str
     parent_span_id: Optional[str] = None
     name: Optional[str] = None
-    kind: SpanKind = SpanKind.SPAN
+    kind: SpanKind = SpanKind.OTHER
     status: SpanStatus = SpanStatus.UNSET
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -299,7 +296,7 @@ class OTelSpanClassifier:
                 return kind
         if "LLM" in (attributes.get("logfire.tags") or []):
             return SpanKind.LLM
-        return SpanKind.SPAN
+        return SpanKind.OTHER
 
     @classmethod
     def io(cls, attributes: dict[str, Any]) -> tuple[Any, Any]:

@@ -84,7 +84,7 @@ class TestTraceQuery:
 
     def test_kinds_accept_strings(self):
         query = TraceQuery(kinds=["tool"])
-        assert query.accepts(SpanKind.TOOL) and not query.accepts(SpanKind.LLM)
+        assert query.kinds == [SpanKind.TOOL]
 
     @pytest.mark.parametrize("filters", [{"kinds": []}, {"trace_ids": []}, {"session_id": ""}, {"name": ""}])
     def test_rejects_empty_filters(self, filters):
@@ -105,15 +105,15 @@ class TestOTelSpanClassifier:
         [
             ({"openinference.span.kind": "TOOL"}, "get_weather", SpanKind.TOOL),
             ({"openinference.span.kind": "LLM"}, "generation", SpanKind.LLM),
-            ({"openinference.span.kind": "CHAIN"}, "turn", SpanKind.SPAN),
+            ({"openinference.span.kind": "CHAIN"}, "turn", SpanKind.OTHER),
             ({"traceloop.span.kind": "tool", "gen_ai.operation.name": "execute_tool"}, "get_weather.tool", SpanKind.TOOL),
-            ({"traceloop.span.kind": "workflow"}, "Agent Workflow", SpanKind.SPAN),
+            ({"traceloop.span.kind": "workflow"}, "Agent Workflow", SpanKind.OTHER),
             ({"gen_ai.operation.name": "chat"}, "openai.chat", SpanKind.LLM),
             ({"gen_ai.operation.name": "invoke_agent"}, "invoke_agent weather-agent", SpanKind.AGENT),
             ({"logfire.msg_template": "Function: {name}"}, "Function: {name}", SpanKind.TOOL),
             ({"logfire.msg_template": "Agent run: {name!r}"}, "Agent run: {name!r}", SpanKind.AGENT),
             ({"logfire.tags": ["LLM"]}, "Chat completion with {gen_ai.request.model!r}", SpanKind.LLM),
-            ({}, "Agent Kernel OpenAI", SpanKind.SPAN),
+            ({}, "Agent Kernel OpenAI", SpanKind.OTHER),
         ],
     )
     def test_classify(self, attributes, name, expected):
@@ -237,7 +237,7 @@ class TestSpanStatus:
         assert SpanStatus.of(value) is expected
 
 
-def _tspan(span_id, minute, parent=None, kind=SpanKind.SPAN, trace_id="t1", usage=None, **extra):
+def _tspan(span_id, minute, parent=None, kind=SpanKind.OTHER, trace_id="t1", usage=None, **extra):
     return FetchedSpan(
         provider="fake", trace_id=trace_id, span_id=span_id, parent_span_id=parent, start_time=_ts(minute), kind=kind, usage=usage, **extra
     )
@@ -565,7 +565,7 @@ class TestLangfuseFetcher:
         client = MagicMock()
         client.api.observations.get_many.return_value = _page([_observation("tool"), _observation("chain", type_="CHAIN")])
 
-        spans = LangfuseTraceFetcher(client).fetch_spans(TraceQuery(start=START, end=END, kinds=[SpanKind.SPAN]))
+        spans = LangfuseTraceFetcher(client).fetch_spans(TraceQuery(start=START, end=END, kinds=[SpanKind.OTHER]))
 
         assert client.api.observations.get_many.call_args.kwargs["type"] is None
         assert [span.span_id for span in spans] == ["chain"]
@@ -664,7 +664,7 @@ class TestLogfireFetcher:
         assert span.usage == SpanUsage(input_tokens=42, output_tokens=7, total_tokens=49)
 
     def test_sql_escapes_literals_and_handles_span_kind(self):
-        sql = LogfireTraceFetcher(read_token="tok")._sql(TraceQuery(name="it's", kinds=[SpanKind.SPAN]), 10, END)
+        sql = LogfireTraceFetcher(read_token="tok")._sql(TraceQuery(name="it's", kinds=[SpanKind.OTHER]), 10, END)
         assert "COALESCE(message, span_name) = 'it''s'" in sql
         assert "NOT COALESCE(" in sql
 
@@ -914,11 +914,11 @@ class TestCloudWatchFetcher:
 
     def test_insights_escapes_literals_and_handles_span_kind(self):
         insights = CloudWatchTraceFetcher(client=MagicMock())._insights(
-            TraceQuery(name='say "hi"', kinds=[SpanKind.SPAN], trace_ids=["t1", "t2"]), 10
+            TraceQuery(name='say "hi"', kinds=[SpanKind.OTHER], trace_ids=["t1", "t2"]), 10
         )
         assert 'name = "say \\"hi\\""' in insights
         assert 'traceId in ["t1", "t2"]' in insights
-        assert "openinference" not in insights  # SPAN is everything else, so kinds are filtered locally
+        assert "openinference" not in insights  # OTHER is everything else, so kinds are filtered locally
 
 
 @pytest.mark.parametrize(

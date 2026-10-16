@@ -156,15 +156,15 @@ The example is `examples/aws-serverless/langfuse-trace-evaluation/`. Implementat
 
 ### Span kinds
 
-- `SpanKind`: `agent`, `llm`, `tool`, and `span` (everything else).
+- `SpanKind`: `agent`, `llm`, `tool`, and `other` (everything else).
 - `OTelSpanClassifier` classifies each OTel span by its own attributes, never once per provider, in this
   precedence: `openinference.span.kind`, `traceloop.span.kind`, `gen_ai.operation.name`, the Logfire
-  message template or `LLM` tag, else `span`.
+  message template or `LLM` tag, else `other`.
   - Must label every span in the captured dumps as `research/span-formats.md` §3–§4 does.
   - Also extracts `input`/`output`, the session id and per-call `usage`, ignoring roll-ups.
-- Langfuse maps its own types: `GENERATION` → llm, `TOOL` → tool, `AGENT` → agent, else span.
+- Langfuse maps its own types: `GENERATION` → llm, `TOOL` → tool, `AGENT` → agent, else other.
 - **Fetchers map each provider's fields onto the neutral ones but don't patch over a provider's own mistakes.**
-  A span Langfuse labels as a plain `SPAN` stays `span`; user code trusts `span.kind` and `span.status`.
+  A span Langfuse labels as a plain `SPAN` stays `other`; user code trusts `span.kind` and `span.status`.
   Re-classifying in the Langfuse fetcher was rejected: a `kinds=[TOOL]` query could no longer filter server
   side by `type=TOOL`, and would have to page through every span in the window.
 - Detail: spec.md §`trace/fetch.py`.
