@@ -42,6 +42,7 @@ const sidebars = {
         'architecture/execution-flow',
         'architecture/memory-management',
         'architecture/sandbox-internals',
+        'architecture/realtime-internals',
       ],
     },
     {
@@ -146,6 +147,7 @@ const sidebars = {
         'advanced/human-in-the-loop',
         'advanced/sandbox',
         'advanced/secrets',
+        'advanced/a2ui',
         'advanced/knowledge-bases',
         'advanced/queue-mode-guide',
         {
