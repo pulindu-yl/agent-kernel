@@ -27,3 +27,9 @@ async def test_follow_up_question(test_client):
         "Which country hosted the tournament?, answer with only the country names and make sure to mention all the contries that hosted this tournament"
     )
     await test_client.expect(["Sri Lanka, India and Pakistan"])
+
+
+@pytest.mark.order(3)
+async def test_the_tool_is_called(test_client):
+    await test_client.send("What is the weather in Paris? Use the get_weather tool and repeat its answer exactly.")
+    await test_client.expect(["The weather in Paris is 72 degrees and sunny."])

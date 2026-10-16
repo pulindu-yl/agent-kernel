@@ -20,6 +20,8 @@ The existing Pydantic AI and OpenAI adapters (`framework/pydanticai/pydanticai.p
 
 ### Session and message history
 
+- The native session snapshot is persisted **before** the framework context: a context that cannot be stored (an unpicklable value) must not lose a turn the model completed — on a resume, a tool call that already ran.
+
 - `MAFSession` holds the running session state.
 - Retrieval must mirror `OpenAIRunner._session()`: `session.get(FRAMEWORK) or session.set(FRAMEWORK, MAFSession())`.
 - Serialization must account for MAF's strict native object typing:
@@ -52,9 +54,16 @@ The existing Pydantic AI and OpenAI adapters (`framework/pydanticai/pydanticai.p
 - `supports_pause = True`: a tool declared with `approval_mode="always_require"` (natively, or via `MAFToolBuilder.bind(..., approval_mode=...)`) pauses the run.
 - Pause detection reads the final response's `function_approval_request` items, before the reply mapping, identically in `run()` and `stream()`; `stream()` ends with `RunPaused`.
 - The record (`PausedRunState.add`, after `clear_for_runner` — one conversation per session) carries the serialized `AgentSession` and the pending requests, so a resume needs nothing else and works on any replica.
-- `resume()` / `resume_stream()` send one user message of approval responses: `approved` approves; `denied` and `cancelled` reject. They share the reply/stream helpers with `run()` / `stream()`, and clear the record only after the native call succeeds.
+- `resume()` / `resume_stream()` send one user message of approval responses: `approved` approves; `denied` and `cancelled` reject. They share the reply/stream helpers with `run()` / `stream()`, and clear the record once the native call succeeded and the conversation holding its outcome is stored — before the framework context, whose write-back can fail on its own — so a failed native call stays retryable and an approved tool can never run twice.
 - Refused above the `try`, naming the cause: a partial resume, a decision payload, a prompt beside the decisions, and a new prompt while a pause is outstanding (MAF would drop the pending calls).
 - Out of scope: free-text questions (`input_required`) — MAF agents have no native equivalent.
+
+### Native run options
+
+- `MAFAgent.RESERVED_RUN_OPTIONS`: `messages`, `stream` and `session` — the runner sets each itself; declaring one raises `ValueError` at declaration.
+- `run()`, `stream()`, `resume()` and `resume_stream()` each resolve the options once with `await agent.resolve_run_options(session, requests)`, after the early returns, and build the native call with `_native_kwargs(options, session=...)`, so the AK-owned keys are written last.
+- Model settings nest inside MAF's own `options` mapping (`temperature`, `max_tokens`, `response_format`); `function_invocation_kwargs` reaches every tool call. `Agent.run` takes no `**kwargs`, so an unknown key raises `TypeError` on the first run.
+- Progress hooks are MAF middleware on the agent, not run options; `examples/cli/maf-run-options` demonstrates both.
 
 ### Tool binding
 
@@ -75,9 +84,9 @@ The existing Pydantic AI and OpenAI adapters (`framework/pydanticai/pydanticai.p
 
 ### Tracing
 
-- Must add `maf()` tracing provider implementation to `BaseTrace`.
-- Must add `trace/langfuse/maf.py`, `trace/openllmetry/maf.py`, and `trace/logfire/maf.py` following the established instrumentation pattern.
-- MAF emits OpenTelemetry spans by default (`ENABLE_INSTRUMENTATION`), so the traced runners add the outer AK span only and must not force-enable MAF instrumentation over a user's opt-out.
+- Must add `maf()` to `BaseTrace` as an `@abstractmethod`, like the six existing framework methods (the precedent `pydanticai()` set in #539), and the matching `Trace.maf()`. A custom tracer must implement it.
+- Must add traced runners for all four built-in backends: `trace/langfuse/maf.py`, `trace/openllmetry/maf.py`, `trace/logfire/maf.py` and `trace/cloudwatch/maf.py` (registered in `CloudWatch.maf()`).
+- MAF emits OpenTelemetry spans by default (`ENABLE_INSTRUMENTATION`), so the traced runners add the outer AK span only and must not force-enable MAF instrumentation over a user's opt-out. Span content is metadata-only unless the user sets MAF's `ENABLE_SENSITIVE_DATA`.
 
 ### Packaging (`ak-py/pyproject.toml`)
 

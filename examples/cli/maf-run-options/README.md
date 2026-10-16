@@ -46,13 +46,17 @@ Install dependencies:
 
     ./build.sh
 
+> Note: until a release of `agentkernel` that includes the `maf` extra is published to PyPI,
+> build with `./build.sh local` against a locally built `ak-py/dist`; a plain `./build.sh` installs a
+> PyPI release without `agentkernel.maf`.
+
 Install local `agentkernel` in development mode:
 
     ./build.sh local
 
 Run the demo:
 
-    python demo.py
+    uv run python demo.py
 
 Run the tests:
 

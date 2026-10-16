@@ -269,7 +269,7 @@ and is never persisted.
 declared option can never displace a value the adapter populates (the session, the framework
 context, the input). The same keys are also rejected at declaration: each adapter names them in
 `RESERVED_RUN_OPTIONS`, and `run_options` raises `ValueError` naming the key and the reason. Unknown
-keys are not validated and reach the SDK. OpenAI, ADK, Pydantic AI and smolagents raise `TypeError` for
+keys are not validated and reach the SDK. OpenAI, ADK, Pydantic AI, Microsoft Agent Framework and smolagents raise `TypeError` for
 an unknown keyword on the first run; LangGraph and CrewAI drop one silently (`ainvoke` ignores unknown
 keywords, and `Crew` is a Pydantic model that ignores extra fields), so check the spelling there. The
 one guarded case is LangGraph: a `RunnableConfig` key declared at the top level (`recursion_limit`,
@@ -338,7 +338,7 @@ runner, so a declared `hooks=` still reaches the SDK when `trace.enabled` is on.
 that is not a keyword argument of the native call.
 
 See the per-framework demos: `examples/cli/openai-run-options`, `langgraph-run-options`,
-`adk-run-options`, `pydanticai-run-options`, `crewai-run-options` and `smolagents-run-options`, and
+`adk-run-options`, `pydanticai-run-options`, `maf-run-options`, `crewai-run-options` and `smolagents-run-options`, and
 `examples/cli/openai-dynamic-run-options` for options computed per run.
 
 ## Best Practices

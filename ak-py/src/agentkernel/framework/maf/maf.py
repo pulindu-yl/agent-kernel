@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator
 from typing import Any, Callable, ClassVar, List, Mapping
 from uuid import uuid4
 
-from agent_framework import Agent, AgentSession, Content, Message
+from agent_framework import Agent, AgentResponse, AgentResponseUpdate, AgentSession, Content, Message
 from agent_framework import tool as maf_tool
 
 from ...core import Agent as BaseAgent
@@ -83,15 +83,18 @@ class MAFRunner(Runner):
         super().__init__(FRAMEWORK)
 
     @staticmethod
-    def _session(session: Session) -> MAFSession | None:
+    def _session(session: Session) -> MAFSession:
         """
         Retrieves the MAFSession from the AgentKernel session, initializing it if not present.
-        :param session: The AK session, or None.
-        :return: The MAF session data stored under the framework key, or None without a session.
+        Callers handle a stateless run (no session) before reaching here.
+        :param session: The AK session.
+        :return: The MAF session data stored under the framework key.
         """
-        if session is None:
-            return None
-        return session.get(FRAMEWORK) or session.set(FRAMEWORK, MAFSession())
+        stored: MAFSession | None = session.get(FRAMEWORK)
+        if stored is None:
+            stored = MAFSession()
+            session.set(FRAMEWORK, stored)
+        return stored
 
     @staticmethod
     def _attachment_content(data: str, mime_type: str | None, kind: str) -> Content:
@@ -170,20 +173,31 @@ class MAFRunner(Runner):
 
         return self._native_kwargs(options, session=native_session), native_session, incoming
 
-    def _finalize_session(self, session: Session | None, native_session: AgentSession | None, incoming: dict | None) -> None:
+    def _finalize_session(
+        self, session: Session | None, native_session: AgentSession | None, incoming: dict | None, record: PausedRun | None = None
+    ) -> None:
         """
-        Writes the framework context and the native MAF session back to the AK session after a successful run.
-        The context is popped from the native state first: AK persists it as the framework context, so keeping
-        it in the MAF snapshot would store it twice.
+        Writes the native MAF session, then the framework context, back to the AK session after a successful run.
+
+        The context is popped from the native state first: AK persists it as the framework context, so keeping it in
+        the MAF snapshot would store it twice. The conversation is persisted first, as Pydantic AI persists its history
+        first: the context write-back can fail (an unpicklable value a tool stored), and that failure must not also
+        lose a turn the model already completed. A resumed run's record is cleared right after the conversation is
+        stored and before the context: once the conversation holds the tool results, a retry from the record's
+        pre-resume snapshot would run the approved tools a second time.
         :param session: The AK session, or None for a stateless run.
         :param native_session: The native session used for the run, or None.
         :param incoming: The framework context loaded this turn, or None.
+        :param record: The paused run being resumed, or None for an ordinary turn.
+        :raises TypeError: If the framework context cannot be pickled; the conversation is already stored.
         """
         if session is None or native_session is None:
             return
         produced = native_session.state.pop("ak_context", None)
-        self._store_framework_context(session, incoming, produced)
         self._session(session).set_state(native_session.to_dict())
+        if record is not None:
+            PausedRunState.clear(session, record.id)
+        self._store_framework_context(session, incoming, produced)
 
     async def run(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AgentReply:
         """
@@ -286,9 +300,8 @@ class MAFRunner(Runner):
 
             result = await agent.agent.run(self._approval_message(decisions, record), **kwargs)
 
-            self._finalize_session(session, native_session, incoming)
-            # Cleared only once the framework has accepted the decisions, so a failed resume can be retried.
-            PausedRunState.clear(session, record.id)
+            # Clears the record once the conversation holds the outcome; a failed native call above leaves it for a retry.
+            self._finalize_session(session, native_session, incoming, record)
             return self._reply(agent, session, native_session, result, "")
         except Exception as e:
             return AgentReplyText(response=user_facing_error_message(e))
@@ -330,7 +343,7 @@ class MAFRunner(Runner):
     async def _stream_turn(
         self,
         agent: Any,
-        session: Session | None,
+        session: Session,
         message: Message,
         kwargs: dict[str, Any],
         native_session: AgentSession | None,
@@ -345,7 +358,7 @@ class MAFRunner(Runner):
         the runner is shared across sessions. The pause is read off the final response, as `run()` reads it, so the
         streamed and non-streamed paths cannot drift apart.
         :param agent: The agent being run.
-        :param session: The AK session, or None for a stateless run.
+        :param session: The AK session.
         :param message: The user message to send: the prompt, or the approval responses on a resume.
         :param kwargs: The native run kwargs built by `_prepare_session`.
         :param native_session: The native session used for the run, or None.
@@ -369,18 +382,16 @@ class MAFRunner(Runner):
 
         # After a normal drain only — disconnect/error leaves the stored session, context and record intact.
         try:
-            self._finalize_session(session, native_session, incoming)
+            self._finalize_session(session, native_session, incoming, record)
         except Exception as e:
             self._log_framework_context_stream_failure(session, e)
-        if record is not None:
-            PausedRunState.clear(session, record.id)
 
         approvals = self._approval_requests(final)
         if approvals:
             paused = self._paused_reply(agent, session, native_session, approvals)
             yield RunPaused(run_id=paused.run_id, agent=agent.name, interruptions=paused.interruptions)
 
-    def _reply(self, agent: Any, session: Session | None, native_session: AgentSession | None, result: Any, prompt: str) -> AgentReply:
+    def _reply(self, agent: Any, session: Session | None, native_session: AgentSession | None, result: AgentResponse, prompt: str) -> AgentReply:
         """
         Maps a finished native run onto an AgentReply, shared by `run()` and `resume()` so a resumed turn answers in
         the same shapes. A pause is checked first: a run waiting on approval may still carry text produced on the way.
@@ -395,21 +406,19 @@ class MAFRunner(Runner):
         if approvals:
             return self._paused_reply(agent, session, native_session, approvals)
 
-        structured = AgentReplyAny.from_output(getattr(result, "value", None), prompt)
+        structured = AgentReplyAny.from_output(result.value, prompt)
         if structured is not None:
             return structured
 
-        output = getattr(result, "text", None)
-        return AgentReplyText(response=str(result) if output is None else output, prompt=prompt)
+        return AgentReplyText(response=result.text, prompt=prompt)
 
     @staticmethod
-    def _approval_requests(result: Any) -> list[Content]:
+    def _approval_requests(result: AgentResponse) -> list[Content]:
         """
-        :param result: A native `AgentResponse`, or None.
+        :param result: The native `AgentResponse`.
         :return: The tool approvals the run is waiting on; empty when it finished.
         """
-        requests = getattr(result, "user_input_requests", None) or []
-        return [request for request in requests if getattr(request, "type", None) == "function_approval_request"]
+        return [request for request in result.user_input_requests if request.type == "function_approval_request"]
 
     def _paused_reply(
         self, agent: Any, session: Session | None, native_session: AgentSession | None, approvals: list[Content]
@@ -431,13 +440,14 @@ class MAFRunner(Runner):
         if session is None or native_session is None:
             raise ValueError("A Microsoft Agent Framework run paused for tool approval, but a pause needs a session to be recorded in.")
 
+        interruptions = [self._interruption(request) for request in approvals]
         PausedRunState.clear_for_runner(session, self.name)
         record = PausedRunState.add(
             session,
             agent=agent.name,
             runner=self.name,
-            interruptions=[self._interruption(request) for request in approvals],
-            payload={"session": native_session.to_dict(), "requests": [request.to_dict() for request in approvals]},
+            interruptions=interruptions,
+            payload={"session": native_session.to_dict(), "requests": {i.id: request.to_dict() for i, request in zip(interruptions, approvals)}},
         )
         return AgentPausedReplyAny(run_id=record.id, session_id=session.id, agent=agent.name, interruptions=record.interruptions)
 
@@ -447,14 +457,17 @@ class MAFRunner(Runner):
         Maps one `function_approval_request` onto an interruption, keyed by MAF's own request id.
         :param request: The pending approval request.
         :return: The interruption to carry back to the caller.
+        :raises ValueError: If the request carries no id or function call.
         """
-        call = getattr(request, "function_call", None)
-        arguments = getattr(call, "arguments", None)
+        call, request_id = request.function_call, request.id
+        if call is None or request_id is None:
+            # MAF builds every approval request with both, and skips one without them when resuming.
+            raise ValueError(f"Microsoft Agent Framework returned an approval request without an id or function call: {request!r}")
         return PausedInterruption(
-            id=request.id,
+            id=request_id,
             kind="tool_call",
-            tool_name=getattr(call, "name", None),
-            arguments=None if arguments is None else cls._as_text(arguments),
+            tool_name=call.name,
+            arguments=None if call.arguments is None else cls._as_text(call.arguments),
         )
 
     def _reject_while_a_decision_is_outstanding(self, session: Session | None) -> None:
@@ -522,15 +535,14 @@ class MAFRunner(Runner):
         `approved` approves; `denied` and `cancelled` both reject, since MAF has only those two verbs. MAF tells the
         model the call was rejected by the user; a decision's `message` has no channel and is not forwarded.
         :param decisions: The human's decisions, one per pending request (`_reject_unresumable` has checked).
-        :param record: The record holding the pending requests.
+        :param record: The record holding the pending requests, keyed by interruption id.
         :return: The message of approval responses.
         """
-        approved = {decision.id: decision.status == "approved" for decision in decisions}
-        pending = [Content.from_dict(request) for request in record.payload["requests"]]
-        return Message("user", [request.to_function_approval_response(approved[request.id]) for request in pending])
+        pending = {interruption_id: Content.from_dict(request) for interruption_id, request in record.payload["requests"].items()}
+        return Message("user", [pending[decision.id].to_function_approval_response(decision.status == "approved") for decision in decisions])
 
     def _map_update(
-        self, update: Any, fallback_id: str, streams: dict[str, str], open_calls: dict[str, None], call_ids: dict[Any, str]
+        self, update: AgentResponseUpdate, fallback_id: str, streams: dict[str, str], open_calls: dict[str, None], call_ids: dict[Any, str]
     ) -> list[StreamEvent]:
         """
         Translates one native `AgentResponseUpdate` into AK events. Unmapped content types produce nothing.
@@ -541,10 +553,10 @@ class MAFRunner(Runner):
         :param call_ids: `tool_call_index` -> call id seen so far. Mutated in place.
         :return: The AK events this update produces, in order.
         """
-        native_id = getattr(update, "message_id", None)
+        native_id = update.message_id
         events: list[StreamEvent] = []
-        for item in getattr(update, "contents", None) or []:
-            item_type = getattr(item, "type", "")
+        for item in update.contents:
+            item_type = item.type
             if item_type in ("text", "text_reasoning"):
                 events.extend(self._delta_events(item_type, item, native_id, fallback_id, streams))
             elif item_type == "function_call":
@@ -564,7 +576,7 @@ class MAFRunner(Runner):
         :param streams: Native content type -> id of the open stream. Mutated in place.
         :return: The boundary events, if any, followed by the delta.
         """
-        text = getattr(item, "text", None)
+        text = item.text
         if not text:
             return []
         is_text = item_type == "text"
@@ -592,9 +604,9 @@ class MAFRunner(Runner):
             return []
         events: list[StreamEvent] = []
         if call_id not in open_calls:
-            events.append(ToolCallStart(tool_call_id=call_id, name=getattr(item, "name", None) or ""))
+            events.append(ToolCallStart(tool_call_id=call_id, name=item.name or ""))
             open_calls[call_id] = None
-        args = getattr(item, "arguments", None)
+        args = item.arguments
         if args:
             events.append(ToolCallArgs(tool_call_id=call_id, delta=self._as_text(args)))
         return events
@@ -606,14 +618,14 @@ class MAFRunner(Runner):
         :param open_calls: Call ids awaiting a result. Mutated in place.
         :return: The tool-result events.
         """
-        call_id = getattr(item, "call_id", None)
+        call_id = item.call_id
         if not call_id:
             return []
         events: list[StreamEvent] = []
         if call_id in open_calls:
             del open_calls[call_id]
             events.append(ToolCallEnd(tool_call_id=call_id))
-        events.append(ToolCallResult(tool_call_id=call_id, content=self._as_text(getattr(item, "result", None))))
+        events.append(ToolCallResult(tool_call_id=call_id, content=self._as_text(item.result)))
         return events
 
     @staticmethod
@@ -626,8 +638,8 @@ class MAFRunner(Runner):
         :param call_ids: `tool_call_index` -> call id seen so far; the None key holds the latest call. Mutated in place.
         :return: The call id, or None when the chunk cannot be tied to a call.
         """
-        index = (getattr(item, "additional_properties", None) or {}).get("tool_call_index")
-        call_id = getattr(item, "call_id", None)
+        index = (item.additional_properties or {}).get("tool_call_index")
+        call_id = item.call_id
         if call_id:
             call_ids[index] = call_id
             call_ids[None] = call_id
@@ -669,7 +681,7 @@ class MAFAgent(BaseAgent):
         "session": "managed by the runner based on the AK session",
     }
 
-    def __init__(self, name: str, runner: MAFRunner, agent: Agent):
+    def __init__(self, name: str, runner: Runner, agent: Agent):
         """
         Initializes a MAFAgent instance.
         :param name: The name the agent is registered under.
@@ -678,8 +690,6 @@ class MAFAgent(BaseAgent):
         """
         super().__init__(name, runner)
         self._agent = agent
-        if getattr(self._agent, "default_options", None) is None:
-            self._agent.default_options = {}
         self._attach_system_tools()
         self._setup_system_prompt()
 
@@ -694,7 +704,7 @@ class MAFAgent(BaseAgent):
         """
         :return: The native agent's description, falling back to its instructions.
         """
-        return getattr(self.agent, "description", None) or self.agent.default_options.get("instructions", "") or ""
+        return self.agent.description or self.agent.default_options.get("instructions") or ""
 
     def override_system_prompt(self, prompt: str) -> None:
         """
@@ -771,7 +781,7 @@ class MAFModule(Module):
         :param agents: All agents in the module.
         :return: The MAFAgent wrapper.
         """
-        if getattr(agent, "name", None) is None:
+        if agent.name is None:
             raise ValueError("MAF agents passed to MAFModule must have an explicit name= — AK registers agents by name immediately.")
         return MAFAgent(agent.name, self.runner, agent)
 

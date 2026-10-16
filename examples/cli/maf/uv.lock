@@ -506,6 +506,41 @@ wheels = [
 ]
 
 [[package]]
+name = "cli-maf"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "agent-framework-openai" },
+    { name = "agentkernel" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "agentkernel", extra = ["test"] },
+    { name = "black" },
+    { name = "isort" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "agent-framework-openai", specifier = ">=1.14.4" },
+    { name = "agentkernel", extras = ["cli", "maf"], specifier = ">=0.9.5" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "agentkernel", extras = ["test"], specifier = ">=0.9.5" },
+    { name = "black", specifier = "==26.5.1" },
+    { name = "isort", specifier = ">=5.0.0" },
+    { name = "mypy", specifier = ">=1.0.0" },
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", specifier = ">=0.23.0" },
+]
+
+[[package]]
 name = "click"
 version = "8.3.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1352,41 +1387,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/63/6d/c5b5c1fa526d453e807984139ecf5fbe6f640a110569e7d84fbc4e045559/litellm-1.103.2-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:c9c4b32c685ca62d7eaf246c94e4a943c884d1ab56607b408b2c9cdf959b658c", size = 27616993, upload-time = "2026-10-01T06:21:05.156Z" },
     { url = "https://files.pythonhosted.org/packages/cc/e1/2fe0fd0e8668ac6de67dec958524a26878c0ad963676cda2ceeb281e200e/litellm-1.103.2-cp310-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:f73617d4d6b6741903f01f003b23c825045276b35a057a72080c816772a90e31", size = 28196360, upload-time = "2026-10-01T06:21:09.427Z" },
     { url = "https://files.pythonhosted.org/packages/fa/c2/ecb4f45b170e9c5271132f6a399c9a3eb934c077ae6c8e2ac35f4d66ffa5/litellm-1.103.2-cp310-abi3-win_amd64.whl", hash = "sha256:0dc3fb3439653e218bca4c905efd5bdb69e61ab4df31dbb0ede05013e1c4c649", size = 28140642, upload-time = "2026-10-01T06:21:13.457Z" },
-]
-
-[[package]]
-name = "maf-demo"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "agent-framework-openai" },
-    { name = "agentkernel" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "agentkernel", extra = ["test"] },
-    { name = "black" },
-    { name = "isort" },
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "agent-framework-openai", specifier = ">=1.14.4" },
-    { name = "agentkernel", extras = ["cli", "maf"], specifier = ">=0.9.5" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "agentkernel", extras = ["test"], specifier = ">=0.9.5" },
-    { name = "black", specifier = "==26.5.1" },
-    { name = "isort", specifier = ">=5.0.0" },
-    { name = "mypy", specifier = ">=1.0.0" },
-    { name = "pytest", specifier = ">=8.0.0" },
-    { name = "pytest-asyncio", specifier = ">=0.23.0" },
 ]
 
 [[package]]

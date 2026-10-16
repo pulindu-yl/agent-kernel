@@ -8,7 +8,7 @@ const FRAMEWORKS = [
   'Google ADK',
   'Smolagents',
   'Pydantic AI',
-  'Microsoft Agents',
+  'Microsoft Agent Framework',
 ];
 
 const DEPLOY_TARGETS = [

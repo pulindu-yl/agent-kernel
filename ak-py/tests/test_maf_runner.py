@@ -3,7 +3,7 @@ import copy
 import inspect
 import json
 import pickle
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agent_framework import (
@@ -56,8 +56,11 @@ from agentkernel.framework.maf.maf import MAFAgent, MAFModule, MAFRunner, MAFSes
 
 
 class NativeMockAgent:
+    """Stands in for a MAF `Agent`: the attributes the adapter reads, with an `AsyncMock` run."""
+
     def __init__(self, name="test-agent"):
         self.name = name
+        self.description = None
         self.default_options = {"instructions": "Test system message", "tools": []}
         self.run = AsyncMock()
 
@@ -176,7 +179,7 @@ async def test_stream_success_multi_message(runner, session, maf_agent, native_a
         yield AgentResponseUpdate(message_id="msg2", contents=[Content(type="text", text="It is ")])
         yield AgentResponseUpdate(message_id="msg2", contents=[Content(type="text", text="72F")])
 
-    native_agent.run.return_value = ResponseStream(mock_stream())
+    native_agent.run.return_value = ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
 
     requests = [AgentRequestText(prompt="Hello")]
     events = [e async for e in runner.stream(maf_agent, session, requests)]
@@ -217,7 +220,7 @@ async def test_stream_reasoning_and_missing_ids(runner, session, maf_agent, nati
         yield AgentResponseUpdate(message_id=None, contents=[Content(type="text_reasoning", text=" more")])
         yield AgentResponseUpdate(message_id=None, contents=[Content(type="text", text="Here is the answer.")])
 
-    native_agent.run.return_value = ResponseStream(mock_stream())
+    native_agent.run.return_value = ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
     events = [e async for e in runner.stream(maf_agent, session, [AgentRequestText(prompt="Hello")])]
 
     r_starts = [e for e in events if isinstance(e, ReasoningStart)]
@@ -242,7 +245,7 @@ async def test_stream_missing_id_split(runner, session, maf_agent, native_agent)
         yield AgentResponseUpdate(message_id=None, contents=[Content(type="text", text="B")])
         yield AgentResponseUpdate(message_id="msg1", contents=[Content(type="text", text="C")])
 
-    native_agent.run.return_value = ResponseStream(mock_stream())
+    native_agent.run.return_value = ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
     events = [e async for e in runner.stream(maf_agent, session, [AgentRequestText(prompt="Hello")])]
 
     m_starts = [e for e in events if isinstance(e, MessageStart)]
@@ -264,7 +267,7 @@ async def test_stream_failure_propagates(runner, session, maf_agent, native_agen
         yield AgentResponseUpdate(message_id="msg1", contents=[Content(type="text", text="Hello")])
         raise error
 
-    native_agent.run.return_value = ResponseStream(mock_stream())
+    native_agent.run.return_value = ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
 
     with pytest.raises(ValueError, match="Stream interrupted") as exc:
         async for _ in runner.stream(maf_agent, session, [AgentRequestText(prompt="Hello")]):
@@ -335,7 +338,7 @@ async def test_options_are_forwarded_to_runner_stream(runner, session, maf_agent
     async def mock_stream():
         yield AgentResponseUpdate(message_id="msg1", contents=[Content.from_text("Hello")])
 
-    native_agent.run.return_value = ResponseStream(mock_stream())
+    native_agent.run.return_value = ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
     resolved = {"options": {"temperature": 0.5, "max_tokens": 100}}
     maf_agent.resolve_run_options = AsyncMock(return_value=resolved)
     requests = [AgentRequestText(prompt="Hi")]
@@ -360,7 +363,7 @@ async def test_ak_session_wins_without_mutating_declared_options(runner, session
 
     for _ in range(2):
         if stream:
-            native_agent.run.return_value = ResponseStream(mock_stream())
+            native_agent.run.return_value = ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
             _ = [event async for event in runner.stream(maf_agent, session, [AgentRequestText(prompt="Hi")])]
         else:
             native_agent.run.return_value = AgentResponse(messages=[])
@@ -400,7 +403,7 @@ async def test_declared_options_factory_runs_each_turn(session, stream):
         requests = [AgentRequestText(prompt="Hi")]
         for turn in range(1, 3):
             if stream:
-                native.run.return_value = ResponseStream(mock_stream())
+                native.run.return_value = ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
                 _ = [event async for event in module.runner.stream(wrapped, session, requests)]
             else:
                 native.run.return_value = AgentResponse(messages=[])
@@ -427,7 +430,7 @@ async def test_framework_context_round_trips_with_new_keys(runner, session, maf_
         context["cart"].append("eggs")
         context["delivery_note"] = "front door"
         if stream:
-            return ResponseStream(mock_stream())
+            return ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
         return AgentResponse(messages=[Message(role="assistant", contents=[Content.from_text("Added eggs")])])
 
     native_agent.run.side_effect = native_run
@@ -452,7 +455,7 @@ async def test_tool_only_stream_has_no_text_boundaries(runner, session, maf_agen
         yield AgentResponseUpdate(contents=[Content(type="function_call", call_id="call1", name="weather", arguments='{"city":"Paris"}')])
         yield AgentResponseUpdate(contents=[Content.from_function_result(call_id="call1", result="72F")])
 
-    native_agent.run.return_value = ResponseStream(mock_stream())
+    native_agent.run.return_value = ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
     events = [event async for event in runner.stream(maf_agent, session, [AgentRequestText(prompt="Weather?")])]
     assert [type(event) for event in events] == [ToolCallStart, ToolCallArgs, ToolCallEnd, ToolCallResult]
     assert all(event.tool_call_id == "call1" for event in events)
@@ -464,7 +467,7 @@ async def test_reasoning_only_stream_has_no_text_boundaries(runner, session, maf
         yield AgentResponseUpdate(contents=[Content(type="text_reasoning", text="Thinking")])
         yield AgentResponseUpdate(contents=[Content(type="text_reasoning", text=" more")])
 
-    native_agent.run.return_value = ResponseStream(mock_stream())
+    native_agent.run.return_value = ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
     events = [event async for event in runner.stream(maf_agent, session, [AgentRequestText(prompt="Think")])]
     assert [type(event) for event in events] == [ReasoningStart, ReasoningDelta, ReasoningDelta, ReasoningEnd]
     assert len({event.message_id for event in events}) == 1
@@ -500,31 +503,58 @@ def test_maf_agent_methods(maf_agent):
 
 
 @pytest.mark.asyncio
-async def test_snapshot_validation_preserves_old_state(runner, session, maf_agent, native_agent):
+async def test_a_failed_context_write_back_keeps_the_turn_but_not_the_context(runner, session, maf_agent, native_agent):
+    # The model completed the turn, so the conversation is stored even when the context cannot be: losing the
+    # turn would make the model forget an answer the user already saw.
     old_state = AgentSession(session_id=session.id).to_dict()
     session.set("maf", MAFSession())
     session.get("maf").set_state(old_state)
     session.set_framework_context({"safe": 1})
 
     native_response = AgentResponse(messages=[Message(role="assistant", contents=[Content.from_text("Hello")])])
-    native_agent.run.return_value = native_response
 
     class Unserializable:
         pass
 
     def side_effect(*args, **kwargs):
-        kwargs["session"].state["ak_context"] = {"bad": Unserializable()}
+        native_session = kwargs["session"]
+        native_session.state["ak_context"] = {"bad": Unserializable()}
+        native_session.state["turns"] = 1  # stands in for the history a provider appends during the run
         return native_response
 
     native_agent.run.side_effect = side_effect
 
     reply = await runner.run(maf_agent, session, [AgentRequestText(prompt="Hi")])
     assert isinstance(reply, AgentReplyText)
-    assert "not picklable" in reply.response or "not JSON serializable" in reply.response
+    assert "not picklable" in reply.response
 
-    assert session.get("maf").get_state() == old_state
+    assert AgentSession.from_dict(session.get("maf").get_state()).state["turns"] == 1
     assert session.get_framework_context() == {"safe": 1}
-    assert native_agent.run.called
+
+
+@pytest.mark.asyncio
+async def test_a_failed_context_write_back_in_a_stream_keeps_the_turn(runner, session, maf_agent, native_agent):
+    session.set_framework_context({"safe": 1})
+
+    class Unserializable:
+        pass
+
+    async def updates():
+        yield AgentResponseUpdate(message_id="m1", contents=[Content.from_text("Hello")])
+
+    def side_effect(*args, **kwargs):
+        native_session = kwargs["session"]
+        native_session.state["ak_context"] = {"bad": Unserializable()}
+        native_session.state["turns"] = 1
+        return ResponseStream(updates(), finalizer=AgentResponse.from_updates)
+
+    native_agent.run.side_effect = side_effect
+
+    events = [e async for e in runner.stream(maf_agent, session, [AgentRequestText(prompt="Hi")])]
+
+    assert [e.content for e in events if isinstance(e, TextDelta)] == ["Hello"]
+    assert AgentSession.from_dict(runner._session(session).get_state()).state["turns"] == 1
+    assert session.get_framework_context() == {"safe": 1}
 
 
 @pytest.mark.asyncio
@@ -571,7 +601,7 @@ async def test_stream_correlates_chunked_tool_calls_without_ids(runner, session,
         yield AgentResponseUpdate(contents=[Content.from_function_result(call_id="call_a", result={"temp": 72})])
         yield AgentResponseUpdate(contents=[Content.from_function_result(call_id="call_b", result="12:00")])
 
-    native_agent.run.return_value = ResponseStream(mock_stream())
+    native_agent.run.return_value = ResponseStream(mock_stream(), finalizer=AgentResponse.from_updates)
     events = [e async for e in runner.stream(maf_agent, session, [AgentRequestText(prompt="Hello")])]
 
     starts = [e for e in events if isinstance(e, ToolCallStart)]
@@ -823,6 +853,51 @@ class TestHumanInTheLoop:
         assert "".join(e.content for e in events if isinstance(e, TextDelta)) == "done: refunded A1"
         assert not any(isinstance(e, RunPaused) for e in events)
         assert PausedRunState.list(session) == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_context_write_back_on_resume_stream_still_records_the_tool_result(self, gated, refunded, session):
+        runner, agent = gated()
+        paused = [e async for e in runner.stream(agent, session, [AgentRequestText(prompt="refund please")])][-1]
+        decisions = [ResumeDecision(id=i.id, status="approved") for i in paused.interruptions]
+
+        runner, agent = gated()
+        runner._store_framework_context = MagicMock(side_effect=TypeError("framework_context is not picklable"))
+        _ = [e async for e in runner.resume_stream(agent, session, [], decisions, PausedRunState.get(session, paused.run_id))]
+
+        assert refunded == ["A1"]
+        # The stored conversation already holds the tool's result, so clearing the record is safe: the next turn
+        # continues from it rather than from the pre-pause snapshot with the approval still dangling.
+        restored = AgentSession.from_dict(runner._session(session).get_state())
+        history = [c.type for m in restored.state["in_memory"]["messages"] for c in m.contents]
+        assert "function_result" in history
+        assert PausedRunState.list(session) == []
+
+    @pytest.mark.asyncio
+    async def test_a_failed_context_write_back_on_resume_cannot_run_the_tool_twice(self, gated, refunded, session):
+        reply = await _pause(gated, session)
+
+        runner, agent = gated()
+        runner._store_framework_context = MagicMock(side_effect=TypeError("framework_context is not picklable"))
+        result = await runner.resume(agent, session, [], _decisions(reply), PausedRunState.get(session, reply.run_id))
+
+        assert isinstance(result, AgentReplyText) and "not picklable" in result.response
+        assert refunded == ["A1"]
+        # The conversation holds the tool's result, so the record is gone: answering again cannot re-run the refund
+        # from the pre-resume snapshot.
+        assert PausedRunState.list(session) == []
+        restored = AgentSession.from_dict(runner._session(session).get_state())
+        assert "function_result" in [c.type for m in restored.state["in_memory"]["messages"] for c in m.contents]
+
+    @pytest.mark.asyncio
+    async def test_a_resume_whose_conversation_cannot_be_stored_keeps_the_record(self, gated, refunded, session):
+        reply = await _pause(gated, session)
+
+        runner, agent = gated()
+        with patch.object(MAFSession, "set_state", side_effect=RuntimeError("session store unavailable")):
+            result = await runner.resume(agent, session, [], _decisions(reply), PausedRunState.get(session, reply.run_id))
+
+        assert isinstance(result, AgentReplyText) and "unavailable" in result.response
+        assert [r.id for r in PausedRunState.list(session)] == [reply.run_id]  # nothing recorded the outcome: retryable
 
     @pytest.mark.asyncio
     async def test_resume_stream_refuses_a_partial_resume_before_streaming(self, gated, session):

@@ -1,5 +1,5 @@
 [project]
-name = "maf-demo"
+name = "cli-maf"
 version = "0.1.0"
 description = "Agent Kernel - MAF CLI Demo"
 requires-python = ">=3.12"

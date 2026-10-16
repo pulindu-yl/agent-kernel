@@ -1,5 +1,5 @@
 [project]
-name = "maf-run-options"
+name = "cli-maf-run-options"
 version = "0.1.0"
 description = "Agent Kernel - MAF per-agent native run options demo"
 requires-python = ">=3.12"

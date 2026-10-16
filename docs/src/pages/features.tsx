@@ -1269,7 +1269,7 @@ function FrameworkSupport() {
     },
     {
       key: "maf",
-      name: "Microsoft Agents",
+      name: "Microsoft Agent Framework",
       description:
         "Microsoft Agent Framework (MAF), the unified successor to AutoGen and Semantic Kernel.",
       link: "/docs/next/frameworks/microsoft-agents",

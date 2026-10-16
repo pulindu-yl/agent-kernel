@@ -14,5 +14,8 @@ storyteller_agent = Agent(
 
 MAFModule([storyteller_agent])
 
+# Entry point referenced by the Dockerfile (from app import runner; runner()).
+runner = RESTAPI.run
+
 if __name__ == "__main__":
-    RESTAPI.run()
+    runner()
