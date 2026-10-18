@@ -26,11 +26,11 @@ Every transfer is logged (`Transferring from 'supervisor' to 'billing'`) and rea
 
 Realtime calls run an agent's ADK tool callbacks around every tool call, `transfer_to_agent` included, as an ADK run does. The supervisor's `before_tool_callback`, `require_account`, refuses a transfer to `billing` or `tech_support` until the caller's account is verified with `verify_account`: it returns a result in the tool's place, so the transfer does not happen, the supervisor keeps the call, and the model hears why. `verify_account` keeps the account in the ADK tool state, which lasts for the whole call, across transfers.
 
-## Background updates
+## A tool that waits
 
-`book_technician` answers at once and starts a background job with `RealtimeCall(session_id).run_in_background(...)`: the dispatch system confirms the visit a few seconds later. The job runs off the loop that paces the call's audio, after the call's earlier jobs, and reports back with `job.post(...)`, which waits for a quiet moment (nobody speaking, nothing still owed an answer) before the agent says it, so the update never cuts the caller or the agent off. Whichever agent has the call by then says it.
+`book_technician` is an `async` tool that waits for the dispatch system to confirm the visit (a few seconds, `DISPATCH_SECONDS`) and returns the confirmation as its result, which the agent then tells the caller. The tool waits on the realtime loop without blocking it, so every call's audio keeps playing. While it waits, the call counts as busy: nothing an application posts into the call is said, no `idle` event reaches a hook, and the model is not taken for stalled. The agent may say a short sentence before calling it, but Gemini decides when the call is made, so that sentence is not guaranteed to be heard first. If the call ends meanwhile, Agent Kernel cancels the tool and sends no result.
 
-The tool passes `refuse=`: while a booking for the same account is still with the dispatch system, a second one is refused, and the refusal is the tool's answer. The check runs under the lock that guards the submission, so two bookings made at once cannot both pass it.
+While a booking for an account is with the dispatch system, a second one for the same account (two calls in one model turn) is refused, and the refusal is the tool's answer.
 
 ## Call log
 
@@ -71,7 +71,7 @@ Connect to `room_01` in your LiveKit Sandbox dashboard and speak.
 1. *"Hi, why is my bill higher this month?"* — the supervisor asks for your account number first: a transfer before it is refused (`require_account`).
 2. *"It's A-1042."* — the supervisor verifies it and transfers you to **billing** (a new voice), which looks up the invoice without asking for your account number again.
 3. *"And my internet keeps dropping. My postcode is SW1A 1AA."* — billing transfers you to **tech_support**.
-4. *"Can someone come out on Friday?"* — tech_support requests a technician; a few seconds later, at a quiet moment, it tells you the dispatch system confirmed the visit.
+4. *"Can someone come out on Friday?"* — tech_support books a technician; once the dispatch system confirms the visit, a few seconds later, it tells you the time and the reference.
 
 The log shows the call as it goes (`CallLog`).
 
@@ -81,7 +81,7 @@ The log shows the call as it goes (`CallLog`).
 uv run pytest
 ```
 
-The tests need no model, LiveKit server or key: they check the handoff rule, the background confirmation and the call log.
+The tests need no model, LiveKit server or key: they check the handoff rule, the technician booking and the call log.
 
 ## Limits
 

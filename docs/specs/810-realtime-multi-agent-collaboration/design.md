@@ -1,15 +1,19 @@
-# #810: Realtime multi-agent collaboration with background work
+# #810: Realtime multi-agent collaboration
 
-Realtime support for applications in which voice agents and background agents work together: voice agents talk to
-the caller, hand off to each other and start work through short tools; background agents do the long work in their
-own sessions and report back into the call. The design idea: voice is the meeting room, not the engine. The pool
-gains the turn state and an outbox that let application code speak into a call at a quiet moment, and hooks that let
-it watch one; the Gemini adapter gains ADK's tool callbacks, authored history, the call's `RunConfig` and connection
-recovery. On top of these, the building blocks every such application otherwise builds itself: background jobs,
-facts about a call and an idle event, gateways opened and closed per session, and OpenAI's tool input guardrails in
-realtime. AK provides the mechanism; the
-application keeps the policy and the words. The changes were driven by a full application kept outside this
-repository.
+Realtime support for applications in which voice agents and other agents work together: voice agents talk to the
+caller and hand off to each other; a voice agent's tool can ask another registered agent and wait for its answer,
+which returns through the tool call. The design idea: voice is the meeting room, not the engine. The pool gains the
+turn state and an outbox that let application code speak into a call at a quiet moment, hooks that let it watch one,
+and ownership of its tool calls, so a call that ends cancels a tool still waiting; the Gemini adapter gains ADK's tool
+callbacks, authored history, the call's `RunConfig` and connection recovery. On top of these, the building blocks
+such an application otherwise builds itself: facts about a call and an idle event, and gateways opened and closed per
+session. AK provides the mechanism; the application keeps the policy and the words. The changes were driven by a full
+application kept outside this repository.
+
+Revised: an earlier version of this design added background jobs (`RealtimeCall.run_in_background`, a job loop hosted
+beside the pool) so a voice agent could keep talking while long work ran, its result posted later. The application's
+product decision is that the caller may wait for research and review, so their result comes back through the original
+tool call, and the job runner is removed (Open questions).
 
 Contract background: [`../809-realtime-multi-agent-handoffs/design.md`](../809-realtime-multi-agent-handoffs/design.md),
 [`../405-livekit-realtime-voice/design.md`](../405-livekit-realtime-voice/design.md).
@@ -35,28 +39,27 @@ Contract background: [`../809-realtime-multi-agent-handoffs/design.md`](../809-r
   - A socket error is reported as `error` (`adk.py:1219-1234`), the pool fails the connection (`realtime_pool.py:159-171`), and the next input starts over at the entry agent (`realtime_pool.py:95-98`) with no earlier turns (`docs/docs/integrations/livekit.md:288`)
   - The Live API ends a connection after about 10 minutes and an audio session after 15 minutes without compression; it offers session resumption ([Session management with Live API](https://ai.google.dev/gemini-api/docs/live-session))
   - What the caller says while no socket is open is dropped (`adk.py:1298-1308`), during a transfer too (`adk.py:1360-1361`)
-- Background agents cannot share the call's session: the pool runs tools inside the AK session lock (`realtime_pool.py:438`), which `Runtime.run` holds for a whole run (`runtime.py:393`); they run in sessions of their own
-- Every application that runs background agents builds the same infrastructure itself
-  - A thread with an event loop of its own, kept for the call's life (a model client keeps tasks on the loop of its first call), a queue, a session per job, and a way to drop queued work when the call ends; the example starts a bare thread per job (`examples/api/livekit-voice/google/handoffs/server.py:66`)
-  - A guard against starting the same job twice, which cannot race the submission it allows
+- An agent a voice tool asks cannot share the call's session: the pool runs tools inside the AK session lock (`realtime_pool.py:438`), which `Runtime.run` holds for a whole run (`runtime.py:393`); it runs in a session of its own
+- A tool still waiting when its call ends outlives the call
+  - The pool starts each tool call as a bare task (`realtime_pool.py:131`, `loop.create_task`) that closing the connection does not cancel: the tool keeps its session lock and its nested run, and its result is then sent to a disconnected adapter
+  - Tools were quick when this was written; a tool that awaits another agent's run (tens of seconds) makes it matter
 - A known gap this change does not close: a run that fails reads like an answer
   - Every adapter turns a framework error into an ordinary `AgentReplyText` (`user_facing_error_message`): 10 sites in 6 adapters (`adk.py:534,722`, `openai.py:263,425`, `langgraph.py:624,775`, `pydanticai.py:219,454`, `crewai.py:404`, `smolagents.py:188`); `Runtime.run` cannot tell either (`runtime.py:418-422`)
-  - A background job detects failure through its framework's own signal, during the run (the OpenAI Agents SDK calls `RunHooks.on_agent_end` only for a run that finished); see Non-goals
+  - A tool that asks another agent detects failure through its framework's own signal, during the run (the OpenAI Agents SDK calls `RunHooks.on_agent_end` only for a run that finished); see Non-goals
 - An application that nudges a stalled team runs a watcher thread per call, and tracks facts the pool already keeps
   - The connection keeps when the caller last spoke, when edge text arrived, when the agent changed and when a tool result was sent (`realtime_pool.py:174-211`); `RealtimeCall` exposes only `connected`, `quiet_for()` and `agent_has_spoken` (`realtime_pool.py:1138-1155`)
 - A gateway cannot be stopped on its own, so an application cannot give each session its own room
   - `GatewayRunner` stops only on the process-wide shutdown event (`gateway.py:63`)
   - `LiveKitEdgeGateway.stop()` before its `start()` has made its stop event does nothing, and `start()` then waits forever (`livekit/adapter.py:207,224,249`)
-- OpenAI realtime offers no tool that has input guardrails (`openai.py:839-840`), though the SDK's own realtime session runs them (`agents/realtime/session.py:1197`, `openai-agents` 0.20.0)
 
 ## Requirements
 
 ```mermaid
 flowchart TB
     C(["Caller"]) <--> E["Edge<br/>LiveKit room"]
-    E <--> V["Voice agents<br/>talk, hand off (tool callbacks can refuse), start work"]
-    V -- "short tools" --> J["Background jobs<br/>RealtimeCall.run_in_background<br/>an agent session per job"]
-    J -- "result or failure, posted" --> V
+    E <--> V["Voice agents<br/>talk, hand off (tool callbacks can refuse)"]
+    V -- "async tool, awaited" --> J["Another registered agent<br/>AgentService.run_multi<br/>a session of its own"]
+    J -- "result or failure: the tool's reply" --> V
     APP["Application code<br/>policies and wording"] -- "RealtimeCall.post_when_idle" --> V
     V -. "RealtimeHook events" .-> APP
 ```
@@ -116,58 +119,17 @@ flowchart TB
 - While recovering, the connection is not ready for posts; a failed connection is released by the pool even if no more input comes
 - OpenAI realtime is unchanged
 
-### Background jobs (`RealtimeCall.run_in_background`, `BackgroundJob`)
+### Tool calls that wait (`RealtimeConnection`)
 
-- `RealtimeCall(session_id).run_in_background(work, *, name, ...) -> BackgroundJob`: runs `async work(job)` off the realtime pool's loop; returns at once
-  - One job loop per process, of its own (never the pool's), run by the realtime host (Hosting and lifecycle, below)
-  - A session's jobs run one at a time, in the order submitted; other sessions' jobs run beside them
-  - Process-local, as `RealtimeCall` is: not a `QueueTransport` backend and not a distributed job service; agents run through `AgentService.run_multi`
-  - `work` returns text to post into the call, or `None`; it raises to fail
-- `BackgroundJob`: `id`, `name`, `session_id` (the call's), `arguments`, `status` (`queued`, `running`, `done`, `failed`, `cancelled`)
-  - `await job.ask(agent, prompt) -> AgentReply`: runs a registered agent through `AgentService.run_multi` in the job's own AK session, `<call session>-job-<job id>`, never the call's; a job's asks share it
-  - `ask` returns the reply as the runtime returned it: a framework error arrives as error text (Motivation), so `work` checks its framework's own signal and raises to fail
-  - `job.post(text, key=None)`: `post_when_idle` into the call
-  - `BackgroundJob.call_session_id(session_id)`: the call's session from a job's session, so a tool the background agent calls finds its call
-- Options, all off by default
-  - `job_id`: the application's own id (default `<name>-<random>`, so a default id never continues an earlier job's session); a duplicate of a queued or running job's id raises `ValueError`
-  - `arguments`: what the job is for, kept on the job
-  - `refuse(pending) -> str | None`: called under the session's job lock with its queued and running jobs; a text refuses the submission (`BackgroundJobRefused`), so a check and the submission it allows cannot race
-  - `wait_until_heard`: start only once the call has been quiet for a moment (what the agent said before calling the tool has been heard), at most 20 s; no wait without a live call
-  - `on_error(job, error) -> str | None`: text to post when `work` raises; without it the error is logged and nothing is posted
-- `RealtimeCall.jobs`: the session's queued and running jobs
-- `RealtimeCall.close()` also ends the call's jobs: those whose work has not started (one waiting to be heard included) are `cancelled` and never run, the running one finishes, and nothing any of them posts afterwards reaches a later call of the session: a job's post checks the call and queues the text as one step
-- Work raising `asyncio.CancelledError` ends its job as `cancelled`, and the call's next job runs; a worker that is itself cancelled hands the queue to a new one, except during host shutdown
-- Each job ends once: one terminal status, one `finished_at`, and `on_error` called at most once
-- Callbacks run outside the runner's locks, except `refuse`, which runs under the job lock so its check is atomic with the submission: it must be fast and must not call back into the runner (submit, close, post)
-- No policy: no retries, no failure counting, no wording beyond log lines
-
-### Hosting and lifecycle (`BackgroundJobRunner`)
-
-- Hosted like the pool: `BackgroundJobRunner.initialize()` and `get_task()`, a `ThreadRunner.Task` (`graceful`, `stop_all_on_failure`) whose `start()` supervises the job loop until `ThreadRunner.shutdown_event` or the runner's own `stop()`
-  - The loop runs on a thread of its own; the task's thread starts it, watches it and drives shutdown from outside it, with time-bounded waits, so a loop blocked by application code cannot hold the host
-  - Registered beside the pool in `RealtimeAgentRunner._get_extra_tasks()` (`pipeline/agent_runner.py:266`) and `ECSRealtimeAgentRunner._get_extra_tasks()` (`deployment/aws/containerized/akagentrunner.py:299`); the single-process `IOHandler` reaches it through `RealtimeAgentRunner` (`pipeline/io_handler.py:146`)
-  - No other execution mode starts a job loop; constructing the runner starts no thread
-  - The loop's thread dying fails the host (`stop_all_on_failure`); a job's exception stays that job's
-- Submission needs a ready host, and never waits: a voice tool may submit on the pool's loop, which paces the audio
-  - No runner in the process, a runner not yet ready, or a runner shutting down: `run_in_background` raises `RuntimeError` at once, saying which and that the realtime host runs the job runner
-  - Readiness is established at startup, on a consumer thread: before it opens a call's connection, `RealtimeConnectionPool.get_or_create` waits for an initialized job runner's loop, at most 10 s, beside its existing wait for its own loop (a warning if it is still not ready; the call opens, and submissions raise). No tool runs before a connection exists
-  - Connections opening at once wait for the same outcome, under a lock of its own (no connection or job lock held); only a wait that succeeded is remembered, so after a timeout the next connection waits again
-  - Shutdown closes admission under the job lock before anything else: a submission either lands first, and is then cancelled by shutdown, or is refused
-- Call closure (`RealtimeCall.close()`): as above; it never stops or closes the shared job loop
-- Host shutdown (`ThreadRunner.shutdown_event`, or `stop()`), in order
-  1. In one step under the job lock: close admission, mark every job's posts suppressed (the calls are closing), and end every queued job and every job still waiting to be heard as `cancelled`
-  2. Outside the lock: their `on_error` gets `BackgroundJobCancelled`; nothing it returns is posted, since posts are already suppressed
-  3. Give running work `SHUTDOWN_GRACE_SECONDS` (5) to finish
-  4. Always, whatever the jobs' status, ask the loop to cancel every task still on it (a cancelled job's worker may still be waiting; finished work may have left tasks of its own, such as an SDK's listener), and give them `CANCEL_CLEANUP_SECONDS` (5) to end; job status alone does not prove the loop clean
-  5. Log an error naming each job still not ended, ask the loop to stop, and wait for its thread briefly; the loop closes itself, on its own thread, once it stops
-  - Both are cleanup budgets, not a guaranteed shutdown time: application code that blocks the job loop cannot run its cancellation, and Python cannot stop it. The host stops waiting, logs that the loop is still blocked, and that work remains until the process exits (documented)
-  - No session worker is restarted during shutdown; nothing on the pool's loop waits on the job thread
-- Both bounds are class constants, no configuration: 5 s each, the scale of the existing cleanup bounds (the pool's 2 s, `GatewayRunner.GRACEFUL_STOP_TIMEOUT_SECONDS` of 10 s)
-- Intentional change for direct callers: background jobs run only where a realtime host runs the job runner; a script or test with none gets the `RuntimeError` above
-- Test support: `BackgroundJobHost` (`pipeline/testing.py`, beside `QueueTransportContract`, which imports `pytest`: for test fixtures, not production scripts) is a context manager that creates a runner, runs its `start()` on a thread and stops it with `stop()`, the production shutdown path
-  - It stops only the runner it created; it refuses to start while a runner already exists in the process, and never sets `ThreadRunner.shutdown_event`
-  - Test fixtures may host infrastructure this way; application code never touches the internal runner, its loop or its locks
-  - `reset()` for AK's own tests stops a runner through the same `stop()`
+- A realtime tool may be an `async` function that awaits long work, such as another registered agent's run through `AgentService.run_multi` in a session of its own, and returns its result as the tool call's answer; nothing in AK is specific to it
+  - It runs on the pool's loop, through the existing tool path (the framework's tool builder, the adapter's `execute_tool`, the call's session and `Agent._activate()`); an SDK's async client yields the loop while it waits, so other calls' audio keeps its pace; blocking work belongs in `asyncio.to_thread`
+  - The nested run uses its own session: the waiting tool holds the call's session lock
+- The connection owns its tool calls: each is a task of the connection, and the connection knows which are still running
+- While a tool call runs, the call is busy (`is_responding`): no post is said and no `idle` is reported; on Gemini the stall wait starts again only when the result is sent, so a slow tool is not taken for a stalled socket
+- Closing the connection (`RealtimeCall.close()`, an idle or failed-socket eviction, pool shutdown) cancels its running tool calls and waits briefly (`_TOOL_CANCEL_SECONDS`, 2 s) for them to unwind before the adapter disconnects; the cancellation unwinds a nested run and releases its session
+- No result is sent once the connection is closed or its socket failed, whether the tool was cancelled, ignored its cancellation, or finished just then: a late result never reaches a dead socket or the session's next connection
+- A socket the Gemini adapter recovers keeps its existing rule: tools still running are waited for briefly (`LOST_TOOL_WAIT_SECONDS`), a later result is kept in the history, sent to no socket, and the tool is never rerun by AK
+- No time limit, retries or wording in AK: an application bounds its own wait (`asyncio.timeout`)
 
 ### Facts about a live call, and an idle event (`RealtimeCall`, `RealtimeHook`)
 
@@ -190,14 +152,6 @@ flowchart TB
   - Any `StatefulEdgeAdapter` with a `session_id`; runs in the process of the Response Handler, as `GatewayRunner` does
   - A gateway leaving unregisters only its own entry, never the one a later `open` registered for the same session
 
-### OpenAI realtime: tool input guardrails (`OpenAIRealtimeRunner`)
-
-- A tool with `tool_input_guardrails` is offered, and its guardrails run before it, in order, as the SDK's realtime session runs them
-  - `reject_content`: the tool does not run; the guardrail's message is the tool's result
-  - `raise_exception`: `ToolInputGuardrailTripwireTriggered` is raised and logged; the pool answers the model with the error, as for any tool that raises
-- Tools that need approval or carry output guardrails stay excluded (no realtime pause); handoffs get no guardrails, since the SDK has none for them (`on_handoff` raising already refuses a handoff)
-- This is for OpenAI applications; the Gemini team already refuses tools through ADK's callbacks
-
 ### Diagnostics
 
 - The pool warns when its loop is blocked for more than a second; the ADK adapter logs how long the caller waited for an agent to start speaking
@@ -208,26 +162,26 @@ flowchart TB
   - Turn detection, languages: ADK's `RunConfig` already holds them, carried by `Module.run_options`
   - Post timing, reconnect and stall thresholds: values settled in live runs, kept as constants rather than knobs nobody has asked to tune
   - The idle threshold: per hook (`idle_after_seconds`), since two hooks may want different ones
-  - The job loop, the heard wait: constants; a job's options are per call
+  - The tool-cancel wait: a constant, at the scale of the hook drain (2 s); a tool's own time limit is the application's
 - No new extra; existing YAML and `AK_*` env vars stay valid
 
 ### Example (`examples/api/livekit-voice/google/handoffs/`)
 
-- The existing handoffs example gains: a `before_tool_callback` that refuses a handoff to a specialist until the caller's account is verified, a technician booking that a background job confirms through `post_when_idle`, and a `RealtimeHook` that logs the call
-- The booking confirmation is a background job: `book_technician` submits it with `run_in_background` instead of starting a thread, and refuses a second booking while one is under way
+- The existing handoffs example gains: a `before_tool_callback` that refuses a handoff to a specialist until the caller's account is verified, a technician booking whose tool waits for the dispatch system's confirmation, and a `RealtimeHook` that logs the call
+- `book_technician` is an `async` tool that awaits the confirmation and returns it, instead of starting a thread; a second booking for the same account is refused while one is under way
 - Offline tests; the example runs them in the CI e2e matrix
 
 ### Tests
 
 - Offline, against scripted sockets: `ak-py/tests/test_realtime_pool.py`, `test_module.py`, `test_livekit_gateway.py`, `test_ecs_akagentrunner_realtime.py`; the example's `server_test.py`
-- New: `test_realtime_jobs.py` (background jobs), `test_integration_gateway_runner.py` cases for `stop()` and `GatewayPool`
-- Job hosting: shutdown with only a waiting job, and with a task left by finished work; concurrent first connections waiting for readiness; startup and readiness, repeated `initialize()`, both realtime runner hosts registering the task, graceful shutdown in its order, the shutdown/submission race, no worker restarted after shutdown, a cleanup timeout (cooperative doubles released afterwards, no test thread left behind)
-- Live runs on `gemini-3.1-flash-live-preview`, done by the maintainer: handoffs, a background post, a forced drop, a call past 10 minutes
+- New: `test_integration_gateway_runner.py` cases for `stop()` and `GatewayPool`; `TestRealtimeAwaitedTools` in `test_realtime_pool.py`: busy while a tool waits (no post, no `idle`), the result sent once, the call's session and agent back after a nested run, cancellation on close (directly and through `RealtimeCall.close()`) with locks released and nothing sent, nothing sent after a failed socket or by a tool that ignored its cancellation; a Gemini tool slower than the stall wait not taken for a stall
+- The application drives the awaited path end to end (its voice tools through `GoogleADKToolBuilder`, the Gemini adapter and the connection, its background agents through `AgentService` and the OpenAI Agents SDK against a local stand-in for the Responses API)
+- Live runs on `gemini-3.1-flash-live-preview`, done by the maintainer: handoffs, a forced drop, a call past 10 minutes, and how long callers wait for research and review
 
 ### Documentation and skills
 
 - `docs/docs/integrations/livekit.md`, `hooks.md`; `docs/docs/architecture/realtime-internals.md`
-- Background jobs, the call facts, the idle event, `GatewayPool` and OpenAI tool guardrails in `livekit.md` and `realtime-internals.md`
+- Tools that wait, the call facts, the idle event and `GatewayPool` in `livekit.md` and `realtime-internals.md`
 - `.agents/skills/ak-dev-architecture/SKILL.md` (a realtime section), `.agents/skills/ak-dev-testing-conventions/SKILL.md`
 - `docs/versioned_docs/` is never edited
 
@@ -237,11 +191,12 @@ flowchart TB
 - ADK plugins in realtime; recovery for the OpenAI realtime adapter
 - Detecting a voice turn the model never answers; bounding the replayed history. The `idle` event reports a quiet call; it does not decide that the team is stuck
 - An AK gate for tools and handoffs: ADK's tool callbacks and the OpenAI SDK's tool guardrails and `on_handoff` already refuse them, on both paths; a realtime-only AK gate would make the same agent follow different rules in a call and over REST
-- Policies in AK: no handoff limits, retry counts, nudge wording or job refusal rules; an application writes them in its own classes
-- Background jobs across processes: a job runs in the process that submitted it, as `RealtimeCall` reaches only that process's calls; no job queue backend, no distributed job service
-- Background jobs outside a realtime host: no job loop starts on demand
-- Reporting a failed run as failed (a failed-reply type across the 10 adapter error sites), and a generic background-agent tool built on it: the application that drove this change detects failure natively and needs its own steps around each run (citations watched during the run, a check after it), so neither would have a user here; both can come with the application that needs them
-- Approval (`needs_approval`) and tool output guardrails in OpenAI realtime: approval needs a realtime pause, which AK does not have
+- Policies in AK: no handoff limits, retry counts, nudge wording, time limits or refusal rules; an application writes them in its own classes
+- Background work in AK: no job runner, queue or loop of its own; long work is an awaited tool, and work that must outlive its tool call is the application's
+- A sub-agent framework or an agent-as-tool in AK: a tool selecting an agent and running it through `AgentService` is ordinary application code
+- Reporting a failed run as failed (a failed-reply type across the 10 adapter error sites), and a generic agent tool built on it: the application that drove this change detects failure natively and needs its own steps around each run (citations watched during the run, a check after it), so neither would have a user here; both can come with the application that needs them
+- Approval (`needs_approval`) and tool guardrails (input or output) in OpenAI realtime: approval needs a realtime pause, which AK does not have, and this runner calls a tool directly, so it does not offer a guarded tool (unchanged)
+- Gemini's tool call cancellation (`toolCallCancellation`): neither adapter acts on it; a result is still sent for a call the server cancelled
 - Gemini's native session resumption: a follow-up. A handoff needs a new socket for the new agent anyway, and the replay already recovers a drop and the ~10 minute limit; resumption would also need context window compression (an audio session ends at 15 minutes without it) and is unproven on the preview Live model
 - A browser voice edge (a web page carrying a call with no media server); an application can build one on the public edge seam (`StatefulEdgeAdapter`, `StatefulEdgeRegistry`)
 - The application that drove these changes
@@ -254,10 +209,9 @@ flowchart TB
 - Resolved: no native session resumption in this change (Non-goals); recovery replays the conversation with a one-time note
 - Resolved: a late tool result is kept in the history, not sent to the recovered socket (unverified on Gemini 3.x Live)
 - Resolved: tool calls Gemini writes into its words (`transfer_to_agent{...}`) are not stripped in the adapter; edges filter what they show
-- Resolved: the building blocks an application needs (background jobs, call facts and the idle event, per-session gateways, OpenAI tool guardrails) ship in this PR, proved by migrating the application that drove them
-- Resolved: no failed-reply type and no background-agent tool in this PR (Non-goals): a check on the reply alone cannot tell an error from an answer, so failure is detected during the run, natively, by the job's own code
+- Resolved: the building blocks an application needs (call facts and the idle event, per-session gateways, tool calls the connection owns) ship in this PR, proved by migrating the application that drove them
+- Resolved (revised): no background jobs. The application's product decision is that the caller may wait while research or review runs, so their result returns through the original tool call. Awaited tools need nothing new from AK beyond the connection owning its tool calls; the job runner, its hosting in both realtime runners, the pool's readiness wait, `BackgroundJobHost` and the job API are removed from this PR. Nothing of it was released
+- Resolved (revised): OpenAI realtime tool input guardrails are out of this PR, to keep it to what the application depends on; a tool with any tool guardrail stays unoffered, as before
+- Resolved: no failed-reply type and no agent tool in this PR (Non-goals): a check on the reply alone cannot tell an error from an answer, so failure is detected during the run, natively, by the application's own code
 - Resolved: the idle signal is a `RealtimeHook` event, not a new callback, so it inherits the hooks' ordering, isolation and attachment
-- Resolved: one job loop per process, not a thread per call: no thread to leak when an application never ends a call, and no loop closed under a model client's tasks; the realtime host starts it and shuts it down, as it does the pool (no thread started on first use)
-- Resolved: the shutdown bounds, 5 s for running work and 5 s for cancellation, as cleanup budgets
-- Resolved: `BackgroundJobHost` for test fixtures
-- Resolved (revised): the pool and the jobs move together into `pipeline/realtime/` (`pool.py`, `jobs.py`); no compatibility module for the old `realtime_pool.py` path, which was never released (the public path is `agentkernel.pipeline`); `core/realtime/` and `integration/adapter/` are unchanged
+- Resolved (revised): the pool stays in `pipeline/realtime_pool.py`, the path released in agentkernel 0.9.5, so its imports, singleton and patch targets are unchanged; no `pipeline/realtime/` package. `core/realtime/` and `integration/adapter/` are unchanged

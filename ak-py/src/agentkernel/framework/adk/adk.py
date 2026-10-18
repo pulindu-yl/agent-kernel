@@ -1082,6 +1082,8 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         # When the socket was last reconnected, and how many reconnected sockets in a row were lost again soon after.
         self._reconnected_at: float | None = None
         self._quick_drops = 0
+        # The Live model the open socket runs, which decides how text is sent to it (``send_text``).
+        self._socket_model: str | None = None
         # For the first-audio log: when the caller's words were last transcribed, and when the model was last
         # given something to answer (a tool result, text), until its next turn starts speaking.
         self._caller_words_at: float | None = None
@@ -1301,6 +1303,7 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
         connection = await cm.__aenter__()
         self._cm = cm
         self._active = sdk_agent
+        self._socket_model = model
         if seeded:
             turn_complete = turns[-1].role == "user"
             await connection.send_client_content(turns=turns, turn_complete=turn_complete)
@@ -1662,10 +1665,16 @@ class GoogleADKRealtimeRunner(BaseRealtimeRunner):
             self._hold_audio(base64.b64decode(base64_audio))
 
     async def send_text(self, text: str) -> None:
+        """Send a user text turn, as ADK's live connection sends one: on Gemini 3.x Live as realtime input
+        (``send_realtime_input(text=...)``), since the caller's audio already goes that way and the SDK warns against
+        interleaving it with client content; on earlier models as a completed client-content turn."""
         if self._connection:
             await self._end_turn_and_report()
             self._history.append(self._Said("user", types.Content(role="user", parts=[types.Part(text=text)])))
-            await self._connection.send_client_content(turns=types.Content(role="user", parts=[types.Part(text=text)]), turn_complete=True)
+            if self._socket_model is not None and self._is_gemini_3_live(self._socket_model):
+                await self._connection.send_realtime_input(text=text)
+            else:
+                await self._connection.send_client_content(turns=types.Content(role="user", parts=[types.Part(text=text)]), turn_complete=True)
             # A wait already running is kept: only the model's progress moves it. Otherwise text sent every so often
             # to a socket that has stopped answering (an application's nudges) keeps it from being taken for stalled.
             if self._owed_since is None:

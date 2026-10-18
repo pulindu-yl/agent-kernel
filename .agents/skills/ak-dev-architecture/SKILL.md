@@ -11,7 +11,7 @@ description: >
   threads (the integration/thread package), secret resolution (agentkernel.secret: SecretManager,
   SecretProvider, env/aws_ssm), messaging integrations (the integration/adapter
   seam: InboundAdapter/OutboundAdapter, WebhookRESTRequestHandler, PollerRunner), realtime voice
-  (RealtimeConnectionPool, the RealtimeRunner adapters, RealtimeCall, RealtimeHook, background jobs, GatewayPool, the LiveKit gateway),
+  (RealtimeConnectionPool, the RealtimeRunner adapters, RealtimeCall, RealtimeHook, tool calls that wait, GatewayPool, the LiveKit gateway),
   the adapter pattern, the queue execution pipeline
   (agentkernel.pipeline: QueueMessage/QueueTransport/ConsumerLoop, the in_memory transport,
   AgentRunner/ResponseHandler/RequestHandler/IOHandler, the RESTAPI.run delegation rule, and the
@@ -594,7 +594,7 @@ Platform --poll-----> PollerRunner ---------------> (same adapter surface) -----
   `tests/test_integration_adapter_contract.py`; `tests/test_integration_roundtrip.py` drives a
   platform event through the whole `in_memory` topology to a recording outbound adapter.
 
-## Realtime Voice (`pipeline/realtime/`, `core/realtime/`, `integration/livekit/`)
+## Realtime Voice (`pipeline/realtime_pool.py`, `core/realtime/`, `integration/livekit/`)
 
 Live voice calls (`execution.mode: realtime`), specs #405, #809 and #810, internals in
 `docs/docs/architecture/realtime-internals.md`. A call does **not** go through `Runtime.run()`: no
@@ -612,8 +612,15 @@ Caller <-> LiveKitEdgeGateway (StatefulEdgeAdapter, hosted by GatewayRunner via 
   hand it input thread-safely. The loop evicts connections idle for 300 s and connections whose socket
   failed (every 5 s), paces model audio at playback speed (`execution.realtime.playback_lead_ms`), and
   warns when it was blocked for over a second. Tools run inside `async with session` and
-  `Agent._activate()`, so they hold the session lock; long work belongs in a background agent with a
-  session of its own. The realtime path loads the AK session once per connection and never stores it.
+  `Agent._activate()`, so they hold the session lock; a tool that asks another agent runs it in a session of
+  its own. The realtime path loads the AK session once per connection and never stores it.
+- **Tool calls that wait** (#810): a tool call is a task of its connection (`RealtimeConnection._tool_tasks`); an
+  `async` tool may await long work (another agent's `AgentService.run_multi`, which yields the pool's loop) and
+  return its result through the original call. While it runs the call is `is_responding` (no posts, no `idle`),
+  and ADK's stall wait restarts only when the result is sent. `RealtimeConnection.close()` (application close,
+  eviction, shutdown) cancels the tool tasks, waits `_TOOL_CANCEL_SECONDS` (2 s) for them to unwind, and a result
+  that comes once the connection is `closed` (closed or socket failed) is never sent. No AK time limit, retries or
+  wording: those are the application's. No background-job runner (removed from #810).
 - **Adapter contract** (`core/realtime/runner.py`, `RealtimeRunner`): `connect(session, agent, callback)`,
   `append_audio`, `send_text`, `execute_tool`, `send_tool_result`, `disconnect`, `team(agent)`. Callback
   events: `audio_delta`, `transcript_delta`, `tool_call`, `done` (status `reconnecting` when a lost socket
@@ -633,36 +640,20 @@ Caller <-> LiveKitEdgeGateway (StatefulEdgeAdapter, hosted by GatewayRunner via 
   `last_tool_result_at`, `close()`. `post_when_idle(..., while_quiet=True)` ties a post to the current quiet
   stretch (`RealtimeOutbox.quiet_since`, which a handover also ends): refused when the call is not quiet, dropped
   once the stretch changes (a new connection included); a stale `idle` is dropped before its hook runs. In-process only: it reaches a call only in the process running the pool.
-- **Package layout** (#810): `pipeline/realtime/pool.py` (the pool, `RealtimeConnection`, `RealtimeOutbox`,
-  `RealtimeCall`) and `pipeline/realtime/jobs.py` (background jobs); `core/realtime/` keeps the adapter contracts and
-  audio primitives, `integration/adapter/` the gateways. The public path is `agentkernel.pipeline` (lazy exports
-  into `realtime.pool` / `realtime.jobs`); there is no module at the old `pipeline/realtime_pool.py` path, which was
-  never released. Loggers: `ak.pipeline.realtime.pool`, `ak.pipeline.realtime.jobs`.
-- **Background jobs** (`pipeline/realtime/jobs.py`, #810): `RealtimeCall.run_in_background(work, name=, job_id=,
-  arguments=, wait_until_heard=, on_error=, refuse=)` returns a `BackgroundJob` at once, or raises `RuntimeError`
-  at once with no running runner (never waits: it may be on the pool's loop). `BackgroundJobRunner` (process-wide,
-  internal) is hosted like the pool: `initialize()` + `get_task()` in both `RealtimeAgentRunner` and
-  `ECSRealtimeAgentRunner` `_get_extra_tasks()`; `start()` runs one loop on its own thread (`ak-background-jobs`),
-  supervises it and drives a bounded shutdown (admission closed, posts suppressed, queued/waiting jobs cancelled,
-  5 s grace, then always cancel every task left on the loop and wait for them up to 5 s, the rest logged as
-  abandoned); the pool's `get_or_create` waits for its readiness on a consumer thread, concurrent first connections
-  waiting for the same outcome under a lock of its own, and only success remembered. A session's jobs run one at a time in order; `refuse(pending)` and the id check
-  run under the submission's lock; each job ends once (`_end`); `post` is runner-owned. Tests host it with
-  `pipeline/testing.py::BackgroundJobHost`.
-  `job.ask(agent, prompt)` runs `AgentService.run_multi` in `<call>-job-<id>` and returns the reply as is (a
-  framework error is error text: `work` detects failure through its framework's own signal and raises);
-  `job.post` is dropped once the call ended. `RealtimeCall.close()` cancels queued jobs (`on_error` gets
-  `BackgroundJobCancelled`). No policy: no retries, counts or wording. No failed-reply type and no
-  background-agent tool (810 Non-goals).
+- **Module layout** (#810): `pipeline/realtime_pool.py` (the pool, `RealtimeConnection`, `RealtimeOutbox`,
+  `RealtimeCall`), the path agentkernel 0.9.5 shipped, so its imports and patch targets (`_SHUTDOWN_GRACE_SECONDS`,
+  ...) are unchanged; `core/realtime/` keeps the adapter contracts and audio primitives, `integration/adapter/` the
+  gateways. The public path for `RealtimeCall` is `agentkernel.pipeline` (lazy export into `realtime_pool`). Logger:
+  `ak.pipeline.realtime_pool`.
 - **`RealtimeHook` / `RealtimeEvent`** (`core/hooks.py`, #810): observe a call (`connected`, `caller_said`,
   `edge_text`, `agent_said`, `agent_changed`, `reconnected`, `disconnected`, `idle`); attached with
   `Module.realtime_hook(agent, hooks)` to the agent a call starts with; one queue and task per
   connection, off the audio path; a failing hook is logged. `idle` goes only to a hook setting
   `idle_after_seconds`, at `n`, `2n`, ... seconds of one quiet stretch (keyed by `RealtimeOutbox.quiet_since`), through the same queue as
   `(event, only)`.
-- **OpenAI specifics** (`framework/openai/openai.py`): a tool's `tool_input_guardrails` run in `execute_tool`
-  before it (`reject_content` is the result, `raise_exception` raises); tools needing approval or with output
-  guardrails are not offered. A handoff is refused by `on_handoff` raising.
+- **OpenAI specifics** (`framework/openai/openai.py`): tools needing approval or carrying tool guardrails (input or
+  output) are not offered, since this runner calls the tool directly and would skip them. A handoff is refused by
+  `on_handoff` raising.
 - **Google ADK specifics** (`framework/adk/adk.py`): every tool call runs between the calling agent's
   `before/on_error/after_tool_callback`, mirroring ADK's order, so a callback can refuse
   `transfer_to_agent`; plugins do not run. A transfer seeds the new socket with the call's history,
@@ -681,7 +672,7 @@ Caller <-> LiveKitEdgeGateway (StatefulEdgeAdapter, hosted by GatewayRunner via 
   failed, and refuses an adapter built for another session. A leaving gateway unregisters only its own registry
   entry (`StatefulEdgeRegistry.unregister(session_id, adapter=...)`), so it cannot remove its replacement's.
 - **Testing**: `tests/test_realtime_pool.py` drives the pool and both adapters against scripted sockets
-  (`_FakeLiveClient` / `_FakeLiveSession` for Gemini); `tests/test_realtime_jobs.py` the background jobs;
+  (`_FakeLiveClient` / `_FakeLiveSession` for Gemini), awaited tool calls included (`TestRealtimeAwaitedTools`);
   `tests/test_integration_gateway_runner.py` `stop()` and `GatewayPool`; `tests/test_livekit_gateway.py` covers the edge;
   `examples/api/livekit-voice/google/handoffs/server_test.py` runs offline in the e2e matrix.
 

@@ -8,27 +8,26 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 
-from ...core.base import Agent as BaseAgent
-from ...core.base import Session
-from ...core.config import AKConfig
-from ...core.event import AgentChanged, AudioDelta, Interrupt, TextDelta
-from ...core.hooks import RealtimeEvent
-from ...core.model import StreamChunk
-from ...core.realtime import EDGE_SAMPLE_RATE, PCM16Resampler
-from ...core.realtime import RealtimeRunner as BaseRealtimeRunner
-from ...core.runtime import Runtime
-from ...core.tool import ToolContext
-from ..envelope import ATTR_INTEGRATION, ATTR_REALTIME, ATTR_REQUEST_ID, ATTR_USER_ID, REPLY_CONTEXT_PREFIX, QueueMessage, QueueName
-from ..integration_delivery import IntegrationDelivery
-from ..thread_runner import ThreadRunner
-from ..transport.base import QueueTransport, QueueTransportFactory
+from ..core.base import Agent as BaseAgent
+from ..core.base import Session
+from ..core.config import AKConfig
+from ..core.event import AgentChanged, AudioDelta, Interrupt, TextDelta
+from ..core.hooks import RealtimeEvent
+from ..core.model import StreamChunk
+from ..core.realtime import EDGE_SAMPLE_RATE, PCM16Resampler
+from ..core.realtime import RealtimeRunner as BaseRealtimeRunner
+from ..core.runtime import Runtime
+from ..core.tool import ToolContext
+from .envelope import ATTR_INTEGRATION, ATTR_REALTIME, ATTR_REQUEST_ID, ATTR_USER_ID, REPLY_CONTEXT_PREFIX, QueueMessage, QueueName
+from .integration_delivery import IntegrationDelivery
+from .thread_runner import ThreadRunner
+from .transport.base import QueueTransport, QueueTransportFactory
 
 if TYPE_CHECKING:  # typing only; the runners pass these in
-    from ...core.chat_service import ChatService
-    from ...core.model import BaseRunRequest
-    from .jobs import BackgroundJob
+    from ..core.chat_service import ChatService
+    from ..core.model import BaseRunRequest
 
-_log = logging.getLogger("ak.pipeline.realtime.pool")
+_log = logging.getLogger("ak.pipeline.realtime_pool")
 
 # Bound on a consumer thread's wait for a model send to complete before the input is acked.
 _SEND_TIMEOUT_SECONDS = 10.0
@@ -41,6 +40,9 @@ _SWEEP_SECONDS = 5.0
 _SHUTDOWN_GRACE_SECONDS = 2.0
 # When a connection closes, how long its realtime hooks may take over the events still waiting for them.
 _HOOK_DRAIN_SECONDS = 2.0
+# When a connection closes, how long its cancelled tool calls may take to unwind (release the session lock, close
+# what they opened) before the adapter is disconnected without them.
+_TOOL_CANCEL_SECONDS = 2.0
 # How often the pool's loop looks for a quiet moment to say what applications posted into their calls.
 _POST_POLL_SECONDS = 0.25
 # A response whose ``done`` never arrives stops counting as under way once the model has generated
@@ -90,6 +92,9 @@ class RealtimeConnection:
         # once.
         self._disconnecting = False
         self.last_activity_at: float = time.time()
+        # The tool calls running for this connection: cancelled when it closes, since their results have no
+        # socket left to go to, and each holds the session lock while it runs.
+        self._tool_tasks: set[asyncio.Task] = set()
         # Turn state, for code that talks into the call (possibly from another thread) to tell a
         # quiet call from a busy one; ``last_activity_at`` cannot, as every caller audio frame moves it.
         self._tools_in_flight = 0
@@ -306,7 +311,9 @@ class RealtimeConnection:
         elif event_type in ("done", "transcript_delta", "agent_changed"):
             await self._audio_queue.put((event_type, data))
         elif event_type == "tool_call":
-            self.loop.create_task(self._execute_tool_and_reply(data["call_id"], data["name"], data["arguments"]))
+            task = self.loop.create_task(self._execute_tool_and_reply(data["call_id"], data["name"], data["arguments"]))
+            self._tool_tasks.add(task)
+            task.add_done_callback(self._tool_tasks.discard)
         elif event_type == "caller_transcript":
             if (data.get("text") or "").strip():
                 self._observe("caller_said", text=data["text"].strip())
@@ -430,9 +437,15 @@ class RealtimeConnection:
 
         The call counts toward ``is_responding`` until its result is sent, which then marks
         ``last_tool_result_at``: the model owes a reply to it.
+
+        The call is a task of this connection's (``_tool_tasks``), which :meth:`close` cancels: a
+        tool may await long work, such as another agent's run, and the call may end meanwhile. A
+        result that comes once the connection is closed (or its socket failed) is not sent: that
+        socket is gone, and the session's next call is another conversation.
         """
         _log.info(f"Executing tool {name} for session {self.session_id}")
         self._tools_in_flight += 1
+        sent = False
         try:
             # The adapter activates this context in its framework's own way (OpenAI sets the
             # contextvar around ``on_invoke_tool``; ADK enters the cache the wrapper fetches from).
@@ -448,10 +461,18 @@ class RealtimeConnection:
                 _log.exception(f"Tool execution {name} failed")
                 result_str = f"Error: {e}"
 
+            if self.closed:
+                _log.info(f"Tool {name} finished after session {self.session_id} closed; its result is not sent: {result_str[:200]}")
+                return
             _log.info(f"Tool {name} result: {result_str[:200]}")
+            sent = True
             await self.adapter.send_tool_result(call_id, result_str)
+        except asyncio.CancelledError:
+            _log.info(f"Tool {name} of session {self.session_id} was cancelled: the call closed")
+            raise
         finally:
-            self._last_tool_result_at = time.time()
+            if sent:
+                self._last_tool_result_at = time.time()
             self._tools_in_flight -= 1
 
     async def _emit(self, chunk: StreamChunk) -> None:
@@ -481,7 +502,7 @@ class RealtimeConnection:
         :param text: The text to put into the conversation; the model responds to it.
         :param from_edge: The text came from the edge (the caller typed it, or the edge sent it for
             them); it then marks :attr:`last_edge_text_at`. Leave it unset for text the application
-            sends itself, such as a background job reporting back.
+            sends itself, such as an update posted into the call.
         """
         self.last_activity_at = time.time()
         if from_edge:
@@ -519,10 +540,12 @@ class RealtimeConnection:
             _log.error(f"Realtime session {self.session_id}: failed to {action}: {task.exception()}")
 
     async def close(self) -> None:
-        """Stop pacing and disconnect the adapter; a second call returns at once.
+        """Stop pacing, cancel the tool calls still running, and disconnect the adapter; a second call returns at once.
 
-        The realtime hooks are told the call is ``disconnected``, and given a moment
-        (``_HOOK_DRAIN_SECONDS``) to finish the events still waiting for them.
+        A cancelled tool call sends no result, and is given a moment (``_TOOL_CANCEL_SECONDS``) to
+        unwind before the adapter disconnects. The realtime hooks are told the call is
+        ``disconnected``, and given a moment (``_HOOK_DRAIN_SECONDS``) to finish the events still
+        waiting for them.
         """
         self.closed = True
         if self._disconnecting:
@@ -532,10 +555,23 @@ class RealtimeConnection:
             self._pacing_task.cancel()
             self._pacing_task = None
         try:
+            await self._cancel_tools()
             await self.adapter.disconnect()
         finally:
             self._report_closed()
             await self._finish_hooks()
+
+    async def _cancel_tools(self) -> None:
+        """Cancel the tool calls still running, and wait at most ``_TOOL_CANCEL_SECONDS`` for them to unwind."""
+        current = asyncio.current_task()
+        tasks = [task for task in self._tool_tasks if not task.done() and task is not current]
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        _, pending = await asyncio.wait(tasks, timeout=_TOOL_CANCEL_SECONDS)
+        if pending:
+            _log.warning(f"{len(pending)} tool calls of session {self.session_id} did not stop within {_TOOL_CANCEL_SECONDS}s of being cancelled")
 
     def _observe(self, event_type: str, **fields: Any) -> None:
         """Queue a realtime event for the agent's realtime hooks; nothing when it has none. Call on the pool loop."""
@@ -879,10 +915,6 @@ class RealtimeConnectionPool:
         # Set once shutdown starts: no connection is created after it, since the loop it would run
         # on is about to close.
         self._stopping = threading.Event()
-        # Whether the process's background job runner was seen ready, set only after a wait that succeeded; the lock
-        # makes a concurrent first connection wait for that outcome rather than pass while the wait is under way.
-        self._jobs_ready = False
-        self._jobs_ready_lock = threading.Lock()
         # What applications asked to say into each session's call (``post_when_idle``), per session so
         # that it outlives a reconnect.
         self._outboxes: dict[str, RealtimeOutbox] = {}
@@ -1165,7 +1197,6 @@ class RealtimeConnectionPool:
         """
         if not self._loop_ready.wait(timeout=10):
             raise RuntimeError("RealtimeConnectionPool event loop not ready")
-        self._wait_for_jobs()
         if self._stopping.is_set() or ThreadRunner.shutdown_event.is_set():
             raise RuntimeError("RealtimeConnectionPool is shutting down: no new connection is opened")
 
@@ -1189,27 +1220,6 @@ class RealtimeConnectionPool:
             with self._conn_lock:
                 self._connections.pop(session_id, None)
             raise
-
-    def _wait_for_jobs(self) -> None:
-        """Before a call's connection opens, wait for the process's background job runner to run, if there is one.
-
-        On a consumer thread, never the pool's loop. A tool submits background jobs without waiting, so the job loop
-        must run before any call does. Connections opening at once wait together for the one wait under way, under a
-        lock of its own (no connection or job lock is held); only a wait that succeeded is remembered, so after a
-        timeout (logged) the next connection waits again, and submissions raise meanwhile.
-        """
-        if self._jobs_ready:
-            return
-        from .jobs import BackgroundJobRunner
-
-        with self._jobs_ready_lock:
-            if self._jobs_ready:
-                return
-            runner = BackgroundJobRunner.current()
-            if runner is None or runner.wait_ready(BackgroundJobRunner.READY_TIMEOUT_SECONDS):
-                self._jobs_ready = True
-                return
-        _log.warning(f"The background job runner is not running after {BackgroundJobRunner.READY_TIMEOUT_SECONDS}s: background jobs cannot start")
 
     def dispatch(
         self, body: "BaseRunRequest", request_id: str, user_id: Optional[str], attributes: Mapping[str, Any], chat_service: "ChatService"
@@ -1282,8 +1292,8 @@ class RealtimeConnectionPool:
 
 
 class RealtimeCall:
-    """A session's live realtime call, as application code outside it sees it: a background job reporting back,
-    a webhook, a timer.
+    """A session's live realtime call, as application code outside it sees it: a realtime hook, a webhook, a
+    timer.
 
     ``post_when_idle`` says something into the call at its next quiet moment, without cutting anyone off;
     ``quiet_for``, ``connected`` and ``agent_has_spoken`` tell what the call is doing, and ``last_caller_input_at``,
@@ -1368,80 +1378,10 @@ class RealtimeCall:
         pool = RealtimeConnectionPool.get()
         return pool.withdraw(self.session_id, key) if pool is not None else False
 
-    def run_in_background(
-        self,
-        work: Callable[["BackgroundJob"], Awaitable[Optional[str]]],
-        *,
-        name: str,
-        job_id: Optional[str] = None,
-        arguments: Optional[dict[str, Any]] = None,
-        wait_until_heard: bool = False,
-        on_error: Optional[Callable[["BackgroundJob", Exception], Optional[str]]] = None,
-        refuse: Optional[Callable[[list["BackgroundJob"]], Optional[str]]] = None,
-    ) -> "BackgroundJob":
-        """Run ``work`` in the background for this call, and return its job at once. Thread-safe.
-
-        For long work a voice agent starts with a short tool and keeps talking: ``work(job)`` runs off the pool's
-        loop, after the call's earlier jobs, and asks agents with ``job.ask`` in an AK session of the job's own,
-        never the call's. Text it returns is said into the call at a quiet moment (``post_when_idle``); raising fails
-        the job. AK decides no policy: no retries, no wording; ``refuse`` and ``on_error`` are the application's.
-
-        :param work: ``async work(job) -> str | None``.
-        :param name: What kind of job it is, such as ``"research"``.
-        :param job_id: The application's own id for it; a new one by default. Its agents' session is
-            ``<call session>-job-<job_id>``.
-        :param arguments: What the job is for, kept on it, for ``refuse`` to compare.
-        :param wait_until_heard: Start only once what the agent said before the tool has been heard: the call has
-            been quiet for a moment, at most 20 s.
-        :param on_error: ``on_error(job, error) -> str | None``: what to say into the call when ``work`` raised, and
-            also called, its text unused, for a job the call's ``close()`` cancelled (``BackgroundJobCancelled``).
-            Without it the error is only logged.
-        :param refuse: ``refuse(pending) -> str | None``, given the call's queued and running jobs, under the lock
-            that also guards the submission: a reason refuses this one, so a check and the submission it allows
-            cannot race.
-        :raises RuntimeError: No background job runner runs in this process (the realtime host runs it, beside the
-            pool; a test hosts one with ``agentkernel.pipeline.testing.BackgroundJobHost``), it has not started yet,
-            or it is shutting down. Raised at once: a submission never waits.
-        :raises BackgroundJobRefused: ``refuse`` returned a reason; its text is for the model.
-        :raises ValueError: A queued or running job of this call has ``job_id``.
-        """
-        from .jobs import BackgroundJobRunner
-
-        runner = BackgroundJobRunner.current()
-        if runner is None:
-            raise RuntimeError(
-                "No background job runner in this process: background jobs run in the realtime host "
-                "(execution.mode: realtime), which runs the job runner beside the realtime pool; "
-                "a test hosts one with agentkernel.pipeline.testing.BackgroundJobHost"
-            )
-        return runner.submit(
-            self.session_id,
-            work,
-            name=name,
-            job_id=job_id,
-            arguments=arguments,
-            wait_until_heard=wait_until_heard,
-            on_error=on_error,
-            refuse=refuse,
-        )
-
-    @property
-    def jobs(self) -> list["BackgroundJob"]:
-        """This call's queued and running background jobs, the running one first."""
-        from .jobs import BackgroundJobRunner
-
-        runner = BackgroundJobRunner.current()
-        return runner.jobs(self.session_id) if runner is not None else []
-
     def close(self) -> bool:
         """End the call now, such as when the application ends a meeting: its model connection is closed and the
-        posts still waiting for it are dropped. Its queued background jobs are cancelled; the one running finishes,
-        but says nothing more into the session. The session's next input starts a new call. Returns whether the
-        call was open."""
-        from .jobs import BackgroundJobRunner
-
-        runner = BackgroundJobRunner.current()
-        if runner is not None:
-            runner.close(self.session_id)
+        posts still waiting for it are dropped. A tool call still running (one awaiting another agent's run, say) is
+        cancelled, and its result is not sent. The session's next input starts a new call. Returns whether the call
+        was open."""
         pool = RealtimeConnectionPool.get()
         return pool.close(self.session_id) if pool is not None else False

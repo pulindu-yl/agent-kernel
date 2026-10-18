@@ -1,10 +1,14 @@
-# #810: Realtime multi-agent collaboration with background work — Implementation Plan
+# #810: Realtime multi-agent collaboration — Implementation Plan
 
 This plan builds [`spec.md`](spec.md) in order: the core contracts first, then the Gemini adapter, the pool, recovery,
 the LiveKit gateway, the example, the tests, and the docs and skills sync. Each iteration leaves the branch importable,
 lint-clean and its suite green. Work happens on `feature/realtime-multi-agent-collaboration` off `develop`; the PR is
-#818, titled `feat: realtime multi-agent collaboration with background work (#810)`. The spec documents are committed
-before the code they describe.
+#818, titled `feat: realtime multi-agent collaboration (#810)`. The spec documents are committed before the code they
+describe.
+
+Revised: the background jobs (`RealtimeCall.run_in_background` and its hosting) and OpenAI realtime tool input
+guardrails were built and then removed from this PR (design.md "Open questions"); the iterations below describe what
+remains, with research and review in the application as awaited tools.
 
 ## Iteration 1: Core contracts
 
@@ -76,13 +80,13 @@ before the code they describe.
 
 ## Iteration 8: Example
 
-- **Goal:** `examples/api/livekit-voice/google/handoffs/` shows a refused handoff, a background post and the call log, and its offline tests run in CI.
+- **Goal:** `examples/api/livekit-voice/google/handoffs/` shows a refused handoff, a booking that waits for the dispatch system, and the call log, and its offline tests run in CI.
 - **Files:** `examples/api/livekit-voice/google/handoffs/{server.py,server_test.py,README.md}`, `.github/test-config.yaml`
 - **Steps:**
-  1. Add `verify_account`, `require_account`, the background confirmation in `book_technician` and `CallLog`, and build the gateway under `__main__`, per the spec.md "Example" table.
+  1. Add `verify_account`, `require_account`, the awaited confirmation in `book_technician` and `CallLog`, and build the gateway under `__main__`, per the spec.md "Example" table.
   2. Write `server_test.py` per spec.md "New: `examples/api/livekit-voice/google/handoffs/server_test.py`".
   3. Build ak-py (`ak-py/build.sh`), then run `./build.sh local` in the example; register it in `.github/test-config.yaml`.
-- **Verify:** `cd examples/api/livekit-voice/google/handoffs && uv run pytest -s` passes offline; with a LiveKit room and a Gemini key, a call shows the refused handoff, the dispatch post and the call log.
+- **Verify:** `cd examples/api/livekit-voice/google/handoffs && uv run pytest -s` passes offline; with a LiveKit room and a Gemini key, a call shows the refused handoff, the confirmed booking and the call log.
 
 ## Iteration 9: Tests
 
@@ -114,12 +118,12 @@ Iterations 11 to 16 build spec.md "Application building blocks", in the same PR,
 - **Steps:** the facts; `quiet_since`; `_report_idle`; the `(event, only)` hook queue; `while_quiet` (spec.md "Call facts").
 - **Verify:** `TestRealtimeCallFacts`, `TestRealtimeIdle`, `TestRealtimeOutbox`.
 
-## Iteration 12: Background jobs
+## Iteration 12: Tool calls the connection owns
 
-- **Goal:** `RealtimeCall.run_in_background` runs jobs per session, in order, on one job loop.
-- **Files:** `pipeline/realtime_jobs.py` (new), `pipeline/realtime_pool.py`, `pipeline/__init__.py`
-- **Steps:** the errors, `BackgroundJob`, `BackgroundJobRunner` (Rules 1 to 7); `RealtimeCall.run_in_background`, `jobs`, `close()`.
-- **Verify:** `TestBackgroundJobRunner`, `TestBackgroundJobAsk`, `TestRealtimeCallJobs`.
+- **Goal:** a tool that awaits long work keeps the call busy, answers through its own call, and is cancelled when its call closes, sending nothing late.
+- **Files:** `pipeline/realtime_pool.py`, `ak-py/tests/test_realtime_pool.py`
+- **Steps:** spec.md "Tool calls the connection owns" Rules 1 to 4: `_tool_tasks`, `_cancel_tools()` in `close()`, no result once `closed`.
+- **Verify:** `TestRealtimeAwaitedTools` (failing with the cancellation and the closed check taken out); the stall case in `TestADKRealtimeRecovery`.
 
 ## Iteration 13: Gateways per session
 
@@ -128,35 +132,21 @@ Iterations 11 to 16 build spec.md "Application building blocks", in the same PR,
 - **Steps:** `GatewayRunner.stop`; `GatewayPool` (spec.md "Gateways").
 - **Verify:** `test_integration_gateway_runner.py`.
 
-## Iteration 14: OpenAI realtime tool input guardrails
+## Iteration 14: Example, docs and skills
 
-- **Goal:** OpenAI realtime runs a tool's input guardrails, as the SDK's realtime session does.
-- **Files:** `framework/openai/openai.py`
-- **Steps:** offer the tools; run the guardrails in `execute_tool` (spec.md "OpenAI realtime tool input guardrails").
-- **Verify:** `TestOpenAIRealtimeToolGuardrails`.
-
-## Iteration 15: Example, docs and skills
-
-- **Goal:** the example's booking is a background job; the docs and skills describe the building blocks.
+- **Goal:** the example's booking is an awaited tool; the docs and skills describe the building blocks.
 - **Files:** `examples/api/livekit-voice/google/handoffs/{server.py,server_test.py,README.md}`, the surfaces in spec.md "Migration surface"
 - **Steps:** switch `book_technician` (spec.md "Example"); update the tests; edit the docs and the two dev skills.
 - **Verify:** the example's `uv run pytest -s`; `cd docs && npm run build`; the full suite and `make lint-check-all`.
 
-## Iteration 16: Host the job runner (design.md "Hosting and lifecycle")
+## Iteration 15: The pool's module
 
-- **Goal:** the realtime host starts and shuts down the job runner; submission never waits; shutdown is bounded.
-- **Files:** `pipeline/realtime_jobs.py`, `pipeline/realtime_pool.py`, `pipeline/agent_runner.py`, `deployment/aws/containerized/akagentrunner.py`, `pipeline/testing.py`
-- **Steps:** spec.md "Background jobs" Rules 1, 1a, 7a, 9 and 10: hosting, admission and readiness, one end per job and a runner-owned `post`, shutdown, `BackgroundJobHost`; move AK's tests onto `BackgroundJobHost`.
-- **Verify:** host tests (startup, repeated `initialize()`, both runners' tasks, shutdown order, the submission race, no restart after shutdown, a cleanup timeout released afterwards); `test_realtime_jobs.py`; the full suite.
+- **Goal:** the pool stays in `pipeline/realtime_pool.py`, its 0.9.5 path, with no `pipeline/realtime/` package.
+- **Files:** `pipeline/realtime_pool.py`, `pipeline/__init__.py`, `pipeline/agent_runner.py`, `deployment/aws/containerized/akagentrunner.py`, the tests' imports
+- **Steps:** spec.md "Module layout".
+- **Verify:** `from agentkernel.pipeline.realtime_pool import RealtimeConnectionPool` works and its patch targets reach the pool; the full suite.
 
-## Iteration 17: Shutdown cleanup, readiness, and the realtime package
+## Iteration 16: The application (outside this repository)
 
-- **Goal:** shutdown always cleans the job loop's tasks within its budget; concurrent first connections see one readiness outcome; the pool and the jobs live in `pipeline/realtime/`.
-- **Files:** `pipeline/realtime/{__init__,pool,jobs}.py` (moved), `pipeline/__init__.py`, `pipeline/testing.py`, `pipeline/agent_runner.py`, `deployment/aws/containerized/akagentrunner.py`, the tests' imports
-- **Steps:** spec.md "Background jobs" Rules 1a and 9; "Package layout".
-- **Verify:** the shutdown and readiness cases in `test_realtime_jobs.py`; the full suite.
-
-## Iteration 18: The application (outside this repository)
-
-- **Goal:** the application that drove the change runs on the building blocks: its background jobs on `run_in_background` (failure detected natively, as today), its nudges an `idle` hook, its rooms a `GatewayPool`, its handoff rules one policy class on ADK's callbacks.
-- **Verify:** its tests pass; a live call: handoffs, research, a refused handoff, a nudge, the meeting ended.
+- **Goal:** the application that drove the change runs on the building blocks: research and review as awaited voice tools running their agents through `AgentService` in sessions of their own (failure detected natively, as before), its nudges an `idle` hook, its rooms a `GatewayPool`, its handoff rules one policy class on ADK's callbacks.
+- **Verify:** its tests pass, against a fresh AK build; a live call: handoffs, research and a review (how long the caller waits), a refused handoff, a nudge, the meeting ended while research runs.

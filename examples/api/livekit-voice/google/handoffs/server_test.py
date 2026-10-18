@@ -1,13 +1,8 @@
-"""Handoffs example tests: the handoff rule, the background confirmation and the call log. No model, LiveKit or network."""
+"""Handoffs example tests: the handoff rule, the technician booking and the call log. No model, LiveKit or network."""
 
 import asyncio
 import logging
-import time
 from types import SimpleNamespace
-
-import pytest
-from agentkernel.pipeline import RealtimeCall
-from agentkernel.pipeline.testing import BackgroundJobHost
 
 import server
 
@@ -38,53 +33,30 @@ def test_verifying_an_account_records_it_for_the_whole_call():
     assert "no account" in server.verify_account("1042", context())
 
 
-@pytest.fixture
-def posts(monkeypatch):
-    """What background jobs say into the call, as (session, text, key)."""
-    said = []
+def test_a_technician_visit_is_answered_once_the_dispatch_system_confirms_it(monkeypatch):
+    monkeypatch.setattr(server, "DISPATCH_SECONDS", 0.01)
 
-    def post_when_idle(self, text, *, key=None, expires_after=600.0, while_quiet=False):
-        said.append((self.session_id, text, key))
-        return True
+    answer = asyncio.run(server.book_technician("A-1042", "Friday"))
 
-    monkeypatch.setattr(RealtimeCall, "post_when_idle", post_when_idle)
-    monkeypatch.setattr(
-        server.AKToolContext, "get", staticmethod(lambda: SimpleNamespace(session=SimpleNamespace(id="room_01")))
-    )
-    # The realtime host runs the background job runner; offline, the test hosts it.
-    with BackgroundJobHost():
-        yield said
+    assert answer.startswith("The technician visit for account A-1042 on Friday is confirmed") and "TEC-4821" in answer
+    assert server.dispatch.booking == set()
 
 
-def _wait(condition):
-    deadline = time.monotonic() + 2
-    while not condition() and time.monotonic() < deadline:
-        time.sleep(0.01)
+def test_a_second_booking_for_the_same_account_is_refused_while_the_first_is_confirmed(monkeypatch):
+    monkeypatch.setattr(server, "DISPATCH_SECONDS", 0.1)
 
+    async def book_at_once():
+        return await asyncio.gather(
+            server.book_technician("A-1042", "Friday"),
+            server.book_technician("A-1042", "Friday"),
+            server.book_technician("A-2000", "Monday"),
+        )
 
-def test_a_technician_visit_is_confirmed_into_the_call_in_the_background(posts, monkeypatch):
-    monkeypatch.setattr(server, "DISPATCH_SECONDS", 0.0)
+    first, again, other = asyncio.run(book_at_once())
 
-    answer = server.book_technician("A-1042", "Friday")
-
-    assert "confirm" in answer
-    _wait(lambda: posts)
-    [(session_id, text, key)] = posts
-    assert (session_id, key) == ("room_01", "dispatch")
-    assert text.startswith("[Dispatch system]") and "TEC-4821" in text and "Friday" in text
-
-
-def test_a_second_booking_waits_for_the_first(posts, monkeypatch):
-    monkeypatch.setattr(server, "DISPATCH_SECONDS", 0.3)
-
-    server.book_technician("A-1042", "Friday")
-    again = server.book_technician("A-1042", "Friday")
-    other = server.book_technician("A-2000", "Monday")
-
+    assert "confirmed" in first and "confirmed" in other
     assert "already being booked" in again
-    assert "requested" in other
-    _wait(lambda: len(posts) == 2)
-    assert len(posts) == 2
+    assert server.dispatch.booking == set()
 
 
 def test_the_supervisor_carries_the_rule_and_the_call_log():

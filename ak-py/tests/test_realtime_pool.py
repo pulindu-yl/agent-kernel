@@ -16,9 +16,9 @@ from agentkernel.core.realtime import RealtimeRunner
 from agentkernel.core.runtime import Runtime
 from agentkernel.core.session.in_memory import InMemorySessionStore
 from agentkernel.core.tool import ToolContext
+from agentkernel.pipeline import realtime_pool
 from agentkernel.pipeline.envelope import ATTR_INTEGRATION, ATTR_REALTIME, QueueName
-from agentkernel.pipeline.realtime import pool as realtime_pool
-from agentkernel.pipeline.realtime.pool import RealtimeConnection, RealtimeConnectionPool
+from agentkernel.pipeline.realtime_pool import RealtimeConnection, RealtimeConnectionPool
 from agentkernel.pipeline.thread_runner import ThreadRunner
 from agentkernel.pipeline.transport.base import QueueTransportFactory
 from agentkernel.pipeline.transport.in_memory import InMemoryTransport
@@ -169,6 +169,129 @@ class TestRealtimeConnection:
 
         assert conn.adapter.executed == [("get_weather", '{"location": "Paris"}', "call-1")]
         assert conn.adapter.tool_results == [("call-1", "42")]
+
+
+class TestRealtimeAwaitedTools:
+    """A tool may await long work, such as another agent's run in a session of its own: the call is busy meanwhile,
+    nothing is posted into it or reported idle, the result goes back through the tool call that asked, and a call
+    closed meanwhile cancels the tool and is sent nothing."""
+
+    class _SlowAdapter(_Adapter):
+        """``execute_tool`` waits for ``release``, inside a nested run in a session of its own, as a tool asking
+        another agent does; it records the contexts it is back in, and whether it was cancelled."""
+
+        def __init__(self):
+            super().__init__()
+            self.release = asyncio.Event()
+            self.started = asyncio.Event()
+            self.child = Session("s1-child")
+            self.back_in = None
+            self.cancelled = False
+            self.ignore_cancel = False
+
+        async def execute_tool(self, name, arguments, context, call_id):
+            self.executed.append((name, arguments, call_id))
+            try:
+                async with self.child:
+                    with _Agent("child")._activate():
+                        self.started.set()
+                        await self.release.wait()
+                return "answer"
+            except asyncio.CancelledError:
+                self.cancelled = True
+                if not self.ignore_cancel:
+                    raise
+                await asyncio.sleep(0.05)
+                return "late answer"
+            finally:
+                self.back_in = (Session.current().id, Agent.current().name)
+
+    @pytest.fixture(autouse=True)
+    def _transport(self, monkeypatch):
+        monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
+        monkeypatch.setattr(RealtimeConnectionPool, "_instance", None)
+
+    async def _call(self, *hooks):
+        agent = _Agent(realtime_runner_cls=self._SlowAdapter)
+        agent.realtime_hooks.extend(hooks)
+        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+        await conn.connect()
+        await asyncio.sleep(0.05)  # the pacing loop sends the starting agent on
+        conn._connected_at = time.time() - 10.0
+        pool = TestRealtimeCall._pool()
+        pool._connections["s1"] = conn
+        await conn.handle_framework_event("tool_call", {"call_id": "c1", "name": "research", "arguments": "{}"})
+        await asyncio.wait_for(conn.adapter.started.wait(), 1.0)
+        return pool, conn
+
+    @pytest.mark.asyncio
+    async def test_the_call_is_busy_while_the_tool_waits_and_hears_its_result_once(self):
+        from agentkernel.pipeline import RealtimeCall
+
+        hook = TestRealtimeIdle._Hook(idle_after_seconds=0.01)
+        pool, conn = await self._call(hook)
+        RealtimeCall("s1").post_when_idle("[Team update] something else")
+
+        assert conn.is_responding and RealtimeCall("s1").quiet_for() is None
+        pool._report_idle(time.time() + 60)
+        pool._deliver_posts(time.time() + 60)
+        await asyncio.sleep(0.05)
+        assert TestRealtimeIdle._idle(hook) == [] and conn.adapter.texts == []  # no nudge, no post meanwhile
+        assert conn.adapter.tool_results == [] and conn.last_tool_result_at is None
+
+        conn.adapter.release.set()
+        await asyncio.sleep(0.05)
+        assert conn.adapter.tool_results == [("c1", "answer")]
+        assert conn.adapter.back_in == ("s1", "general")  # back in the call's session and agent after the nested run
+        assert not conn.session._lock.locked() and not conn.adapter.child._lock.locked()
+        assert not conn.is_responding and conn.last_tool_result_at is not None
+        await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_closing_the_call_cancels_the_waiting_tool_and_sends_it_nothing(self):
+        pool, conn = await self._call()
+
+        await conn.close()
+
+        assert conn.adapter.cancelled and conn.adapter.tool_results == []
+        assert conn.adapter.back_in == ("s1", "general")
+        assert not conn.session._lock.locked() and not conn.adapter.child._lock.locked()
+        assert conn._tool_tasks == set() and conn._tools_in_flight == 0 and conn.last_tool_result_at is None
+        assert Session.current() is None and Agent.current() is None  # nothing leaked into the pool's loop
+
+    @pytest.mark.asyncio
+    async def test_closing_the_call_through_realtime_call_cancels_the_tool(self):
+        from agentkernel.pipeline import RealtimeCall
+
+        pool, conn = await self._call()
+        pool._loop = asyncio.get_running_loop()
+
+        assert RealtimeCall("s1").close() is True
+        await asyncio.sleep(0.1)
+
+        assert conn.adapter.cancelled and conn.adapter.tool_results == [] and conn._tool_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_a_tool_that_ignores_its_cancellation_never_answers_the_closed_call(self, monkeypatch):
+        monkeypatch.setattr(realtime_pool, "_TOOL_CANCEL_SECONDS", 0.01)
+        pool, conn = await self._call()
+        conn.adapter.ignore_cancel = True
+
+        await conn.close()
+        await asyncio.sleep(0.1)  # it returns its result after all
+
+        assert conn.adapter.cancelled and conn.adapter.tool_results == [] and conn._tools_in_flight == 0
+
+    @pytest.mark.asyncio
+    async def test_a_result_that_comes_after_the_socket_failed_is_not_sent(self):
+        pool, conn = await self._call()
+
+        await conn.handle_framework_event("error", {"message": "socket lost"})
+        conn.adapter.release.set()
+        await asyncio.sleep(0.05)
+
+        assert conn.closed and conn.adapter.tool_results == []
+        await conn.close()
 
 
 class TestRealtimeConnectionPool:
@@ -345,7 +468,7 @@ class TestRealtimePoolSweep:
         monkeypatch.setattr(realtime_pool, "_LOOP_LAG_WARNING_SECONDS", 0.1)
         pool, thread = self._start(monkeypatch)
 
-        with caplog.at_level(logging.WARNING, logger="ak.pipeline.realtime.pool"):
+        with caplog.at_level(logging.WARNING, logger="ak.pipeline.realtime_pool"):
             pool._loop.call_soon_threadsafe(time.sleep, 0.4)
             self._until(lambda: "The realtime loop was blocked" in caplog.text)
 
@@ -1219,7 +1342,7 @@ class TestOpenAIRealtimeToolGuards:
         """A tool with no extra checks."""
         return x
 
-    def test_tools_needing_approval_or_output_guardrails_are_not_offered(self, caplog):
+    def test_tools_needing_approval_or_guardrails_are_not_offered(self, caplog):
         def approve(x: str) -> str:
             """Needs approval."""
             return x
@@ -1240,8 +1363,8 @@ class TestOpenAIRealtimeToolGuards:
                 self._tool(checked, tool_output_guardrails=[object()]),
             )
 
-        assert list(offered) == ["plain", "guarded"]  # input guardrails run before the tool (execute_tool)
-        assert caplog.text.count("needs approval or has output guardrails") == 2
+        assert list(offered) == ["plain"]
+        assert caplog.text.count("needs approval or has tool guardrails") == 3
 
     def test_disabled_tools_are_not_offered(self):
         def off(x: str) -> str:
@@ -1305,62 +1428,6 @@ class TestOpenAIRealtimeToolGuards:
         result = await runner.execute_tool("slow", "{}", ToolContext(Runtime(InMemorySessionStore()), agent, Session("s1"), []), "call-1")
 
         assert "timed out" in result
-
-
-class TestOpenAIRealtimeToolGuardrails:
-    """A tool's input guardrails run before it, as the SDK's realtime session runs them."""
-
-    @staticmethod
-    async def _run(behavior, ran):
-        from agents import ToolGuardrailFunctionOutput, tool_input_guardrail
-
-        from agentkernel.framework.openai.openai import OpenAIRealtimeRunner
-
-        seen = []
-
-        @tool_input_guardrail
-        def check(data):
-            seen.append((data.context.tool_name, data.context.tool_arguments, data.agent.name))
-            return behavior(ToolGuardrailFunctionOutput)
-
-        def book(day: str) -> str:
-            """Book a visit."""
-            ran.append(day)
-            return f"Booked for {day}."
-
-        tool = TestOpenAIRealtimeToolGuards._tool(book, tool_input_guardrails=[check])
-        agent = types.SimpleNamespace(agent=types.SimpleNamespace(tools=[tool]), name="general")
-        runner = OpenAIRealtimeRunner()
-        runner._agent = agent
-        runner._active = types.SimpleNamespace(name="general")
-        runner._tools = {tool.name: tool}
-        context = ToolContext(Runtime(InMemorySessionStore()), agent, Session("s1"), [])
-        result = await runner.execute_tool("book", '{"day": "Friday"}', context, "call-1")
-        return result, seen
-
-    @pytest.mark.asyncio
-    async def test_an_allowing_guardrail_lets_the_tool_run(self):
-        ran = []
-        result, seen = await self._run(lambda out: out.allow(), ran)
-
-        assert result == "Booked for Friday." and ran == ["Friday"]
-        assert seen == [("book", '{"day": "Friday"}', "general")]
-
-    @pytest.mark.asyncio
-    async def test_a_rejection_answers_in_the_tools_place(self):
-        ran = []
-        result, _ = await self._run(lambda out: out.reject_content("Verify the account first."), ran)
-
-        assert result == "Verify the account first." and ran == []
-
-    @pytest.mark.asyncio
-    async def test_a_tripwire_raises_and_the_tool_does_not_run(self):
-        from agents import ToolInputGuardrailTripwireTriggered
-
-        ran = []
-        with pytest.raises(ToolInputGuardrailTripwireTriggered):
-            await self._run(lambda out: out.raise_exception(), ran)
-        assert ran == []
 
 
 class _ScriptedRealtimeSocket:
@@ -2498,7 +2565,7 @@ class TestADKRealtimeRecovery:
         await self._until(lambda: len(client.sessions) == 2 and client.sessions[1].realtime_audio)
 
         assert client.sessions[1].realtime_audio == [b"\x02" * 1600, b"\x03" * 1600]  # the oldest was dropped
-        assert _seen([client.sessions[1].client_content[-1][0]]) == ["[Team update] typed meanwhile"]
+        assert client.sessions[1].realtime_text[-1] == "[Team update] typed meanwhile"  # Gemini 3.x: realtime text
         await runner.disconnect()
 
     @pytest.mark.asyncio
@@ -2550,6 +2617,25 @@ class TestADKRealtimeRecovery:
                 break
 
         assert any(kind == "reconnected" for kind, _ in events)
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_a_tool_that_takes_longer_than_the_stall_wait_is_not_taken_for_a_stall(self, monkeypatch):
+        """The model owes nothing while its tool runs: the wait for an answer starts when the result is sent."""
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        monkeypatch.setattr(GoogleADKRealtimeRunner, "STALL_SECONDS", 0.2)
+        client = _FakeLiveClient([[_live_tool_call("c1", "research", question="q")], lambda s: s.tool_responses, self._spoken_turn()])
+        runner, events = await self._connect(monkeypatch, client)
+        await runner.send_text("Look it up, please.")  # owed an answer, which the tool call is
+        await self._until(lambda: any(kind == "tool_call" for kind, _ in events))
+
+        await asyncio.sleep(0.7)  # the tool takes over three stall waits
+        assert len(client.sessions) == 1 and not any(kind in ("reconnected", "done") for kind, _ in events)
+
+        await runner.send_tool_result("c1", "The answer.")
+        await self._until(lambda: ("done", {"status": "completed"}) in events)
+        assert len(client.sessions[0].tool_responses) == 1 and len(client.sessions) == 1
         await runner.disconnect()
 
     @pytest.mark.asyncio
@@ -2748,6 +2834,33 @@ class TestADKRealtimeRecovery:
         await runner.disconnect()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", ["gemini-3.1-flash-live-preview", "gemini-2.5-flash-native-audio-preview-12-2025"])
+    async def test_text_reaches_the_socket_as_adk_sends_it_for_the_model(self, monkeypatch, model):
+        """As ADK's live connection does: realtime input on Gemini 3.x Live, which also carries the caller's audio
+        (the SDK warns against interleaving it with client content); a completed client-content turn before that."""
+        client = _FakeLiveClient([])
+        supervisor, _, _ = TestADKRealtimeTransfers._graph()
+        supervisor.model = model
+        monkeypatch.setattr("google.genai.Client", lambda *a, **k: client)
+        from agentkernel.framework.adk.adk import GoogleADKRealtimeRunner
+
+        runner = GoogleADKRealtimeRunner()
+
+        async def callback(event_type, data):
+            pass
+
+        await runner.connect(Session("s1"), types.SimpleNamespace(name="supervisor", agent=supervisor), callback)
+        await runner.send_text("[Team update] J1 finished.")
+
+        socket = client.sessions[0]
+        if model.startswith("gemini-3."):
+            assert socket.realtime_text == ["[Team update] J1 finished."] and socket.client_content == []
+        else:
+            [(turns, turn_complete)] = socket.client_content
+            assert _seen([turns]) == ["[Team update] J1 finished."] and turn_complete and socket.realtime_text == []
+        await runner.disconnect()
+
+    @pytest.mark.asyncio
     async def test_a_post_whose_send_fails_reaches_the_next_socket(self, monkeypatch):
         """The pool takes a post out of its outbox before the send: text is kept in the history before it is sent, so
         a socket that fails while it is sent loses nothing; the next socket is seeded with it, and answers it."""
@@ -2757,7 +2870,7 @@ class TestADKRealtimeRecovery:
         async def socket_closed(*args, **kwargs):
             raise ConnectionError("1006 abnormal closure")
 
-        client.sessions[0].send_client_content = socket_closed
+        client.sessions[0].send_realtime_input = socket_closed  # how text reaches a Gemini 3.x socket
         with pytest.raises(ConnectionError):
             await runner.send_text("[Team update] J1 finished.")
         runner._recover_soon("socket error: 1006 abnormal closure")  # as the failing socket's listener does
@@ -3489,7 +3602,7 @@ class TestRealtimeOutbox:
     """What an application posts into a call is said only when nobody is talking and nothing is owed a reply."""
 
     def _outbox(self, *texts, now=100.0, **keys):
-        from agentkernel.pipeline.realtime.pool import RealtimeOutbox
+        from agentkernel.pipeline.realtime_pool import RealtimeOutbox
 
         outbox = RealtimeOutbox("s1")
         for text in texts:
@@ -3563,7 +3676,7 @@ class TestRealtimeOutbox:
         assert outbox.empty
 
     def test_a_full_outbox_drops_the_oldest(self):
-        from agentkernel.pipeline.realtime.pool import RealtimeOutbox
+        from agentkernel.pipeline.realtime_pool import RealtimeOutbox
 
         outbox = self._outbox(*[f"update {i}" for i in range(RealtimeOutbox.MAX_PENDING + 1)])
 
@@ -3656,7 +3769,7 @@ class TestRealtimeCall:
         from agentkernel.pipeline import RealtimeCall
 
         call = RealtimeCall("s1")
-        with caplog.at_level(logging.WARNING, logger="ak.pipeline.realtime.pool"):
+        with caplog.at_level(logging.WARNING, logger="ak.pipeline.realtime_pool"):
             assert call.post_when_idle("J1 finished.") is False
         assert "No realtime pool in this process" in caplog.text
         assert (call.connected, call.quiet_for(), call.withdraw("k")) == (False, None, False)
@@ -3780,7 +3893,7 @@ class TestRealtimeHooks:
         agent.realtime_hooks.extend([self._Recorder(fail=True), recorder])
         conn = _connection(agent=agent, loop=asyncio.get_running_loop())
 
-        with caplog.at_level(logging.ERROR, logger="ak.pipeline.realtime.pool"):
+        with caplog.at_level(logging.ERROR, logger="ak.pipeline.realtime_pool"):
             await conn.connect()
             await conn.close()
 
@@ -3896,7 +4009,7 @@ class TestRealtimeOutboxWhileQuiet:
 
     @staticmethod
     def _outbox():
-        from agentkernel.pipeline.realtime.pool import RealtimeOutbox
+        from agentkernel.pipeline.realtime_pool import RealtimeOutbox
 
         return RealtimeOutbox("s1")
 

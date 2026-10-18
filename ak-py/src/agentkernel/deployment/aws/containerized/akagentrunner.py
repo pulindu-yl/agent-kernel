@@ -6,8 +6,7 @@ import logging
 from ....core.chat_service import ChatService
 from ....core.config import AKConfig, ExecutionMode
 from ....core.model import BaseRunRequest, StreamChunk
-from ....pipeline.realtime.jobs import BackgroundJobRunner
-from ....pipeline.realtime.pool import RealtimeConnectionPool
+from ....pipeline.realtime_pool import RealtimeConnectionPool
 from ....pipeline.thread_runner import ThreadRunner
 from ....pipeline.transport.base import QueueTransportFactory
 from ..core.sqs_handler import SQSHandler
@@ -298,8 +297,8 @@ class ECSRealtimeAgentRunner(ECSAgentRunner):
 
     @classmethod
     def _get_extra_tasks(cls) -> list[ThreadRunner.Task]:
-        # The pool's loop holds the calls; the job runner's runs their background jobs, never on the pool's loop.
-        return [RealtimeConnectionPool.initialize().get_task(), BackgroundJobRunner.initialize().get_task()]
+        pool = RealtimeConnectionPool.initialize()
+        return [pool.get_task()]
 
     @classmethod
     def on_permanent_failure(cls, record: dict) -> None:

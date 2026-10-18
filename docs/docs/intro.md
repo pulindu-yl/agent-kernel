@@ -12,7 +12,7 @@ slug: /
 
 🔀 **Realtime multi-agent handoffs** - A voice call moves between agents with the OpenAI Agents SDK's handoffs or Google ADK's transfers, and in LiveKit every agent appears as its own participant, with only the active one unmuted. [Learn more →](./integrations/livekit.md#multi-agent-handoffs)
 
-🧵 **Background work in a live call** - A voice agent starts long work with a short tool and keeps talking: `RealtimeCall.run_in_background` runs it off the call's audio loop, in a session of its own, and says the result into the call at a quiet moment. Hooks are told when a call goes quiet, and `GatewayPool` opens a room per meeting. [Learn more →](./integrations/livekit.md#background-work)
+🧵 **Teams in a live call** - A voice agent's `async` tool can wait for another agent's run, in a session of its own, and answer with its result while other calls keep playing; application code says updates into the call at a quiet moment with `RealtimeCall`. Hooks are told when a call goes quiet, and `GatewayPool` opens a room per meeting. [Learn more →](./integrations/livekit.md#tools-that-wait-for-long-work)
 
 🙋 **Human in the Loop** - Let a run pause for a person's approval or answer, and resume from their decision minutes or hours later, on any replica. Works on OpenAI, LangGraph, Pydantic AI and Google ADK, over REST, streaming and AG-UI. [Learn more →](./advanced/human-in-the-loop.md)
 

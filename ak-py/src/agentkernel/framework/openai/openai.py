@@ -6,7 +6,7 @@ import copy
 import inspect
 import logging
 from collections.abc import AsyncGenerator
-from typing import Any, Callable, ClassVar, List, Mapping, Optional, Type
+from typing import Any, Callable, ClassVar, List, Mapping, Type
 
 from agents import Agent, FunctionTool, Handoff, RunContextWrapper, Runner, function_tool, handoff
 from agents.run_state import RunState
@@ -825,20 +825,19 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
         """The agent's tools the Realtime session may call, by name.
 
         The Realtime API calls only function tools; any other tool type (hosted tools such as web
-        search) cannot run over the socket. A tool that needs approval or carries output guardrails
-        is not offered either: approval needs the call to pause, which REALTIME mode cannot, and
-        offering the tool would skip a check its author asked for. Both are skipped with a warning
-        rather than silently. A tool's input guardrails are applied, before it runs, as the SDK's own
-        realtime session applies them (:meth:`execute_tool`). A disabled tool (``is_enabled``) is
-        left out, as the SDK's own runner leaves it out.
+        search) cannot run over the socket. A tool that needs approval or carries tool guardrails
+        is not offered either: the SDK's runner applies those around a call, and this runner calls
+        the tool directly, so offering it would skip a check its author asked for. Both are skipped
+        with a warning rather than silently. A disabled tool (``is_enabled``) is left out, as the
+        SDK's own runner leaves it out.
         """
         tools = {}
         for tool in getattr(sdk_agent, "tools", None) or []:
             name = getattr(tool, "name", type(tool).__name__)
             if not isinstance(tool, FunctionTool):
                 _log.warning(f"Tool {name} is not a function tool; the Realtime API cannot call it")
-            elif tool.needs_approval is not False or tool.tool_output_guardrails:
-                _log.warning(f"Tool {name} needs approval or has output guardrails, which REALTIME mode does not apply; it is not offered")
+            elif tool.needs_approval is not False or tool.tool_input_guardrails or tool.tool_output_guardrails:
+                _log.warning(f"Tool {name} needs approval or has tool guardrails, which REALTIME mode does not apply; it is not offered")
             elif await self._is_enabled(tool, run_context, sdk_agent):
                 tools[name] = tool
         return tools
@@ -983,11 +982,6 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
         SDK invokes the handoff (and its ``on_handoff``) and the agent it returns takes over when the
         call's result is sent. A handoff that raises leaves the agent as it is. A response's second
         handoff is not invoked; its answer says so.
-
-        A tool's input guardrails run first, in order, as the SDK's realtime session runs them: one
-        that rejects the call (``reject_content``) answers in the tool's place, with its message,
-        and the tool does not run; one that trips (``raise_exception``) raises
-        ``ToolInputGuardrailTripwireTriggered``, which the pool answers as any tool that raised.
         """
         from agents.tool import invoke_function_tool
         from agents.tool_context import ToolContext as SDKToolContext
@@ -1014,31 +1008,10 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
         )
         context.set()
         try:
-            rejection = await self._input_guardrail_rejection(tool, sdk_context, caller)
-            if rejection is not None:
-                _log.info(f"Tool {name} was not run: an input guardrail rejected the call")
-                return rejection
             result = await invoke_function_tool(function_tool=tool, context=sdk_context, arguments=arguments)
         finally:
             context.reset()
         return str(result) if result is not None else ""
-
-    @staticmethod
-    async def _input_guardrail_rejection(tool: FunctionTool, sdk_context: Any, caller: Agent) -> Optional[str]:
-        """Run the tool's input guardrails in order; the first rejection's message, or ``None`` when every one allows it.
-
-        :raises ToolInputGuardrailTripwireTriggered: A guardrail tripped (``raise_exception``).
-        """
-        from agents import ToolInputGuardrailData, ToolInputGuardrailTripwireTriggered
-
-        for guardrail in tool.tool_input_guardrails or []:
-            output = await guardrail.run(ToolInputGuardrailData(context=sdk_context, agent=caller))
-            behavior = output.behavior["type"]
-            if behavior == "raise_exception":
-                raise ToolInputGuardrailTripwireTriggered(guardrail=guardrail, output=output)
-            if behavior == "reject_content":
-                return output.behavior["message"]
-        return None
 
     async def disconnect(self) -> None:
         self._closing = True
