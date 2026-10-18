@@ -16,9 +16,9 @@ from agentkernel.core.realtime import RealtimeRunner
 from agentkernel.core.runtime import Runtime
 from agentkernel.core.session.in_memory import InMemorySessionStore
 from agentkernel.core.tool import ToolContext
-from agentkernel.pipeline import realtime_pool
 from agentkernel.pipeline.envelope import ATTR_INTEGRATION, ATTR_REALTIME, QueueName
-from agentkernel.pipeline.realtime_pool import RealtimeConnection, RealtimeConnectionPool
+from agentkernel.pipeline.realtime import pool as realtime_pool
+from agentkernel.pipeline.realtime.pool import RealtimeConnection, RealtimeConnectionPool
 from agentkernel.pipeline.thread_runner import ThreadRunner
 from agentkernel.pipeline.transport.base import QueueTransportFactory
 from agentkernel.pipeline.transport.in_memory import InMemoryTransport
@@ -229,7 +229,7 @@ class TestRealtimePoolShutdown:
         import concurrent.futures
 
         monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
-        monkeypatch.setattr("agentkernel.pipeline.realtime_pool._SHUTDOWN_GRACE_SECONDS", 0.1)
+        monkeypatch.setattr(realtime_pool, "_SHUTDOWN_GRACE_SECONDS", 0.1)
         self._HangingAdapter.entered.clear()
 
         pool = RealtimeConnectionPool.initialize()
@@ -345,7 +345,7 @@ class TestRealtimePoolSweep:
         monkeypatch.setattr(realtime_pool, "_LOOP_LAG_WARNING_SECONDS", 0.1)
         pool, thread = self._start(monkeypatch)
 
-        with caplog.at_level(logging.WARNING, logger="ak.pipeline.realtime_pool"):
+        with caplog.at_level(logging.WARNING, logger="ak.pipeline.realtime.pool"):
             pool._loop.call_soon_threadsafe(time.sleep, 0.4)
             self._until(lambda: "The realtime loop was blocked" in caplog.text)
 
@@ -1219,7 +1219,7 @@ class TestOpenAIRealtimeToolGuards:
         """A tool with no extra checks."""
         return x
 
-    def test_tools_needing_approval_or_guardrails_are_not_offered(self, caplog):
+    def test_tools_needing_approval_or_output_guardrails_are_not_offered(self, caplog):
         def approve(x: str) -> str:
             """Needs approval."""
             return x
@@ -1240,8 +1240,8 @@ class TestOpenAIRealtimeToolGuards:
                 self._tool(checked, tool_output_guardrails=[object()]),
             )
 
-        assert list(offered) == ["plain"]
-        assert caplog.text.count("needs approval or has tool guardrails") == 3
+        assert list(offered) == ["plain", "guarded"]  # input guardrails run before the tool (execute_tool)
+        assert caplog.text.count("needs approval or has output guardrails") == 2
 
     def test_disabled_tools_are_not_offered(self):
         def off(x: str) -> str:
@@ -1305,6 +1305,62 @@ class TestOpenAIRealtimeToolGuards:
         result = await runner.execute_tool("slow", "{}", ToolContext(Runtime(InMemorySessionStore()), agent, Session("s1"), []), "call-1")
 
         assert "timed out" in result
+
+
+class TestOpenAIRealtimeToolGuardrails:
+    """A tool's input guardrails run before it, as the SDK's realtime session runs them."""
+
+    @staticmethod
+    async def _run(behavior, ran):
+        from agents import ToolGuardrailFunctionOutput, tool_input_guardrail
+
+        from agentkernel.framework.openai.openai import OpenAIRealtimeRunner
+
+        seen = []
+
+        @tool_input_guardrail
+        def check(data):
+            seen.append((data.context.tool_name, data.context.tool_arguments, data.agent.name))
+            return behavior(ToolGuardrailFunctionOutput)
+
+        def book(day: str) -> str:
+            """Book a visit."""
+            ran.append(day)
+            return f"Booked for {day}."
+
+        tool = TestOpenAIRealtimeToolGuards._tool(book, tool_input_guardrails=[check])
+        agent = types.SimpleNamespace(agent=types.SimpleNamespace(tools=[tool]), name="general")
+        runner = OpenAIRealtimeRunner()
+        runner._agent = agent
+        runner._active = types.SimpleNamespace(name="general")
+        runner._tools = {tool.name: tool}
+        context = ToolContext(Runtime(InMemorySessionStore()), agent, Session("s1"), [])
+        result = await runner.execute_tool("book", '{"day": "Friday"}', context, "call-1")
+        return result, seen
+
+    @pytest.mark.asyncio
+    async def test_an_allowing_guardrail_lets_the_tool_run(self):
+        ran = []
+        result, seen = await self._run(lambda out: out.allow(), ran)
+
+        assert result == "Booked for Friday." and ran == ["Friday"]
+        assert seen == [("book", '{"day": "Friday"}', "general")]
+
+    @pytest.mark.asyncio
+    async def test_a_rejection_answers_in_the_tools_place(self):
+        ran = []
+        result, _ = await self._run(lambda out: out.reject_content("Verify the account first."), ran)
+
+        assert result == "Verify the account first." and ran == []
+
+    @pytest.mark.asyncio
+    async def test_a_tripwire_raises_and_the_tool_does_not_run(self):
+        from agents import ToolInputGuardrailTripwireTriggered
+
+        ran = []
+        with pytest.raises(ToolInputGuardrailTripwireTriggered):
+            await self._run(lambda out: out.raise_exception(), ran)
+        assert ran == []
 
 
 class _ScriptedRealtimeSocket:
@@ -3424,6 +3480,7 @@ def _call_state(**state):
         last_edge_text_at=None,
         last_tool_result_at=None,
         last_reconnect_at=None,
+        last_agent_change_at=None,
     )
     return types.SimpleNamespace(**{**defaults, **state})
 
@@ -3432,7 +3489,7 @@ class TestRealtimeOutbox:
     """What an application posts into a call is said only when nobody is talking and nothing is owed a reply."""
 
     def _outbox(self, *texts, now=100.0, **keys):
-        from agentkernel.pipeline.realtime_pool import RealtimeOutbox
+        from agentkernel.pipeline.realtime.pool import RealtimeOutbox
 
         outbox = RealtimeOutbox("s1")
         for text in texts:
@@ -3506,7 +3563,7 @@ class TestRealtimeOutbox:
         assert outbox.empty
 
     def test_a_full_outbox_drops_the_oldest(self):
-        from agentkernel.pipeline.realtime_pool import RealtimeOutbox
+        from agentkernel.pipeline.realtime.pool import RealtimeOutbox
 
         outbox = self._outbox(*[f"update {i}" for i in range(RealtimeOutbox.MAX_PENDING + 1)])
 
@@ -3599,7 +3656,7 @@ class TestRealtimeCall:
         from agentkernel.pipeline import RealtimeCall
 
         call = RealtimeCall("s1")
-        with caplog.at_level(logging.WARNING, logger="ak.pipeline.realtime_pool"):
+        with caplog.at_level(logging.WARNING, logger="ak.pipeline.realtime.pool"):
             assert call.post_when_idle("J1 finished.") is False
         assert "No realtime pool in this process" in caplog.text
         assert (call.connected, call.quiet_for(), call.withdraw("k")) == (False, None, False)
@@ -3723,7 +3780,7 @@ class TestRealtimeHooks:
         agent.realtime_hooks.extend([self._Recorder(fail=True), recorder])
         conn = _connection(agent=agent, loop=asyncio.get_running_loop())
 
-        with caplog.at_level(logging.ERROR, logger="ak.pipeline.realtime_pool"):
+        with caplog.at_level(logging.ERROR, logger="ak.pipeline.realtime.pool"):
             await conn.connect()
             await conn.close()
 
@@ -3832,3 +3889,269 @@ class TestADKCallerTranscript:
         await runner._handle_message(_live_message(turn_complete=True))
 
         assert [t for t, _ in events] == ["done"]
+
+
+class TestRealtimeOutboxWhileQuiet:
+    """A ``while_quiet`` post is for the quiet stretch it was made in: said if the call stays in it, dropped if not."""
+
+    @staticmethod
+    def _outbox():
+        from agentkernel.pipeline.realtime.pool import RealtimeOutbox
+
+        return RealtimeOutbox("s1")
+
+    def test_it_is_said_while_the_call_stays_quiet(self):
+        outbox, conn = self._outbox(), _call_state()
+
+        assert outbox.add("Take the next step.", None, 600.0, 110.0, while_quiet=True, connection=conn) is True
+        assert outbox.take(conn, now=111.6) == "Take the next step."
+
+    def test_it_is_refused_when_the_call_is_not_quiet_or_not_given(self):
+        outbox = self._outbox()
+
+        assert outbox.add("Take the next step.", None, 600.0, 110.0, while_quiet=True, connection=_call_state(is_responding=True)) is False
+        assert outbox.add("Take the next step.", None, 600.0, 110.0, while_quiet=True) is False
+        assert outbox.empty
+
+    @pytest.mark.parametrize(
+        "moved",
+        [
+            {"last_caller_speech_at": 110.5},
+            {"last_edge_text_at": 110.5},
+            {"last_model_generated_at": 110.5, "last_model_output_at": 110.5},
+            {"last_agent_change_at": 110.5},
+            {"last_tool_result_at": 110.5},
+            {"is_caller_speaking": True},
+        ],
+    )
+    def test_it_is_dropped_once_anything_happens_before_it_is_said(self, moved):
+        outbox, conn = self._outbox(), _call_state()
+        outbox.add("Take the next step.", None, 600.0, 110.0, while_quiet=True, connection=conn)
+        outbox.add("J1 finished.", None, 600.0, 110.0)
+
+        for name, value in moved.items():
+            setattr(conn, name, value)
+        assert outbox.take(conn, now=200.0) in (None, "J1 finished.")
+        assert all(post.text != "Take the next step." for post in outbox._pending)
+
+    def test_another_post_said_first_moves_the_call_on(self):
+        outbox, conn = self._outbox(), _call_state()
+        outbox.add("J1 finished.", None, 600.0, 100.0)
+        outbox.add("Take the next step.", None, 600.0, 110.0, while_quiet=True, connection=conn)
+
+        assert outbox.take(conn, now=110.0) == "J1 finished."
+        conn.last_model_generated_at = conn.last_model_output_at = 111.0
+        assert outbox.take(conn, now=113.0) is None
+        assert outbox.empty
+
+    def test_it_does_not_survive_a_new_connection(self):
+        """A nudge for the old connection's quiet must not be said into the one that replaced it."""
+        outbox, old = self._outbox(), _call_state()
+        outbox.add("Take the next step.", None, 600.0, 110.0, while_quiet=True, connection=old)
+
+        assert outbox.take(_call_state(connected_at=120.0), now=130.0) is None
+        assert outbox.empty
+
+    def test_a_handover_ends_the_quiet_stretch(self):
+        outbox = self._outbox()
+
+        assert outbox.quiet_since(_call_state(last_agent_change_at=119.0), now=120.0) == 119.0
+
+
+class TestRealtimeCallFacts:
+    """``RealtimeCall`` tells when the caller, a handoff and a tool result last moved the call."""
+
+    @pytest.fixture(autouse=True)
+    def _transport(self, monkeypatch):
+        monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
+        monkeypatch.setattr(RealtimeConnectionPool, "_instance", None)
+
+    @pytest.mark.asyncio
+    async def test_the_facts_follow_the_call(self):
+        from agentkernel.pipeline import RealtimeCall
+
+        pool = TestRealtimeCall._pool()
+        call = RealtimeCall("s1")
+        assert (call.last_caller_input_at, call.last_agent_change_at, call.last_tool_result_at) == (None, None, None)
+
+        conn = TestRealtimeCall._connect(pool)
+        await conn.handle_framework_event("speech_started", {})
+        spoke = call.last_caller_input_at
+        assert spoke is not None
+        await asyncio.sleep(0.01)
+        conn.send_text("example.com", from_edge=True)
+        assert call.last_caller_input_at > spoke  # typed text counts as the caller's input too
+        conn.send_text("[Team update] J1 finished.")  # the application's own words do not
+        assert call.last_caller_input_at == conn.last_edge_text_at
+
+        await conn.handle_framework_event("agent_changed", {"agent": "billing", "previous_agent": "general"})
+        assert call.last_agent_change_at == conn.last_agent_change_at is not None
+
+        await conn._execute_tool_and_reply("c1", "lookup", "{}")
+        assert call.last_tool_result_at == conn.last_tool_result_at is not None
+
+    @pytest.mark.asyncio
+    async def test_the_facts_are_read_while_the_socket_is_recovered(self):
+        from agentkernel.pipeline import RealtimeCall
+
+        pool = TestRealtimeCall._pool()
+        conn = TestRealtimeCall._connect(pool)
+        await conn.handle_framework_event("speech_started", {})
+        await conn.handle_framework_event("done", {"status": "reconnecting"})
+
+        call = RealtimeCall("s1")
+        assert call.connected is False
+        assert call.last_caller_input_at == conn.last_caller_speech_at
+
+    def test_a_closed_connection_or_no_pool_has_no_facts(self):
+        from agentkernel.pipeline import RealtimeCall
+
+        call = RealtimeCall("s1")
+        assert call.last_caller_input_at is None  # no pool
+
+        pool = TestRealtimeCall._pool()
+        conn = types.SimpleNamespace(closed=True, last_caller_speech_at=1.0, last_edge_text_at=None)
+        pool._connections["s1"] = conn
+        assert call.last_caller_input_at is None
+
+
+class TestRealtimeIdle:
+    """A hook that asks for it is told that the call has gone quiet, each time as long again has passed."""
+
+    class _Hook:
+        def __init__(self, idle_after_seconds=None):
+            self.idle_after_seconds = idle_after_seconds
+            self.events = []
+
+        async def on_event(self, session, agent, event):
+            self.events.append(event)
+
+        def name(self):
+            return "hook"
+
+    @pytest.fixture(autouse=True)
+    def _transport(self, monkeypatch):
+        monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
+        monkeypatch.setattr(RealtimeConnectionPool, "_instance", None)
+
+    async def _call(self, *hooks, quiet_for=10.0):
+        agent = _Agent()
+        agent.realtime_hooks.extend(hooks)
+        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+        await conn.connect()
+        await asyncio.sleep(0.05)  # the pacing loop sends the starting agent on
+        conn._connected_at = time.time() - quiet_for
+        pool = TestRealtimeCall._pool()
+        pool._connections["s1"] = conn
+        return pool, conn
+
+    @staticmethod
+    def _idle(hook):
+        return [event for event in hook.events if event.type == "idle"]
+
+    @pytest.mark.asyncio
+    async def test_a_quiet_call_is_reported_each_time_as_long_again_has_passed(self):
+        hook = self._Hook(idle_after_seconds=5.0)
+        pool, conn = await self._call(hook, quiet_for=7.0)
+
+        pool._report_idle(time.time())
+        pool._report_idle(time.time())  # not twice for the same five seconds
+        await asyncio.sleep(0.05)
+        [idle] = self._idle(hook)
+        assert idle.quiet_for == pytest.approx(7.0, abs=0.5) and idle.agent == "general"
+
+        pool._report_idle(time.time() + 3.5)  # ten seconds into the stretch
+        await asyncio.sleep(0.05)
+        assert len(self._idle(hook)) == 2 and self._idle(hook)[1].quiet_for >= 10.0
+
+        conn._last_model_generated_at = conn._last_model_output_at = time.time() - 6.0  # the model spoke: a new stretch
+        pool._report_idle(time.time())
+        await asyncio.sleep(0.05)
+        assert len(self._idle(hook)) == 3 and round(self._idle(hook)[-1].quiet_for) == 6
+        await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_each_hook_has_its_own_threshold_and_others_see_no_idle(self):
+        soon, late, never = self._Hook(idle_after_seconds=5.0), self._Hook(idle_after_seconds=20.0), self._Hook()
+        pool, conn = await self._call(soon, late, never)
+
+        pool._report_idle(time.time())
+        await asyncio.sleep(0.05)
+
+        assert (len(self._idle(soon)), len(self._idle(late)), len(self._idle(never))) == (1, 0, 0)
+        await conn.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("busy", ["recovering", "responding", "owed"])
+    async def test_a_busy_or_recovering_call_is_not_idle(self, busy):
+        hook = self._Hook(idle_after_seconds=5.0)
+        pool, conn = await self._call(hook)
+        if busy == "recovering":
+            conn._recovering = True
+        elif busy == "responding":
+            conn._tools_in_flight = 1
+        else:
+            conn._last_caller_speech_at = time.time() - 6.0  # the caller spoke and the model has not answered
+
+        pool._report_idle(time.time())
+        await asyncio.sleep(0.05)
+
+        assert self._idle(hook) == []
+        await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_an_idle_event_whose_quiet_ended_before_its_hook_ran_is_dropped(self):
+        """An idle waiting behind a slow hook while the caller speaks again would nudge into a call that moved on."""
+        release = asyncio.Event()
+
+        class Slow:
+            idle_after_seconds = None
+
+            async def on_event(self, session, agent, event):
+                if event.type == "edge_text":
+                    await release.wait()
+
+            def name(self):
+                return "slow"
+
+        hook = self._Hook(idle_after_seconds=5.0)
+        pool, conn = await self._call(Slow(), hook)
+
+        conn._observe("edge_text", text="example.com")  # the slow hook holds the queue on this
+        await asyncio.sleep(0.01)
+        pool._report_idle(time.time())  # queued behind it
+        conn._last_caller_speech_at = time.time()  # the caller speaks before the idle reaches its hook
+        release.set()
+        await asyncio.sleep(0.05)
+
+        assert self._idle(hook) == []
+        await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_a_hooks_while_quiet_answer_to_idle_is_said(self):
+        class Nudge(self._Hook):
+            async def on_event(self, session, agent, event):
+                if event.type == "idle":
+                    from agentkernel.pipeline import RealtimeCall
+
+                    self.queued = RealtimeCall(event.session_id).post_when_idle("Your turn.", while_quiet=True)
+
+        hook = Nudge(idle_after_seconds=5.0)
+        pool, conn = await self._call(hook)
+
+        pool._report_idle(time.time())
+        await asyncio.sleep(0.05)
+        pool._deliver_posts(time.time())
+        await asyncio.sleep(0.01)
+
+        assert hook.queued is True and conn.adapter.texts == ["Your turn."]
+        await conn.close()
+
+    @pytest.mark.asyncio
+    async def test_a_call_whose_hooks_ask_for_nothing_gets_no_outbox(self):
+        pool, conn = await self._call(self._Hook())
+
+        pool._report_idle(time.time())
+
+        assert pool._outboxes == {}
+        await conn.close()

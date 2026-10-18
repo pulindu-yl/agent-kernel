@@ -1,18 +1,16 @@
+import asyncio
 import logging
-import threading
-import time
 from typing import Any, Optional
-
-from google.adk.agents import Agent as GoogleAgent
-from google.adk.tools import ToolContext
-from google.genai import types
 
 from agentkernel import RealtimeEvent, RealtimeHook
 from agentkernel.adk import GoogleADKModule, GoogleADKToolBuilder
 from agentkernel.core import ToolContext as AKToolContext
 from agentkernel.integration.adapter import GatewayRunner
 from agentkernel.livekit import LiveKitEdgeGateway
-from agentkernel.pipeline import IOHandler, RealtimeCall
+from agentkernel.pipeline import BackgroundJob, BackgroundJobRefused, IOHandler, RealtimeCall
+from google.adk.agents import Agent as GoogleAgent
+from google.adk.tools import ToolContext
+from google.genai import types
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S"
@@ -62,20 +60,36 @@ def check_outage(postcode: str) -> str:
 def book_technician(account_id: str, day: str) -> str:
     """Request a technician visit for a customer account on a given day; the dispatch system confirms it shortly."""
     # The call's session, read while the tool runs: the background job outlives the tool call.
-    session_id = AKToolContext.get().session.id
-    threading.Thread(target=confirm_visit, args=(session_id, account_id, day), daemon=True).start()
+    call = RealtimeCall(AKToolContext.get().session.id)
+    try:
+        # The tool returns at once, and the call goes on; the confirmation is a background job of the call's.
+        call.run_in_background(
+            confirm_visit,
+            name="dispatch",
+            arguments={"account_id": account_id, "day": day},
+            refuse=lambda pending: already_booking(account_id, pending),
+        )
+    except BackgroundJobRefused as refused:
+        return str(refused)
     return (
         f"A technician visit is requested for account {account_id} on {day}. Tell the caller the dispatch system "
         "will confirm the time in a moment, and carry on helping them."
     )
 
 
-def confirm_visit(session_id: str, account_id: str, day: str) -> None:
+def already_booking(account_id: str, pending: list[BackgroundJob]) -> Optional[str]:
+    """Refuse a second booking for an account while its first is still with the dispatch system."""
+    if any(job.name == "dispatch" and job.arguments["account_id"] == account_id for job in pending):
+        return f"A visit for account {account_id} is already being booked; its confirmation comes in a moment. Do not book again."
+    return None
+
+
+async def confirm_visit(job: BackgroundJob) -> None:
     """The dispatch system's answer, said into the call at its next quiet moment instead of cutting anyone off."""
-    time.sleep(DISPATCH_SECONDS)
-    RealtimeCall(session_id).post_when_idle(
-        f"[Dispatch system] The technician visit for account {account_id} on {day} is confirmed for 8am to 12pm, "
-        "reference TEC-4821. Tell the caller in one short sentence.",
+    await asyncio.sleep(DISPATCH_SECONDS)
+    job.post(
+        f"[Dispatch system] The technician visit for account {job.arguments['account_id']} on {job.arguments['day']} is "
+        "confirmed for 8am to 12pm, reference TEC-4821. Tell the caller in one short sentence.",
         key="dispatch",
     )
 
@@ -90,7 +104,9 @@ def require_account(tool: Any, args: dict[str, Any], tool_context: ToolContext) 
         return None
     if tool_context.state.get("account_id"):
         return None
-    return {"result": "Not transferred: ask the caller for their account number and verify it with verify_account first."}
+    return {
+        "result": "Not transferred: ask the caller for their account number and verify it with verify_account first."
+    }
 
 
 class CallLog(RealtimeHook):
@@ -100,7 +116,9 @@ class CallLog(RealtimeHook):
         if event.type == "caller_said":
             _log.info(f"[call {event.session_id}] caller: {event.text}")
         elif event.type == "agent_said":
-            _log.info(f"[call {event.session_id}] {event.agent}: {event.text}{' (interrupted)' if event.interrupted else ''}")
+            _log.info(
+                f"[call {event.session_id}] {event.agent}: {event.text}{' (interrupted)' if event.interrupted else ''}"
+            )
         elif event.type in ("agent_changed", "reconnected"):
             _log.info(f"[call {event.session_id}] {event.type}: {event.agent}")
 

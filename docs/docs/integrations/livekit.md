@@ -98,6 +98,27 @@ Run the Agent Runner as a single replica: its connection pool is local to the pr
 LiveKit requires the Agent Kernel execution mode to be set to `realtime`. Standard async/sync text modes will not work. Ensure you have `execution.mode: realtime` set in your `config.yaml`.
 :::
 
+### A room per session
+
+To give each meeting a room of its own, opened when someone joins and closed when the meeting ends, host the gateways
+with `GatewayPool` instead of a fixed list. It runs in the process of the Response Handler, as `IOHandler.run(gateways=...)`
+does:
+
+```python
+from agentkernel.integration.adapter import GatewayPool
+from agentkernel.livekit import LiveKitEdgeGateway
+
+rooms = GatewayPool(lambda meeting_id: LiveKitEdgeGateway(session_id=meeting_id, agent_name="pm"))
+
+gateway = rooms.open(meeting.id)          # joins the room on a thread of its own, unless it is open already
+token = gateway.participant_token(user_id, name=user_name)
+...
+rooms.close(meeting.id)                   # the team leaves the room
+```
+
+A gateway whose `start()` fails (the room could not be joined) is logged and forgotten, so the next `open` tries
+again. `GatewayRunner.stop()` stops one gateway from any thread, even before it has started.
+
 ### Tokens for your users
 
 A person joins the room with a token signed by the room's API key and secret. When your app serves a page
@@ -232,7 +253,7 @@ For how handoffs flow through the pipeline, see [Realtime Voice Internals](../ar
 
 Agents that can hand off to each other can also do so without the caller, back and forth. Each framework's own hook can refuse a handoff, and the refused agent keeps the call:
 
-- **OpenAI Agents SDK**: wrap the target in `handoff(agent, on_handoff=...)` and raise from the hook. The model gets the exception's message as the handoff's result.
+- **OpenAI Agents SDK**: wrap the target in `handoff(agent, on_handoff=...)` and raise from the hook. The model gets the exception's message as the handoff's result. To refuse a tool call, give the tool an input guardrail (`tool_input_guardrails`): one that answers `reject_content` is the tool's result in its place, as in the SDK's own realtime session; one that trips (`raise_exception`) is answered as a tool that raised.
 - **Google ADK**: give the agent a `before_tool_callback` that returns a result for `transfer_to_agent`. Realtime runs an agent's `before_tool_callback`, `on_tool_error_callback` and `after_tool_callback` around every tool call, as an ADK run does; ADK plugins do not run.
 
 ```python
@@ -271,7 +292,92 @@ waiting, and `call.withdraw(key)` drops one that no longer applies. Say whose wo
 `RealtimeCall` also tells what the call is doing: `connected`, `quiet_for()` (seconds the call has been quiet,
 or `None` while it is busy) and `agent_has_spoken` (whether the agent with the call has said anything since it
 got it, known as soon as the model generates the words: a handoff policy can refuse an agent that hands the call
-on without a word). See [Turn state](../architecture/realtime-internals.md#turn-state) for how quiet is decided.
+on without a word). It tells when each last happened, too: `last_caller_input_at` (the caller spoke, or the edge
+sent text), `last_agent_change_at` and `last_tool_result_at`, in epoch seconds, `None` without a call. See
+[Turn state](../architecture/realtime-internals.md#turn-state) for how quiet is decided.
+
+`post_when_idle(..., while_quiet=True)` is for text that only applies to the quiet moment it was made in: it is
+not queued unless the call is quiet now (it returns `False`), and it is dropped if that quiet ends before it is
+said (the caller, the model, a handoff, a tool result, another post, or a new model connection).
+
+## Background work
+
+A voice agent starts long work with a short tool and keeps talking; `RealtimeCall.run_in_background` runs the work
+for the call and says its result into the call at a quiet moment:
+
+```python
+from agentkernel.core import ToolContext
+from agentkernel.pipeline import BackgroundJob, BackgroundJobRefused, RealtimeCall
+
+
+async def research(job: BackgroundJob) -> str | None:
+    reply = await job.ask("researcher", f"Research question: {job.arguments['question']}")
+    return f"[Team update] Research {job.id}: {reply}"
+
+
+def request_research(question: str) -> str:
+    """Ask the Researcher one question; the answer arrives as a team update."""
+    call = RealtimeCall(ToolContext.get().session.id)
+    try:
+        job = call.run_in_background(
+            research,
+            name="research",
+            arguments={"question": question},
+            refuse=lambda pending: "That research is already under way." if any(j.arguments == {"question": question} for j in pending) else None,
+            on_error=lambda job, error: f"[Team update] Research {job.id} could not run; carry on without it.",
+            wait_until_heard=True,
+        )
+    except BackgroundJobRefused as refused:
+        return str(refused)
+    return f"Started research {job.id}; the answer comes as a team update."
+```
+
+- **Where it runs**: on one event loop of its own for the process, never the realtime pool's (which paces every
+  call's audio); a call's jobs run one at a time, in order, and other calls' run beside them. Keep a job async:
+  blocking work goes to `asyncio.to_thread`. Jobs are process-local, like `RealtimeCall`.
+- **Who runs it**: the realtime host (the Agent Runner, which every process of the single-process topology
+  includes) starts the job runner beside the pool and shuts it down with it. A submission never waits:
+  `run_in_background` raises `RuntimeError` at once in a process with no job runner, one not running yet, or one
+  shutting down. An offline test hosts one with `agentkernel.pipeline.testing.BackgroundJobHost`:
+
+  ```python
+  from agentkernel.pipeline.testing import BackgroundJobHost
+
+  with BackgroundJobHost():
+      ...  # code that starts background jobs
+  ```
+- **Sessions**: `job.ask(agent, prompt)` runs a registered agent in the job's own AK session,
+  `<call session>-job-<job id>`, never the call's, whose lock every voice tool call takes. A job's asks share it.
+  `BackgroundJob.call_session_id(session_id)` gives the call's session back, for a tool the background agent calls.
+- **Results**: text `work` returns is posted (`job.post`), and `job.post(text, key=...)` can post along the way.
+- **Failures**: `work` raising fails the job, and `on_error(job, error)` returns what to say. An agent's failed run
+  comes back from `ask` as error text, as on every other surface, so detect it during the run through the
+  framework's own signal, and raise. With the OpenAI Agents SDK, `RunHooks.on_agent_end` is called only for a run that
+  finished:
+
+  ```python
+  class Finished(RunHooks):
+      async def on_agent_end(self, context, agent, output):
+          FINISHED.get().append(True)        # a ContextVar the job sets around its ask
+  ```
+
+- **Refusing**: `refuse(pending)` sees the call's queued and running jobs, under the lock that guards the submission,
+  so a check and the submission it allows cannot race. `job_id=` sets your own id (default `<name>-<random>`).
+- **Waiting to be heard**: `wait_until_heard=True` starts the job only once what the agent said before the tool has
+  been heard (the call quiet for a moment), at most 20 seconds.
+- **Ending the call**: `RealtimeCall.close()` cancels the jobs whose work has not started, one still waiting to be
+  heard included (their `on_error` gets `BackgroundJobCancelled`), lets the running one finish, and drops what it
+  posts afterwards. `call.jobs` lists the queued and running jobs.
+- **Cancellation**: work that raises `asyncio.CancelledError` ends its job as `cancelled` (`on_error` gets
+  `BackgroundJobCancelled`, and its text is posted), and the call's next job runs.
+- **Shutdown**: when the host shuts down, no job is started any more, nothing jobs post is said, queued and waiting
+  jobs are cancelled (`on_error` gets `BackgroundJobCancelled`), running work has 5 seconds to finish, then it and
+  every other task left on the job loop (one an SDK left behind, say) are cancelled and have 5 seconds to end. These are cleanup budgets: work that blocks the job loop cannot be stopped, so
+  it is logged as abandoned and stays until the process exits.
+- **Callbacks**: `on_error` runs outside Agent Kernel's locks; `refuse` runs under the job lock, so keep it fast and
+  never call `run_in_background`, `close` or `job.post` from it.
+
+Agent Kernel decides no policy here: no retries, no failure counts, no wording.
 
 ## Watching a live call
 
@@ -299,23 +405,42 @@ GoogleADKModule([pm]).realtime_hook(pm, [Transcript()])
 | `agent_said` | An agent's words in one turn, as they reached the edge; `interrupted` when the caller talked over it |
 | `agent_changed` | The call moved to `event.agent`, and once for the agent it starts with |
 | `reconnected` | The model socket dropped or stopped answering and was replaced, with `event.agent` still on the call (Gemini: reconnected with the conversation, the agent told the line dropped) |
+| `idle` | The call has been quiet for `event.quiet_for` seconds. Only to a hook that sets `idle_after_seconds`, then again each time as long again has passed while the call stays quiet |
 
 Hooks are attached to the agent a call starts with and see its handoffs' turns too, named in `event.agent`.
 They run one event at a time, in order, on the pool's loop but off the audio path; keep them short. A hook that
 raises is logged, and the next one still runs.
 
+A hook that sets `idle_after_seconds` is told `idle` once the call has been quiet that long, and again each time
+as long again has passed while it stays quiet (`event.quiet_for` says how long); anything that ends the quiet
+starts the count over. It is how an application notices a stalled call without a
+thread of its own; whether to act, and what to say, is the hook's:
+
+```python
+class Nudge(RealtimeHook):
+    idle_after_seconds = 5.0
+
+    async def on_event(self, session, agent, event: RealtimeEvent) -> None:
+        if event.type == "idle" and team_owes_the_next_step(event.session_id):
+            RealtimeCall(event.session_id).post_when_idle("[Team update] Your turn: take the next step.", while_quiet=True)
+
+    def name(self) -> str:
+        return "nudge"
+```
+
 ## Example Projects
 
-Complete working examples (with In-Memory, Kafka, NATS, and AWS SQS architectures) are available in the **examples/api/livekit-voice** directory. The `openai/handoffs` and `google/handoffs` variants show multi-agent handoffs with an internet support line (supervisor, billing and tech support). `google/handoffs` also refuses a handoff until the caller's account is verified (a `before_tool_callback`), confirms a technician visit from a background job with `RealtimeCall.post_when_idle`, and logs the call with a `RealtimeHook`.
+Complete working examples (with In-Memory, Kafka, NATS, and AWS SQS architectures) are available in the **examples/api/livekit-voice** directory. The `openai/handoffs` and `google/handoffs` variants show multi-agent handoffs with an internet support line (supervisor, billing and tech support). `google/handoffs` also refuses a handoff until the caller's account is verified (a `before_tool_callback`), confirms a technician visit from a background job (`RealtimeCall.run_in_background`), and logs the call with a `RealtimeHook`.
 
 ## Limitations
 
 - **No guardrails or pre/post hooks on realtime turns**: voice and chat turns go to the model socket directly, not through `Runtime.run()`, so input/output guardrails, pre/post hooks and the multimodal pre-hook do not run. [Realtime hooks](#watching-a-live-call) do: they observe the call, and cannot change what is said.
-- **Tool limits**: OpenAI tools that need approval or have tool guardrails are not offered in realtime mode (a warning is logged), and ADK toolsets such as MCP are not supported. Plain function tools work on both frameworks.
-- **One room per gateway**: each `LiveKitEdgeGateway` joins one room, and all audio in that room goes to one session.
+- **Tool limits**: OpenAI tools that need approval or have output guardrails are not offered in realtime mode (a warning is logged); tool input guardrails run. ADK toolsets such as MCP are not supported. Plain function tools work on both frameworks.
+- **One room per gateway**: each `LiveKitEdgeGateway` joins one room, and all audio in that room goes to one session; `GatewayPool` opens one per session.
 - **History is held by the model connection**: the conversation lives in the model's own session (for a Google ADK transfer, Agent Kernel replays it into the new agent's socket).
   - **Google ADK**: a Gemini socket that drops, stalls or reaches the Live API's connection time limit (about 10 minutes) is replaced with the same agent, seeded with the conversation and a short note that the line dropped (see [Connection recovery](../architecture/realtime-internals.md#connection-recovery-google-adk)); what the caller says meanwhile is held and passed on. Only when every attempt fails, or the new sockets keep dropping, is the call failed.
   - **OpenAI**, and any adapter after a failed call: the next connection starts with no earlier turns, at the entry agent. So does a call evicted after five idle minutes.
   - The replayed conversation is text: tone of voice is not carried over, and a very long call replays a long history on every transfer or reconnect.
 - **One LiveKit connection per agent**: with handoffs, every agent in the team is a participant for the whole call, and LiveKit bills connection minutes for each.
 - **Single replicas**: one Agent Runner replica and one IOHandler process, as described above.
+- **Background jobs are in-process**: a job runs in the process that submitted it, and posts reach only that process's calls.

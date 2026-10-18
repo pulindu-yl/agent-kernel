@@ -5,6 +5,10 @@ import logging
 import time
 from types import SimpleNamespace
 
+import pytest
+from agentkernel.pipeline import RealtimeCall
+from agentkernel.pipeline.testing import BackgroundJobHost
+
 import server
 
 TRANSFER = SimpleNamespace(name="transfer_to_agent")
@@ -34,30 +38,53 @@ def test_verifying_an_account_records_it_for_the_whole_call():
     assert "no account" in server.verify_account("1042", context())
 
 
-def test_a_technician_visit_is_confirmed_into_the_call_in_the_background(monkeypatch):
-    posts = []
+@pytest.fixture
+def posts(monkeypatch):
+    """What background jobs say into the call, as (session, text, key)."""
+    said = []
 
-    class FakeCall:
-        def __init__(self, session_id):
-            self.session_id = session_id
+    def post_when_idle(self, text, *, key=None, expires_after=600.0, while_quiet=False):
+        said.append((self.session_id, text, key))
+        return True
 
-        def post_when_idle(self, text, key=None, expires_after=600.0):
-            posts.append((self.session_id, text, key))
-            return True
+    monkeypatch.setattr(RealtimeCall, "post_when_idle", post_when_idle)
+    monkeypatch.setattr(
+        server.AKToolContext, "get", staticmethod(lambda: SimpleNamespace(session=SimpleNamespace(id="room_01")))
+    )
+    # The realtime host runs the background job runner; offline, the test hosts it.
+    with BackgroundJobHost():
+        yield said
 
-    monkeypatch.setattr(server, "RealtimeCall", FakeCall)
+
+def _wait(condition):
+    deadline = time.monotonic() + 2
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_a_technician_visit_is_confirmed_into_the_call_in_the_background(posts, monkeypatch):
     monkeypatch.setattr(server, "DISPATCH_SECONDS", 0.0)
-    monkeypatch.setattr(server.AKToolContext, "get", staticmethod(lambda: SimpleNamespace(session=SimpleNamespace(id="room_01"))))
 
     answer = server.book_technician("A-1042", "Friday")
 
     assert "confirm" in answer
-    deadline = time.monotonic() + 2
-    while not posts and time.monotonic() < deadline:
-        time.sleep(0.01)
+    _wait(lambda: posts)
     [(session_id, text, key)] = posts
     assert (session_id, key) == ("room_01", "dispatch")
-    assert text.startswith("[Dispatch system]") and "TEC-4821" in text
+    assert text.startswith("[Dispatch system]") and "TEC-4821" in text and "Friday" in text
+
+
+def test_a_second_booking_waits_for_the_first(posts, monkeypatch):
+    monkeypatch.setattr(server, "DISPATCH_SECONDS", 0.3)
+
+    server.book_technician("A-1042", "Friday")
+    again = server.book_technician("A-1042", "Friday")
+    other = server.book_technician("A-2000", "Monday")
+
+    assert "already being booked" in again
+    assert "requested" in other
+    _wait(lambda: len(posts) == 2)
+    assert len(posts) == 2
 
 
 def test_the_supervisor_carries_the_rule_and_the_call_log():
@@ -70,8 +97,18 @@ def test_the_call_log_writes_both_sides_of_the_call(caplog):
     log = server.CallLog()
 
     with caplog.at_level(logging.INFO, logger="server"):
-        asyncio.run(log.on_event(None, None, server.RealtimeEvent(type="caller_said", session_id="room_01", text="My bill is high.")))
-        asyncio.run(log.on_event(None, None, server.RealtimeEvent(type="agent_said", session_id="room_01", agent="billing", text="Let me check.")))
+        asyncio.run(
+            log.on_event(
+                None, None, server.RealtimeEvent(type="caller_said", session_id="room_01", text="My bill is high.")
+            )
+        )
+        asyncio.run(
+            log.on_event(
+                None,
+                None,
+                server.RealtimeEvent(type="agent_said", session_id="room_01", agent="billing", text="Let me check."),
+            )
+        )
 
     assert "caller: My bill is high." in caplog.text
     assert "billing: Let me check." in caplog.text

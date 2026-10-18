@@ -102,3 +102,61 @@ before the code they describe.
   2. Run the `ak-dev-sync-docs-from-branch` and `ak-dev-sync-skills-from-branch` flows to confirm nothing else drifted.
   3. Write the PR description from `design.md`: the change, the resolved questions, `Relates to #810`; leave out what #808 already merged (ADK `transfer_to_agent`, LiveKit agent participants). Answer each open review thread with the commit that addresses it, and the browser-edge threads by pointing to its removal.
 - **Verify:** `cd docs && npm run build` succeeds; the two sync flows report no drift.
+
+## Building blocks for applications
+
+Iterations 11 to 16 build spec.md "Application building blocks", in the same PR, each leaving the suite green.
+
+## Iteration 11: Call facts, the idle event and `while_quiet`
+
+- **Goal:** application code reads the call's facts and gets an `idle` event, with no thread of its own.
+- **Files:** `core/hooks.py`, `pipeline/realtime_pool.py`
+- **Steps:** the facts; `quiet_since`; `_report_idle`; the `(event, only)` hook queue; `while_quiet` (spec.md "Call facts").
+- **Verify:** `TestRealtimeCallFacts`, `TestRealtimeIdle`, `TestRealtimeOutbox`.
+
+## Iteration 12: Background jobs
+
+- **Goal:** `RealtimeCall.run_in_background` runs jobs per session, in order, on one job loop.
+- **Files:** `pipeline/realtime_jobs.py` (new), `pipeline/realtime_pool.py`, `pipeline/__init__.py`
+- **Steps:** the errors, `BackgroundJob`, `BackgroundJobRunner` (Rules 1 to 7); `RealtimeCall.run_in_background`, `jobs`, `close()`.
+- **Verify:** `TestBackgroundJobRunner`, `TestBackgroundJobAsk`, `TestRealtimeCallJobs`.
+
+## Iteration 13: Gateways per session
+
+- **Goal:** a gateway stops on its own; `GatewayPool` opens one per session.
+- **Files:** `integration/adapter/gateway.py`, `integration/adapter/__init__.py`
+- **Steps:** `GatewayRunner.stop`; `GatewayPool` (spec.md "Gateways").
+- **Verify:** `test_integration_gateway_runner.py`.
+
+## Iteration 14: OpenAI realtime tool input guardrails
+
+- **Goal:** OpenAI realtime runs a tool's input guardrails, as the SDK's realtime session does.
+- **Files:** `framework/openai/openai.py`
+- **Steps:** offer the tools; run the guardrails in `execute_tool` (spec.md "OpenAI realtime tool input guardrails").
+- **Verify:** `TestOpenAIRealtimeToolGuardrails`.
+
+## Iteration 15: Example, docs and skills
+
+- **Goal:** the example's booking is a background job; the docs and skills describe the building blocks.
+- **Files:** `examples/api/livekit-voice/google/handoffs/{server.py,server_test.py,README.md}`, the surfaces in spec.md "Migration surface"
+- **Steps:** switch `book_technician` (spec.md "Example"); update the tests; edit the docs and the two dev skills.
+- **Verify:** the example's `uv run pytest -s`; `cd docs && npm run build`; the full suite and `make lint-check-all`.
+
+## Iteration 16: Host the job runner (design.md "Hosting and lifecycle")
+
+- **Goal:** the realtime host starts and shuts down the job runner; submission never waits; shutdown is bounded.
+- **Files:** `pipeline/realtime_jobs.py`, `pipeline/realtime_pool.py`, `pipeline/agent_runner.py`, `deployment/aws/containerized/akagentrunner.py`, `pipeline/testing.py`
+- **Steps:** spec.md "Background jobs" Rules 1, 1a, 7a, 9 and 10: hosting, admission and readiness, one end per job and a runner-owned `post`, shutdown, `BackgroundJobHost`; move AK's tests onto `BackgroundJobHost`.
+- **Verify:** host tests (startup, repeated `initialize()`, both runners' tasks, shutdown order, the submission race, no restart after shutdown, a cleanup timeout released afterwards); `test_realtime_jobs.py`; the full suite.
+
+## Iteration 17: Shutdown cleanup, readiness, and the realtime package
+
+- **Goal:** shutdown always cleans the job loop's tasks within its budget; concurrent first connections see one readiness outcome; the pool and the jobs live in `pipeline/realtime/`.
+- **Files:** `pipeline/realtime/{__init__,pool,jobs}.py` (moved), `pipeline/__init__.py`, `pipeline/testing.py`, `pipeline/agent_runner.py`, `deployment/aws/containerized/akagentrunner.py`, the tests' imports
+- **Steps:** spec.md "Background jobs" Rules 1a and 9; "Package layout".
+- **Verify:** the shutdown and readiness cases in `test_realtime_jobs.py`; the full suite.
+
+## Iteration 18: The application (outside this repository)
+
+- **Goal:** the application that drove the change runs on the building blocks: its background jobs on `run_in_background` (failure detected natively, as today), its nudges an `idle` hook, its rooms a `GatewayPool`, its handoff rules one policy class on ADK's callbacks.
+- **Verify:** its tests pass; a live call: handoffs, research, a refused handoff, a nudge, the meeting ended.

@@ -11,7 +11,8 @@ from agentkernel.core.runtime import Runtime
 from agentkernel.core.session.in_memory import InMemorySessionStore
 from agentkernel.deployment.aws.containerized.akagentrunner import ECSAgentRunner, ECSRealtimeAgentRunner, ECSStreamAgentRunner
 from agentkernel.pipeline.envelope import QueueName
-from agentkernel.pipeline.realtime_pool import RealtimeConnectionPool
+from agentkernel.pipeline.realtime.jobs import BackgroundJobRunner
+from agentkernel.pipeline.realtime.pool import RealtimeConnectionPool
 from agentkernel.pipeline.thread_runner import ThreadRunner
 from agentkernel.pipeline.transport.base import QueueTransportFactory
 from agentkernel.pipeline.transport.in_memory import InMemoryTransport
@@ -206,15 +207,20 @@ def test_consumer_loop_starts_real_pool_processes_requests_and_closes_connection
         assert first.closed
         assert pool.get_connection("room_01") is None
         chat_service.prepare_agent_handler.assert_called_once_with("room_01", "general")
+        # The host ran the background job runner beside the pool, and shut it down with it.
+        jobs = BackgroundJobRunner.current()
+        assert jobs is not None and jobs._finished.is_set() and not jobs.ready
     finally:
         ThreadRunner.shutdown_event.set()
         consumer_thread.join(timeout=15)
         RealtimeConnectionPool.reset()
+        BackgroundJobRunner.reset()
 
 
 @pytest.mark.parametrize("runner_cls", [ECSAgentRunner, ECSStreamAgentRunner])
 def test_non_realtime_consumer_does_not_initialize_pool(runner_cls):
-    with patch.object(RealtimeConnectionPool, "initialize") as initialize:
+    with patch.object(RealtimeConnectionPool, "initialize") as initialize, patch.object(BackgroundJobRunner, "initialize") as jobs:
         runner_cls._build_consumer_loop()
 
     initialize.assert_not_called()
+    jobs.assert_not_called()  # no background job runner outside the realtime host

@@ -6,28 +6,29 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 
-from ..core.base import Agent as BaseAgent
-from ..core.base import Session
-from ..core.config import AKConfig
-from ..core.event import AgentChanged, AudioDelta, Interrupt, TextDelta
-from ..core.hooks import RealtimeEvent
-from ..core.model import StreamChunk
-from ..core.realtime import EDGE_SAMPLE_RATE, PCM16Resampler
-from ..core.realtime import RealtimeRunner as BaseRealtimeRunner
-from ..core.runtime import Runtime
-from ..core.tool import ToolContext
-from .envelope import ATTR_INTEGRATION, ATTR_REALTIME, ATTR_REQUEST_ID, ATTR_USER_ID, REPLY_CONTEXT_PREFIX, QueueMessage, QueueName
-from .integration_delivery import IntegrationDelivery
-from .thread_runner import ThreadRunner
-from .transport.base import QueueTransport, QueueTransportFactory
+from ...core.base import Agent as BaseAgent
+from ...core.base import Session
+from ...core.config import AKConfig
+from ...core.event import AgentChanged, AudioDelta, Interrupt, TextDelta
+from ...core.hooks import RealtimeEvent
+from ...core.model import StreamChunk
+from ...core.realtime import EDGE_SAMPLE_RATE, PCM16Resampler
+from ...core.realtime import RealtimeRunner as BaseRealtimeRunner
+from ...core.runtime import Runtime
+from ...core.tool import ToolContext
+from ..envelope import ATTR_INTEGRATION, ATTR_REALTIME, ATTR_REQUEST_ID, ATTR_USER_ID, REPLY_CONTEXT_PREFIX, QueueMessage, QueueName
+from ..integration_delivery import IntegrationDelivery
+from ..thread_runner import ThreadRunner
+from ..transport.base import QueueTransport, QueueTransportFactory
 
 if TYPE_CHECKING:  # typing only; the runners pass these in
-    from ..core.chat_service import ChatService
-    from ..core.model import BaseRunRequest
+    from ...core.chat_service import ChatService
+    from ...core.model import BaseRunRequest
+    from .jobs import BackgroundJob
 
-_log = logging.getLogger("ak.pipeline.realtime_pool")
+_log = logging.getLogger("ak.pipeline.realtime.pool")
 
 # Bound on a consumer thread's wait for a model send to complete before the input is acked.
 _SEND_TIMEOUT_SECONDS = 10.0
@@ -117,6 +118,11 @@ class RealtimeConnection:
         self._hook_events: Optional[asyncio.Queue] = None
         self._hook_task: Optional[asyncio.Task] = None
         self._closed_reported = False
+        # For each hook that asks for ``idle``: the quiet stretch it was last told about (when that stretch began),
+        # and how many times it was told about it.
+        self._idle_reported: dict[int, tuple[float, int]] = {}
+        # The session's outbox, which judges when the call is quiet; known once the pool first looks for idle.
+        self._quiet_outbox: Optional["RealtimeOutbox"] = None
         # The agent whose words are reaching the edge, and those words since its turn began, for the
         # hooks' ``agent_said``.
         self._speaker = agent.name
@@ -534,7 +540,7 @@ class RealtimeConnection:
     def _observe(self, event_type: str, **fields: Any) -> None:
         """Queue a realtime event for the agent's realtime hooks; nothing when it has none. Call on the pool loop."""
         if self._hook_events is not None:
-            self._hook_events.put_nowait(RealtimeEvent(type=event_type, session_id=self.session_id, **fields))
+            self._hook_events.put_nowait((RealtimeEvent(type=event_type, session_id=self.session_id, **fields), None, None))
 
     def _observe_soon(self, event_type: str, **fields: Any) -> None:
         """``_observe`` from any thread: input arrives on a consumer thread, and the hook queue belongs to the pool loop."""
@@ -546,9 +552,40 @@ class RealtimeConnection:
         except RuntimeError:
             running = None
         if running is self.loop:
-            self._hook_events.put_nowait(event)
+            self._hook_events.put_nowait((event, None, None))
         elif not self.loop.is_closed():
-            self.loop.call_soon_threadsafe(self._hook_events.put_nowait, event)
+            self.loop.call_soon_threadsafe(self._hook_events.put_nowait, (event, None, None))
+
+    @property
+    def wants_idle(self) -> bool:
+        """Whether one of the agent's realtime hooks asks to be told when the call goes quiet (``idle_after_seconds``)."""
+        hooks = getattr(self.agent, "realtime_hooks", None) or []
+        return self._hook_events is not None and any(getattr(hook, "idle_after_seconds", None) is not None for hook in hooks)
+
+    def notice_quiet(self, since: float, now: float, outbox: "RealtimeOutbox") -> None:
+        """Tell each hook that asks for it that the call is ``idle``, each time it has been quiet long enough. Call on the pool loop.
+
+        ``since`` is when the call last stopped being quiet, which names the quiet stretch. A hook with
+        ``idle_after_seconds`` of ``n`` is told once the stretch is ``n`` seconds old, then again at ``2n``, ``3n``
+        and so on while it lasts; anything that ends the stretch (a new ``since``) starts the count over. The event
+        goes to that hook alone, through the hooks' queue, so it is in order with the call's other events and never
+        overlaps them; one whose stretch has ended by the time the hook's turn comes is dropped (``_serve_hooks``).
+        """
+        if self._hook_events is None:
+            return
+        self._quiet_outbox = outbox
+        for hook in list(getattr(self.agent, "realtime_hooks", None) or []):
+            after = getattr(hook, "idle_after_seconds", None)
+            if after is None or after <= 0:
+                continue
+            stretch, told = self._idle_reported.get(id(hook), (None, 0))
+            if stretch != since:
+                told = 0
+            if now - since < after * (told + 1):
+                continue
+            self._idle_reported[id(hook)] = (since, told + 1)
+            event = RealtimeEvent(type="idle", session_id=self.session_id, agent=self._speaker, quiet_for=now - since)
+            self._hook_events.put_nowait((event, hook, since))
 
     @property
     def is_ready(self) -> bool:
@@ -598,14 +635,24 @@ class RealtimeConnection:
         if events is None:
             return
         while True:
-            event = await events.get()
-            for hook in list(getattr(self.agent, "realtime_hooks", None) or []):
+            # ``only``: the one hook an event is for (``idle``), else ``None`` for every hook; ``stretch``: the quiet
+            # stretch an ``idle`` is about, which must still be the call's when the hook's turn comes.
+            event, only, stretch = await events.get()
+            if stretch is not None and not self._still_quiet_since(stretch):
+                _log.debug(f"An idle event for session {self.session_id} was dropped: the call moved on before its hook ran")
+                continue
+            for hook in [only] if only is not None else list(getattr(self.agent, "realtime_hooks", None) or []):
                 try:
                     await hook.on_event(self.session, self.agent, event)
                 except Exception:
                     _log.exception(f"Realtime hook {type(hook).__name__} failed on {event.type} in session {self.session_id}")
             if event.type == "disconnected":
                 return
+
+    def _still_quiet_since(self, stretch: float) -> bool:
+        """Whether the call is still in the quiet stretch that began at ``stretch``."""
+        outbox = self._quiet_outbox
+        return outbox is not None and outbox.quiet_since(self, time.time()) == stretch
 
     async def _finish_hooks(self) -> None:
         """Wait for the hooks to take the events left (at most ``_HOOK_DRAIN_SECONDS``), then stop them."""
@@ -624,6 +671,9 @@ class _Post:
     text: str
     key: Optional[str]
     expires_at: float
+    # For a ``while_quiet`` post (``post_when_idle(..., while_quiet=True)``): the quiet stretch it was made in, named by
+    # when it began (``RealtimeOutbox.quiet_since``); it is dropped once the call is no longer in that stretch.
+    stretch: Optional[float] = None
 
 
 class RealtimeOutbox:
@@ -639,7 +689,9 @@ class RealtimeOutbox:
     The pool keeps one per session, not per connection, so a post made while the model socket
     reconnects, or before the caller joins, is said once a connection is quiet. A post with a ``key``
     replaces a waiting post with the same key, and ``withdraw`` drops one; a post not said within its
-    ``expires_after`` is dropped. Thread-safe; posts are said by the pool's loop.
+    ``expires_after`` is dropped. A ``while_quiet`` post is for the quiet stretch it was made in: refused when the call
+    is not quiet, and dropped once the stretch ends (anything happens, or a new connection replaces the old) before
+    it is said. Thread-safe; posts are said by the pool's loop.
     """
 
     QUIET_SECONDS = 1.5
@@ -659,18 +711,35 @@ class RealtimeOutbox:
         with self._lock:
             return not self._pending
 
-    def add(self, text: str, key: Optional[str], expires_after: float, now: float) -> None:
+    def add(
+        self,
+        text: str,
+        key: Optional[str],
+        expires_after: float,
+        now: float,
+        while_quiet: bool = False,
+        connection: Optional[RealtimeConnection] = None,
+    ) -> bool:
+        """Queue a post; returns whether it was queued. A ``while_quiet`` one is queued only while ``connection`` is quiet."""
         post = _Post(text, key, now + expires_after)
         with self._lock:
+            if while_quiet:
+                post.stretch = self._quiet_since(connection, now) if connection is not None else None
+                if post.stretch is None:
+                    _log.info(
+                        f"A post for session {self.session_id} was not queued: it is for a quiet moment, and the call is not quiet: {text[:80]}"
+                    )
+                    return False
             if key is not None:
                 for i, waiting in enumerate(self._pending):
                     if waiting.key == key:
                         self._pending[i] = post
-                        return
+                        return True
             if len(self._pending) >= self.MAX_PENDING:
                 dropped = self._pending.pop(0)
                 _log.warning(f"Too many posts waiting for session {self.session_id}; dropped the oldest: {dropped.text[:80]}")
             self._pending.append(post)
+        return True
 
     def withdraw(self, key: str) -> bool:
         """Drop the waiting post with ``key``; returns whether there was one."""
@@ -692,10 +761,16 @@ class RealtimeOutbox:
         with self._lock:
             return self._quiet_for(connection, now)
 
+    def quiet_since(self, connection: RealtimeConnection, now: float) -> Optional[float]:
+        """When ``connection``'s call last stopped being quiet (``quiet_for`` is ``now`` minus it), or ``None`` while it is busy."""
+        with self._lock:
+            return self._quiet_since(connection, now)
+
     def take(self, connection: RealtimeConnection, now: float) -> Optional[str]:
         """The next post to say into ``connection`` now, removed from the outbox; ``None`` while the call is busy."""
         self.expire(now)
         with self._lock:
+            self._drop_overtaken(connection, now)
             if not self._pending:
                 return None
             quiet = self._quiet_for(connection, now)
@@ -706,7 +781,12 @@ class RealtimeOutbox:
         return post.text
 
     def _quiet_for(self, connection: RealtimeConnection, now: float) -> Optional[float]:
-        """``quiet_for``, with the lock held: it may forget the last post, which a new connection owes nothing to."""
+        """``quiet_for``, with the lock held."""
+        since = self._quiet_since(connection, now)
+        return None if since is None else now - since
+
+    def _quiet_since(self, connection: RealtimeConnection, now: float) -> Optional[float]:
+        """``quiet_since``, with the lock held: it may forget the last post, which a new connection owes nothing to."""
         self._notice(connection)
         if not connection.is_ready or connection.is_responding or connection.is_caller_speaking or self._owes_reply(connection, now):
             return None
@@ -717,9 +797,23 @@ class RealtimeOutbox:
             connection.last_edge_text_at,
             connection.last_tool_result_at,
             connection.last_reconnect_at,
+            connection.last_agent_change_at,
             self._last_post_at,
         )
-        return now - max(t for t in times if t is not None)
+        return max(t for t in times if t is not None)
+
+    def _drop_overtaken(self, connection: RealtimeConnection, now: float) -> None:
+        """Drop the ``while_quiet`` posts whose quiet stretch has ended, with the lock held."""
+        if not any(post.stretch is not None for post in self._pending):
+            return
+        current = self._quiet_since(connection, now)
+        kept = []
+        for post in self._pending:
+            if post.stretch is not None and post.stretch != current:
+                _log.info(f"A post for session {self.session_id} was dropped: the call moved on before it was said: {post.text[:80]}")
+            else:
+                kept.append(post)
+        self._pending = kept
 
     def _notice(self, connection: RealtimeConnection) -> None:
         if connection is not self._connection:
@@ -785,6 +879,10 @@ class RealtimeConnectionPool:
         # Set once shutdown starts: no connection is created after it, since the loop it would run
         # on is about to close.
         self._stopping = threading.Event()
+        # Whether the process's background job runner was seen ready, set only after a wait that succeeded; the lock
+        # makes a concurrent first connection wait for that outcome rather than pass while the wait is under way.
+        self._jobs_ready = False
+        self._jobs_ready_lock = threading.Lock()
         # What applications asked to say into each session's call (``post_when_idle``), per session so
         # that it outlives a reconnect.
         self._outboxes: dict[str, RealtimeOutbox] = {}
@@ -853,6 +951,10 @@ class RealtimeConnectionPool:
                 self._deliver_posts(now)
             except Exception:
                 _log.exception("Failed to deliver posts into realtime calls")
+            try:
+                self._report_idle(now)
+            except Exception:
+                _log.exception("Failed to report idle realtime calls")
             before = time.monotonic()
             await asyncio.sleep(_POST_POLL_SECONDS)
             lag = time.monotonic() - before - _POST_POLL_SECONDS
@@ -861,19 +963,25 @@ class RealtimeConnectionPool:
 
     # Talking into a live call, for application code (see RealtimeCall)
 
-    def post_when_idle(self, session_id: str, text: str, *, key: Optional[str] = None, expires_after: float = 600.0) -> bool:
+    def post_when_idle(
+        self, session_id: str, text: str, *, key: Optional[str] = None, expires_after: float = 600.0, while_quiet: bool = False
+    ) -> bool:
         """Say ``text`` into the session's live call at its next quiet moment (``RealtimeOutbox``). Thread-safe.
 
         :param session_id: The call's session.
         :param text: What to say; the model answers it as it would the caller's words.
         :param key: A post with the same key still waiting is replaced by this one.
         :param expires_after: Seconds the post may wait for a quiet moment before it is dropped.
-        :return: Whether a call is connected now. The post waits either way, for a call to connect.
+        :param while_quiet: The post is for the call's current quiet stretch: not queued unless the call is quiet now,
+            and dropped if the stretch ends before it is said.
+        :return: Whether a call is connected now and the post queued. An ordinary post waits either way, for a call
+            to connect.
         """
+        connection = self._live(session_id) if while_quiet else None
         with self._outbox_lock:
             outbox = self._outboxes.setdefault(session_id, RealtimeOutbox(session_id))
-            outbox.add(text, key, expires_after, time.time())
-        return self.is_connected(session_id)
+            queued = outbox.add(text, key, expires_after, time.time(), while_quiet=while_quiet, connection=connection)
+        return queued and self.is_connected(session_id)
 
     def withdraw(self, session_id: str, key: str) -> bool:
         """Drop the post with ``key`` still waiting for the session's call; returns whether there was one."""
@@ -918,10 +1026,44 @@ class RealtimeConnectionPool:
         conn = self._live(session_id)
         return conn.agent_has_spoken if conn is not None else None
 
+    def last_caller_input_at(self, session_id: str) -> Optional[float]:
+        """When the caller last spoke, or text from the edge last arrived, in the session's open call; ``None`` before that or without one."""
+        conn = self._open(session_id)
+        if conn is None:
+            return None
+        return max((at for at in (conn.last_caller_speech_at, conn.last_edge_text_at) if at is not None), default=None)
+
+    def last_agent_change_at(self, session_id: str) -> Optional[float]:
+        """When the session's open call last moved to another agent; ``None`` before that or without one."""
+        conn = self._open(session_id)
+        return conn.last_agent_change_at if conn is not None else None
+
+    def last_tool_result_at(self, session_id: str) -> Optional[float]:
+        """When a tool result was last sent to the model in the session's open call; ``None`` before that or without one."""
+        conn = self._open(session_id)
+        return conn.last_tool_result_at if conn is not None else None
+
+    def _open(self, session_id: str) -> Optional["RealtimeConnection"]:
+        """The session's connection unless it is closed: ready, connecting or recovering."""
+        with self._conn_lock:
+            conn = self._connections.get(session_id)
+        return conn if conn is not None and not conn.closed else None
+
     def _live(self, session_id: str) -> Optional["RealtimeConnection"]:
         with self._conn_lock:
             conn = self._connections.get(session_id)
         return conn if conn is not None and conn.is_ready else None
+
+    def _report_idle(self, now: float) -> None:
+        """Tell the hooks that ask for it which calls have gone quiet (``RealtimeConnection.notice_quiet``)."""
+        with self._conn_lock:
+            connections = [conn for conn in self._connections.values() if conn.is_ready and conn.wants_idle]
+        for conn in connections:
+            with self._outbox_lock:
+                outbox = self._outboxes.setdefault(conn.session_id, RealtimeOutbox(conn.session_id))
+            since = outbox.quiet_since(conn, now)
+            if since is not None:
+                conn.notice_quiet(since, now, outbox)
 
     def _deliver_posts(self, now: float) -> None:
         """Say each session's next post into its call if the call is quiet; forget outboxes left with nothing to do."""
@@ -1023,6 +1165,7 @@ class RealtimeConnectionPool:
         """
         if not self._loop_ready.wait(timeout=10):
             raise RuntimeError("RealtimeConnectionPool event loop not ready")
+        self._wait_for_jobs()
         if self._stopping.is_set() or ThreadRunner.shutdown_event.is_set():
             raise RuntimeError("RealtimeConnectionPool is shutting down: no new connection is opened")
 
@@ -1046,6 +1189,27 @@ class RealtimeConnectionPool:
             with self._conn_lock:
                 self._connections.pop(session_id, None)
             raise
+
+    def _wait_for_jobs(self) -> None:
+        """Before a call's connection opens, wait for the process's background job runner to run, if there is one.
+
+        On a consumer thread, never the pool's loop. A tool submits background jobs without waiting, so the job loop
+        must run before any call does. Connections opening at once wait together for the one wait under way, under a
+        lock of its own (no connection or job lock is held); only a wait that succeeded is remembered, so after a
+        timeout (logged) the next connection waits again, and submissions raise meanwhile.
+        """
+        if self._jobs_ready:
+            return
+        from .jobs import BackgroundJobRunner
+
+        with self._jobs_ready_lock:
+            if self._jobs_ready:
+                return
+            runner = BackgroundJobRunner.current()
+            if runner is None or runner.wait_ready(BackgroundJobRunner.READY_TIMEOUT_SECONDS):
+                self._jobs_ready = True
+                return
+        _log.warning(f"The background job runner is not running after {BackgroundJobRunner.READY_TIMEOUT_SECONDS}s: background jobs cannot start")
 
     def dispatch(
         self, body: "BaseRunRequest", request_id: str, user_id: Optional[str], attributes: Mapping[str, Any], chat_service: "ChatService"
@@ -1122,7 +1286,8 @@ class RealtimeCall:
     a webhook, a timer.
 
     ``post_when_idle`` says something into the call at its next quiet moment, without cutting anyone off;
-    ``quiet_for``, ``connected`` and ``agent_has_spoken`` tell what the call is doing. What the caller and the
+    ``quiet_for``, ``connected`` and ``agent_has_spoken`` tell what the call is doing, and ``last_caller_input_at``,
+    ``last_agent_change_at`` and ``last_tool_result_at`` when it last did each. What the caller and the
     agents say is observed with a ``RealtimeHook`` (``Module.realtime_hook``). It all works in the process that
     runs the realtime pool (the Agent Runner, which is every process of the single-process topology); in any
     other process there is no call to reach, and a post is dropped with a warning.
@@ -1154,7 +1319,27 @@ class RealtimeCall:
         pool = RealtimeConnectionPool.get()
         return pool.agent_has_spoken(self.session_id) if pool is not None else None
 
-    def post_when_idle(self, text: str, *, key: Optional[str] = None, expires_after: float = 600.0) -> bool:
+    @property
+    def last_caller_input_at(self) -> Optional[float]:
+        """Epoch seconds when the caller last spoke, or text from the edge (typed by the caller, or sent for them) last
+        arrived; ``None`` before that, or without a call."""
+        pool = RealtimeConnectionPool.get()
+        return pool.last_caller_input_at(self.session_id) if pool is not None else None
+
+    @property
+    def last_agent_change_at(self) -> Optional[float]:
+        """Epoch seconds when the call last moved to another agent, in the model's time; ``None`` before that, or without a call."""
+        pool = RealtimeConnectionPool.get()
+        return pool.last_agent_change_at(self.session_id) if pool is not None else None
+
+    @property
+    def last_tool_result_at(self) -> Optional[float]:
+        """Epoch seconds when a tool's result was last given to the model (it answers it next); ``None`` before that,
+        or without a call."""
+        pool = RealtimeConnectionPool.get()
+        return pool.last_tool_result_at(self.session_id) if pool is not None else None
+
+    def post_when_idle(self, text: str, *, key: Optional[str] = None, expires_after: float = 600.0, while_quiet: bool = False) -> bool:
         """Say ``text`` into the call at its next quiet moment. Thread-safe.
 
         Nothing is cut off: the text waits until the model is not responding, the caller is not speaking, the
@@ -1165,13 +1350,17 @@ class RealtimeCall:
             (for example "[Team update] ...").
         :param key: A post with the same key still waiting is replaced: a newer progress update supersedes an older one.
         :param expires_after: Seconds the post may wait before it is dropped as out of date.
-        :return: Whether the call is connected now.
+        :param while_quiet: The post is for the quiet moment it is made in, such as a hook's answer to ``idle``: it
+            is not queued unless the call is quiet now, and it is dropped if that quiet ends before it is said (the
+            caller speaks or types, the model says something, the call moves to another agent, a tool's result or
+            another post goes in, or a new connection takes over).
+        :return: Whether the call is connected now and the post queued.
         """
         pool = RealtimeConnectionPool.get()
         if pool is None:
             _log.warning(f"No realtime pool in this process: nothing posted into session {self.session_id}")
             return False
-        return pool.post_when_idle(self.session_id, text, key=key, expires_after=expires_after)
+        return pool.post_when_idle(self.session_id, text, key=key, expires_after=expires_after, while_quiet=while_quiet)
 
     def withdraw(self, key: str) -> bool:
         """Drop the post with ``key`` if it is still waiting, such as a question that no longer applies; returns
@@ -1179,9 +1368,80 @@ class RealtimeCall:
         pool = RealtimeConnectionPool.get()
         return pool.withdraw(self.session_id, key) if pool is not None else False
 
+    def run_in_background(
+        self,
+        work: Callable[["BackgroundJob"], Awaitable[Optional[str]]],
+        *,
+        name: str,
+        job_id: Optional[str] = None,
+        arguments: Optional[dict[str, Any]] = None,
+        wait_until_heard: bool = False,
+        on_error: Optional[Callable[["BackgroundJob", Exception], Optional[str]]] = None,
+        refuse: Optional[Callable[[list["BackgroundJob"]], Optional[str]]] = None,
+    ) -> "BackgroundJob":
+        """Run ``work`` in the background for this call, and return its job at once. Thread-safe.
+
+        For long work a voice agent starts with a short tool and keeps talking: ``work(job)`` runs off the pool's
+        loop, after the call's earlier jobs, and asks agents with ``job.ask`` in an AK session of the job's own,
+        never the call's. Text it returns is said into the call at a quiet moment (``post_when_idle``); raising fails
+        the job. AK decides no policy: no retries, no wording; ``refuse`` and ``on_error`` are the application's.
+
+        :param work: ``async work(job) -> str | None``.
+        :param name: What kind of job it is, such as ``"research"``.
+        :param job_id: The application's own id for it; a new one by default. Its agents' session is
+            ``<call session>-job-<job_id>``.
+        :param arguments: What the job is for, kept on it, for ``refuse`` to compare.
+        :param wait_until_heard: Start only once what the agent said before the tool has been heard: the call has
+            been quiet for a moment, at most 20 s.
+        :param on_error: ``on_error(job, error) -> str | None``: what to say into the call when ``work`` raised, and
+            also called, its text unused, for a job the call's ``close()`` cancelled (``BackgroundJobCancelled``).
+            Without it the error is only logged.
+        :param refuse: ``refuse(pending) -> str | None``, given the call's queued and running jobs, under the lock
+            that also guards the submission: a reason refuses this one, so a check and the submission it allows
+            cannot race.
+        :raises RuntimeError: No background job runner runs in this process (the realtime host runs it, beside the
+            pool; a test hosts one with ``agentkernel.pipeline.testing.BackgroundJobHost``), it has not started yet,
+            or it is shutting down. Raised at once: a submission never waits.
+        :raises BackgroundJobRefused: ``refuse`` returned a reason; its text is for the model.
+        :raises ValueError: A queued or running job of this call has ``job_id``.
+        """
+        from .jobs import BackgroundJobRunner
+
+        runner = BackgroundJobRunner.current()
+        if runner is None:
+            raise RuntimeError(
+                "No background job runner in this process: background jobs run in the realtime host "
+                "(execution.mode: realtime), which runs the job runner beside the realtime pool; "
+                "a test hosts one with agentkernel.pipeline.testing.BackgroundJobHost"
+            )
+        return runner.submit(
+            self.session_id,
+            work,
+            name=name,
+            job_id=job_id,
+            arguments=arguments,
+            wait_until_heard=wait_until_heard,
+            on_error=on_error,
+            refuse=refuse,
+        )
+
+    @property
+    def jobs(self) -> list["BackgroundJob"]:
+        """This call's queued and running background jobs, the running one first."""
+        from .jobs import BackgroundJobRunner
+
+        runner = BackgroundJobRunner.current()
+        return runner.jobs(self.session_id) if runner is not None else []
+
     def close(self) -> bool:
         """End the call now, such as when the application ends a meeting: its model connection is closed and the
-        posts still waiting for it are dropped. The session's next input starts a new call. Returns whether the
+        posts still waiting for it are dropped. Its queued background jobs are cancelled; the one running finishes,
+        but says nothing more into the session. The session's next input starts a new call. Returns whether the
         call was open."""
+        from .jobs import BackgroundJobRunner
+
+        runner = BackgroundJobRunner.current()
+        if runner is not None:
+            runner.close(self.session_id)
         pool = RealtimeConnectionPool.get()
         return pool.close(self.session_id) if pool is not None else False

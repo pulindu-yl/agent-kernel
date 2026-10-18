@@ -342,7 +342,8 @@ class CallLog(RealtimeHook):
 module.realtime_hook(entry_agent, [CallLog()])
 ```
 
-See [Watching a live call](./livekit.md#watching-a-live-call) for the events.
+A hook that sets `idle_after_seconds` is also told `idle` when the call has been quiet that long, and again each
+time as long again has passed while it stays quiet, so it can act on a stalled call without a thread of its own. See [Watching a live call](./livekit.md#watching-a-live-call) for the events.
 
 ## Implementing Hooks
 

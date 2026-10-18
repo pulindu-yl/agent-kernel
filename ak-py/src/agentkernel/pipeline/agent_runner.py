@@ -9,7 +9,8 @@ from ..core.util.factory import AKConfigError
 from .consumer import ConsumerLoop
 from .envelope import ATTR_ENDPOINT_URL, ATTR_REQUEST_ID, ATTR_STATUS_CODE, ATTR_THREAD, ATTR_USER_ID, QueueMessage, QueueName
 from .integration_delivery import IntegrationDelivery
-from .realtime_pool import RealtimeConnectionPool
+from .realtime.jobs import BackgroundJobRunner
+from .realtime.pool import RealtimeConnectionPool
 from .thread_runner import ThreadRunner
 from .transport.base import QueueTransport, QueueTransportFactory
 
@@ -264,8 +265,8 @@ class RealtimeAgentRunner(AgentRunner):
     _log = logging.getLogger("ak.pipeline.realtime_agent_runner")
 
     def _get_extra_tasks(self) -> List[ThreadRunner.Task]:
-        pool = RealtimeConnectionPool.initialize()
-        return [pool.get_task()]
+        # The pool's loop holds the calls; the job runner's runs their background jobs, never on the pool's loop.
+        return [RealtimeConnectionPool.initialize().get_task(), BackgroundJobRunner.initialize().get_task()]
 
     def process(self, message: QueueMessage) -> None:
         body = BaseRunRequest.model_validate(json.loads(message.body))

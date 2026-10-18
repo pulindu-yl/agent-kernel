@@ -7,9 +7,14 @@ requirements every transport must reproduce (spec #495 §12 / research current-q
 per-group FIFO with one in-flight message per group, bounded-at-least-once redelivery with an
 exact ``receive_count``, publish-time deduplication, attribute round-tripping, batch fetch, and
 queue isolation.
+
+It also holds :class:`BackgroundJobHost`, which hosts the background job runner for offline tests, as the realtime
+host does in production.
 """
 
+import threading
 import time
+from typing import Optional
 
 import pytest
 
@@ -170,3 +175,50 @@ class QueueTransportContract:
         assert self._consumer(transport, QueueName.OUTPUT).fetch(10, 0.05) == []
         [message] = self._consumer(transport, QueueName.INPUT).fetch(10, self.fetch_wait)
         assert message.body == "in"
+
+
+class BackgroundJobHost:
+    """Hosts the background job runner for a test, as the realtime host does in production.
+
+    ``RealtimeCall.run_in_background`` needs a running job runner, which the realtime host starts beside the pool.
+    An offline test has no host, so it opens one around its jobs::
+
+        with BackgroundJobHost():
+            RealtimeCall("room_01").run_in_background(work, name="dispatch")
+
+    It creates the process's runner, runs its ``start()`` on a thread of its own and stops it on exit with
+    ``stop()``, the production shutdown. It stops only the runner it created: it refuses to start while the process
+    already has one, and never sets ``ThreadRunner.shutdown_event``. For test fixtures, not production code.
+    """
+
+    def __init__(self, timeout: float = 15.0):
+        """
+        :param timeout: Seconds to wait for the runner to start, and for it to stop on exit.
+        """
+        self._timeout = timeout
+        self._runner = None
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "BackgroundJobHost":
+        from .realtime.jobs import BackgroundJobRunner
+
+        if BackgroundJobRunner.current() is not None:
+            raise RuntimeError("A background job runner already exists in this process: BackgroundJobHost hosts only one it creates")
+        self._runner = BackgroundJobRunner.initialize()
+        self._thread = threading.Thread(target=self._runner.start, name="test-background-jobs", daemon=True)
+        self._thread.start()
+        if not self._runner.wait_ready(self._timeout):
+            self.__exit__(None, None, None)
+            raise RuntimeError(f"The background job runner did not start within {self._timeout}s")
+        return self
+
+    def __exit__(self, *exc) -> None:
+        from .realtime.jobs import BackgroundJobRunner
+
+        runner, self._runner = self._runner, None
+        if runner is None:
+            return
+        runner.stop(self._timeout)
+        if self._thread is not None:
+            self._thread.join(self._timeout)
+        BackgroundJobRunner._forget(runner)

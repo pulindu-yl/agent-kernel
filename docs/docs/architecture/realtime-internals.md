@@ -118,7 +118,9 @@ Code that talks into a live call from outside it, such as a background job repor
 
 The pool cannot see the model generating before its first output, after the caller speaks or types or a tool result is sent. So deciding the call is quiet also checks that the model owes no reply: the model generated output after the caller's last speech, the edge's last text, the last tool result, the last replayed reconnect, and the last post (each waited for at most `RealtimeOutbox.REPLY_TIMEOUT_SECONDS`, since an input the model never answers must not hold the call forever). It also waits while `is_responding` or `is_caller_speaking`, and until nothing has happened for `RealtimeOutbox.QUIET_SECONDS`. A reply is judged by when the model generated it, not when it was played: words generated before a handoff or a tool result can still be playing after it, and are no answer to it.
 
-Applications do not read these properties themselves: `RealtimeCall` (see [Talking into a live call](../integrations/livekit.md#talking-into-a-live-call)) is the public face of this rule. Its `post_when_idle` queues text in the session's `RealtimeOutbox`, which the pool keeps per session rather than per connection, so posts survive a reconnect. Every `_POST_POLL_SECONDS` the pool's loop says each session's next post if `RealtimeOutbox.quiet_for` finds the call quiet long enough, with `RealtimeConnection.send_text`. `RealtimeCall.quiet_for()` and `agent_has_spoken` read the same state.
+Applications do not read these properties themselves: `RealtimeCall` (see [Talking into a live call](../integrations/livekit.md#talking-into-a-live-call)) is the public face of this rule. Its `post_when_idle` queues text in the session's `RealtimeOutbox`, which the pool keeps per session rather than per connection, so posts survive a reconnect. Every `_POST_POLL_SECONDS` the pool's loop says each session's next post if `RealtimeOutbox.quiet_for` finds the call quiet long enough, with `RealtimeConnection.send_text`. `RealtimeCall.quiet_for()` and `agent_has_spoken` read the same state, and `last_caller_input_at`, `last_agent_change_at` and `last_tool_result_at` read the connection's times (from an open connection, recovering included).
+
+A handover ends a quiet stretch too (`last_agent_change_at` is one of the times). A `while_quiet` post records the quiet stretch it was made in (`RealtimeOutbox.quiet_since`); it is not queued when the call is not quiet, and `take` drops it once the current stretch is a different one, which anything happening, another post said, or a new connection makes it.
 
 ## Realtime hooks
 
@@ -132,8 +134,15 @@ A connection whose agent has `realtime_hooks` (`Module.realtime_hook`) queues `R
 | `caller_said` | The adapter's optional `caller_transcript` event; the Gemini adapter reports the caller's words when a turn ends (the model finishes, calls a tool, or text is sent in) |
 | `edge_text` | `send_text(..., from_edge=True)`, from the consumer thread, handed to the pool's loop |
 | `disconnected` | `close()` or a socket failure, once |
+| `idle` | The pool's loop, every `_POST_POLL_SECONDS`, for a ready connection whose hooks ask for it: `RealtimeOutbox.quiet_since` (when the call last stopped being quiet), and for each hook with `idle_after_seconds` of `n`, once the stretch is `n`, `2n`, ... seconds old (counted per hook and stretch) |
 
-On `close()` the hooks get up to `_HOOK_DRAIN_SECONDS` to take the events still queued. An agent without hooks gets no queue and no task.
+The queue holds `(event, only, stretch)`: `only` is the one hook an `idle` is for and `stretch` the quiet stretch it is about, `None` for every other event; an `idle` whose stretch has ended by the time it is taken is dropped. On `close()` the hooks get up to `_HOOK_DRAIN_SECONDS` to take the events still queued. An agent without hooks gets no queue and no task.
+
+## Background jobs
+
+`RealtimeCall.run_in_background` submits to `BackgroundJobRunner` (`pipeline/realtime/jobs.py`), a process-wide runner with one event loop on its own daemon thread (`ak-background-jobs`), never closed while the host runs: a model client may keep tasks on the loop of its first call. The realtime host runs it as it runs the pool: `RealtimeAgentRunner._get_extra_tasks()` and `ECSRealtimeAgentRunner._get_extra_tasks()` return the pool's task and the runner's `get_task()`, whose `start()` runs the loop's thread, supervises it, and drives shutdown from outside it with bounded waits. `RealtimeConnectionPool.get_or_create` waits on its consumer thread for the job loop before a call's connection opens (connections opening at once wait for the same outcome, under a lock of its own; only success is remembered), so a submission never has to wait: it raises at once with no runner, before the loop runs, or after shutdown began.
+
+Shutdown, on the host's thread: under the job lock, admission closes, every job's posts are suppressed and queued or waiting jobs end `cancelled`; outside it, their `on_error`; running work then has `SHUTDOWN_GRACE_SECONDS` (5); then, always (a cancelled job's worker may still wait, and finished work may have left tasks of its own, such as an SDK's listener), the loop is asked to cancel every task still on it and waits for them with `asyncio.wait`, `CANCEL_CLEANUP_SECONDS` (5), while the host waits for that a bounded time from outside; jobs still running are logged as abandoned, the loop is asked to stop and closes itself on its own thread. A loop blocked by application code is logged and left until the process exits. Each job ends once (`_end`), and `on_error` is called at most once. `BackgroundJobHost` (`pipeline/testing.py`) hosts a runner for offline tests through the same `start()` and `stop()`. Each session has its queued jobs, the one running, and whether a worker task serves it, all under the runner's lock; `submit` runs `refuse` and checks the id under that lock, appends, and schedules a worker when none serves the session. The worker runs the session's jobs one at a time and ends, under the same lock, when none is queued. A job's `ask` runs `AgentService.run_multi` in `<call session>-job-<job id>`. `RealtimeCall.close()` cancels the jobs whose work has not started (one waiting to be heard included) and marks the running one closed; a job's post checks that and queues under the runner's lock, so none reaches a later call. Work raising `asyncio.CancelledError` cancels its job and the worker goes on; a worker task that is cancelled frees its session in a `finally` and hands any queued jobs to a new worker.
 
 ## Starting a call: announcing the team
 
@@ -278,9 +287,11 @@ The replay is the same as a transfer's: text, not the original audio. Gemini's o
 |---|---|---|
 | `AgentChanged` | `agentkernel.core.event` | The speaker-change event, with the team on the first one |
 | `RealtimeRunner` | `agentkernel.core.realtime.runner` | The adapter contract, `team()`, shared cleanup |
-| `RealtimeConnectionPool`, `RealtimeConnection` | `agentkernel.pipeline.realtime_pool` | Connections per session, ordering, pacing, tool scopes |
-| `RealtimeCall`, `RealtimeOutbox` | `agentkernel.pipeline` (`realtime_pool`) | Talking into a call at a quiet moment, and what the call is doing, for application code |
-| `RealtimeHook`, `RealtimeEvent` | `agentkernel.core.hooks` | Observing a call: connection, transcripts, speaker changes |
+| `RealtimeConnectionPool`, `RealtimeConnection` | `agentkernel.pipeline.realtime.pool` | Connections per session, ordering, pacing, tool scopes |
+| `RealtimeCall`, `RealtimeOutbox` | `agentkernel.pipeline` (`realtime.pool`) | Talking into a call at a quiet moment, and what the call is doing, for application code |
+| `RealtimeHook`, `RealtimeEvent` | `agentkernel.core.hooks` | Observing a call: connection, transcripts, speaker changes, quiet stretches (`idle`) |
+| `BackgroundJob`, `BackgroundJobRunner` | `agentkernel.pipeline` (`realtime.jobs`) | Background work for a call: one job loop, per-session order, a session per job, ended with the call |
+| `GatewayRunner`, `GatewayPool` | `agentkernel.integration.adapter` | Hosting a gateway until shutdown or `stop()`; one gateway per session |
 | `OpenAIRealtimeRunner` | `agentkernel.framework.openai` | OpenAI socket, handoffs by `session.update` |
 | `GoogleADKRealtimeRunner` | `agentkernel.framework.adk` | Gemini socket, transfers by reconnect + history |
 | `LiveKitEdgeGateway` | `agentkernel.integration.livekit` | Room, one participant per agent, who is heard and unmuted |

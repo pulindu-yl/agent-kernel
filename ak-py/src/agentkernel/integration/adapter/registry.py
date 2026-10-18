@@ -30,13 +30,17 @@ class StatefulEdgeRegistry:
             cls._cache[key] = adapter
 
     @classmethod
-    def unregister(cls, session_id: str) -> None:
+    def unregister(cls, session_id: str, adapter: Optional[StatefulEdgeAdapter] = None) -> None:
         """Remove a live stateful edge adapter instance from the cache.
 
         Called when a stateful connection disconnects, preventing memory leaks.
+
+        :param adapter: Remove the entry only while it is this adapter: a gateway leaving must not remove the
+            one that has replaced it for the same session.
         """
         with cls._lock:
-            cls._cache.pop(session_id, None)
+            if adapter is None or cls._cache.get(session_id) is adapter:
+                cls._cache.pop(session_id, None)
 
     @classmethod
     def get(cls, session_id: str) -> Optional[StatefulEdgeAdapter]:

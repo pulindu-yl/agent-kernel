@@ -28,7 +28,9 @@ Realtime calls run an agent's ADK tool callbacks around every tool call, `transf
 
 ## Background updates
 
-`book_technician` answers at once and starts a background job: the dispatch system confirms the visit a few seconds later. The job reports back with `RealtimeCall(session_id).post_when_idle(...)`, which waits for a quiet moment (nobody speaking, nothing still owed an answer) before the agent says it, so the update never cuts the caller or the agent off. Whichever agent has the call by then says it.
+`book_technician` answers at once and starts a background job with `RealtimeCall(session_id).run_in_background(...)`: the dispatch system confirms the visit a few seconds later. The job runs off the loop that paces the call's audio, after the call's earlier jobs, and reports back with `job.post(...)`, which waits for a quiet moment (nobody speaking, nothing still owed an answer) before the agent says it, so the update never cuts the caller or the agent off. Whichever agent has the call by then says it.
+
+The tool passes `refuse=`: while a booking for the same account is still with the dispatch system, a second one is refused, and the refusal is the tool's answer. The check runs under the lock that guards the submission, so two bookings made at once cannot both pass it.
 
 ## Call log
 
