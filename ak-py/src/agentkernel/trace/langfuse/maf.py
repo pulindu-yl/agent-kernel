@@ -1,4 +1,3 @@
-import logging
 from typing import Any
 
 from langfuse import Langfuse, propagate_attributes
@@ -17,7 +16,6 @@ class LangFuseMAFRunner(MAFRunner):
         """
         super().__init__()
         self._client = client
-        self._log = logging.getLogger("ak.trace.langfuse.maf")
 
     async def run(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AgentReply:
         """

@@ -1,6 +1,8 @@
 # #720: Microsoft Agent Framework Integration
 
-Recommends integrating Microsoft Agent Framework (MAF) as a seventh AK framework adapter (`framework/maf/`), mirroring the `Agent`/`Runner`/`Module`/`ToolBuilder` pattern used by openai/crewai/langgraph/adk/smolagents/pydanticai. MAF provides a robust, production-ready backend that unifies AutoGen and Semantic Kernel, bringing strong native multi-modal arrays and structured outputs to AK.
+Recommends integrating Microsoft Agent Framework (MAF) as a seventh AK framework adapter (`framework/maf/`), mirroring the `Agent`/`Runner`/`Module`/`ToolBuilder` pattern used by openai/crewai/langgraph/adk/smolagents/pydanticai. MAF unifies AutoGen and Semantic Kernel, and brings native streaming, typed structured output and tool approval to AK.
+
+This document was written alongside the implementation in the same PR rather than reviewed ahead of it; it records the design the adapter follows, so the next adapter PR can be checked against it.
 
 ## Motivation
 
@@ -20,19 +22,14 @@ The existing Pydantic AI and OpenAI adapters (`framework/pydanticai/pydanticai.p
 
 ### Session and message history
 
+- `MAFSession` holds the serialized native session under the `FRAMEWORK` key, retrieved get-or-create (as `OpenAIRunner._session()` does).
+- MAF requires its own `AgentSession` object, while the AK session store persists plain picklable data: the runner restores the native session from its serialized form before each run and stores it back in serialized form after a successful run, so history survives process and serverless boundaries.
 - The native session snapshot is persisted **before** the framework context: a context that cannot be stored (an unpicklable value) must not lose a turn the model completed — on a resume, a tool call that already ran.
-
-- `MAFSession` holds the running session state.
-- Retrieval must mirror `OpenAIRunner._session()`: `session.get(FRAMEWORK) or session.set(FRAMEWORK, MAFSession())`.
-- Serialization must account for MAF's strict native object typing:
-  - Agent Kernel session stores JSON dictionaries natively.
-  - Microsoft SDK strictly requires its own `AgentSession` class.
-  - Requirement: The runner must construct an `AgentSession.from_dict()` before execution, and extract the state back out into a dictionary via `kwargs["session"].to_dict()` afterwards to persist across serverless boundaries.
 
 ### Framework context
 
 - Inject a deep copy of the AK framework context into the native session state under `ak_context` before each run; tools reach it via `FunctionInvocationContext.session.state["ak_context"]`.
-- After a successful run only, pop `ak_context` from the native state and merge it back via `_store_framework_context()`; the MAF snapshot must not keep a second copy.
+- After a successful run only, take `ak_context` out of the native state and merge it back via `_store_framework_context()`; the MAF snapshot must not keep a second copy.
 - Declared fidelity: full round-trip, including tool-added keys.
 
 ### `MAFRunner.run()`
@@ -40,14 +37,14 @@ The existing Pydantic AI and OpenAI adapters (`framework/pydanticai/pydanticai.p
 - Must build and `set()` a `ToolContext(Runtime.current(), agent, session, requests)` in a `try`/`finally` block.
 - Must convert every `AgentRequest` variant to MAF's native multi-modal shape (`agent_framework.Content.from_data()` or `Content.from_uri()`).
 - Must send text and attachments as one user `Message`, so they reach the model as a single turn; a request list with no usable content returns a "no valid content" text reply without calling MAF.
-- Must extract the text result from MAF's complex `Result` object via `getattr(result, "text", str(result))`.
-- Must route structured output through `AgentReplyAny.from_output()` before falling back to `AgentReplyText`.
+- Must route structured output through `AgentReplyAny.from_output()`, and otherwise return the response text as an `AgentReplyText`.
 
 ### `MAFRunner.stream()`
 
 - Must implement `supports_streaming = True`.
 - Must implement real token streaming natively yielding AK's `StreamEvent` objects (`MessageStart`, `TextDelta`, `ReasoningDelta`, `ToolCallStart`, `ToolCallArgs`, `ToolCallEnd`, `ToolCallResult`, `MessageEnd`).
-- Must correlate tool events by MAF's own `call_id`, never a generated id; argument chunks that arrive without an id (Chat Completions-style clients) are tied to their call through `tool_call_index`.
+- Must correlate tool events by MAF's own call id, never a generated one, including streamed argument chunks that arrive without an id (Chat Completions-style clients).
+- Must release the provider stream when a streamed turn is interrupted (an error or a client disconnect); session write-back happens only after the stream drains normally.
 
 ### Human in the loop
 
@@ -56,7 +53,6 @@ The existing Pydantic AI and OpenAI adapters (`framework/pydanticai/pydanticai.p
 - The record (`PausedRunState.add`, after `clear_for_runner` — one conversation per session) carries the serialized `AgentSession` and the pending requests, so a resume needs nothing else and works on any replica.
 - `resume()` / `resume_stream()` send one user message of approval responses: `approved` approves; `denied` and `cancelled` reject. They share the reply/stream helpers with `run()` / `stream()`, and clear the record once the native call succeeded and the conversation holding its outcome is stored — before the framework context, whose write-back can fail on its own — so a failed native call stays retryable and an approved tool can never run twice.
 - Refused above the `try`, naming the cause: a partial resume, a decision payload, a prompt beside the decisions, and a new prompt while a pause is outstanding (MAF would drop the pending calls).
-- Out of scope: free-text questions (`input_required`) — MAF agents have no native equivalent.
 
 ### Native run options
 
@@ -67,8 +63,8 @@ The existing Pydantic AI and OpenAI adapters (`framework/pydanticai/pydanticai.p
 
 ### Tool binding
 
-- `MAFToolBuilder.bind(funcs)` must wrap each plain function as a native MAF tool using MAF's `@tool` decorator (`from agent_framework import tool as maf_tool`).
-- Must extract function properties gracefully falling back to standard python `__name__` and `__doc__`.
+- `MAFToolBuilder.bind(funcs, **options)` must wrap each plain function as a native MAF tool with MAF's `tool()`, which takes the tool's name and description from the function's `__name__` and `__doc__`.
+- Keyword options are forwarded to `tool()` unchanged (e.g. `approval_mode="always_require"`).
 
 ### `MAFAgent` wrapper
 
@@ -91,3 +87,37 @@ The existing Pydantic AI and OpenAI adapters (`framework/pydanticai/pydanticai.p
 ### Packaging (`ak-py/pyproject.toml`)
 
 - Must add a `maf` optional-dependency group depending on `agent-framework-core` only (not the `agent-framework` meta-package, which installs every MAF integration): the adapter imports MAF core only. The application installs its model provider package (e.g. `agent-framework-openai`), mirroring the `pydanticai` extra.
+
+### Configuration
+
+- No new configuration. The adapter reuses the existing `AKConfig` sections every adapter reads (`trace`, `session`, `execution`) and adds no fields, flags or type selectors.
+- Model and provider settings stay on the MAF chat client the application constructs; per-agent run settings go through `Module.run_options`.
+
+### Examples
+
+- `examples/cli/maf` (CLI with a bound tool), `examples/cli/maf_context` (framework context through `FunctionInvocationContext`), `examples/cli/maf-run-options` (`options` and `function_invocation_kwargs`), `examples/api/maf` (REST) and `examples/api/maf-streaming` (SSE token streaming).
+- All five run in the e2e matrix (`.github/test-config.yaml`).
+
+### Documentation and skills
+
+- Framework page `docs/docs/frameworks/microsoft-agents.md`, with the sections the other framework pages carry, and the sidebar entry.
+- Every framework inventory: landing marquee tile, architecture chip, feature explorer, features page (SDK count), intro What's New, FrameworkSelector, FAQ, persona pages, and the streaming, AG-UI, tracing, session-handle and Human in the Loop lists.
+- Bundled user skills (`ak-build`, `ak-init`, `ak-test`, `ak-add-capabilities`) and developer skills, with eval cases.
+
+### Testing
+
+- Unit tests in `ak-py/tests/test_maf_runner.py` and `test_tool_maf.py`: request mapping, session round-trip, framework context, structured output, streaming event mapping (including chunked tool-call ids and a client disconnect), the run-options checklist of the framework-integration skill, and Human in the loop on a real MAF `Agent` driven by a fake chat client (pause, approve/deny, refusals, retry after a failed resume, the replica round trip through pickle, and dispatch through `Runtime`).
+- Trace runner tests alongside the existing tracing tests.
+
+## Non-goals
+
+- Free-text human questions (`input_required`): MAF agents have no native equivalent; only tool approvals pause.
+- Hosted-service requests MAF can return, such as an OAuth consent request from a hosted MCP tool: not surfaced as a pause.
+- MAF workflows (`Workflow` / `workflow.as_agent()`): not wrapped or validated by this adapter; supporting them needs a design for workflow pauses (`request_info`) and checkpoint storage.
+- Background continuation tokens: not exposed; AK's queue-based asynchronous execution is separate.
+- Tracing `resume()`: no traced runner wraps it for any framework today; tracked separately for all adapters that pause.
+
+## Open questions
+
+- A MAF pause blocks every MAF agent that shares the session, because pause records are scoped by runner (`maf`), not by agent — the same as Pydantic AI. For MAF this is also protective: all MAF agents in one session share a single native session snapshot, which holds the pending calls. Should records, and the native snapshot, be scoped per agent instead?
+- Two MAF agents in one session share the snapshot's `service_session_id`, so agents whose clients keep the conversation on the provider's side continue one thread id. Is a per-agent native session needed, or is "use separate sessions" (as documented) enough?

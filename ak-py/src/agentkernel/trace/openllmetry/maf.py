@@ -1,4 +1,3 @@
-import logging
 from typing import Any
 
 from ...core import Session
@@ -14,7 +13,6 @@ class OpenLLMetryMAFRunner(MAFRunner):
         Initializes an OpenLLMetryMAFRunner instance.
         """
         super().__init__()
-        self._log = logging.getLogger("ak.trace.openllmetry.maf")
 
     async def run(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AgentReply:
         """

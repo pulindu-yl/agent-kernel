@@ -1,4 +1,3 @@
-import logging
 from typing import Any
 
 from ...core import Session
@@ -16,7 +15,6 @@ class CloudWatchMAFRunner(MAFRunner):
         """
         super().__init__()
         self._tracer = tracer
-        self._log = logging.getLogger("ak.trace.cloudwatch.maf")
 
     async def run(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AgentReply:
         """

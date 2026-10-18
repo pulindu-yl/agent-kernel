@@ -1,4 +1,3 @@
-import logging
 from typing import Any
 
 import logfire
@@ -15,7 +14,6 @@ class LogfireMAFRunner(MAFRunner):
         Initializes a LogfireMAFRunner instance.
         """
         super().__init__()
-        self._log = logging.getLogger("ak.trace.logfire.maf")
 
     async def run(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AgentReply:
         """

@@ -93,6 +93,40 @@ async def test_process_requests_text_only(runner):
     assert prompt == "Hello"
 
 
+def test_attachment_urls_and_data_uris_map_to_uri_and_data_content(runner):
+    raw = base64.b64encode(b"test_data").decode("utf-8")
+    requests = [
+        AgentRequestImage(image_data="https://example.com/cat.png", name="cat.png", mime_type="image/png"),
+        AgentRequestFile(file_data="s3://bucket/report.pdf", name="report.pdf"),
+        AgentRequestImage(image_data=f"data:image/jpeg;base64,{raw}", name="inline.jpg"),
+    ]
+
+    _, inputs = runner._process_requests(requests)
+
+    url, s3, inline = inputs
+    assert (url.type, url.uri, url.media_type) == ("uri", "https://example.com/cat.png", "image/png")
+    assert (s3.type, s3.uri) == ("uri", "s3://bucket/report.pdf")
+    assert inline.type == "data" and inline.media_type == "image/jpeg"  # the MIME type comes from the data URI itself
+
+
+def test_the_a2a_card_lists_one_skill_per_tool(maf_agent):
+    # Checks what MAF hands the card builder; the builder itself is shared by every adapter.
+    pytest.importorskip("a2a")
+    from agentkernel.framework.maf import maf as maf_module
+
+    def lookup(city: str) -> str:
+        """Look up a city."""
+        return city
+
+    maf_agent.attach_tool(lookup)
+    with patch.object(maf_module.A2ACardBuilder, "build", return_value="card") as build:
+        assert maf_agent.get_a2a_card() == "card"
+
+    kwargs = build.call_args.kwargs
+    assert (kwargs["name"], kwargs["description"]) == ("test-agent", "Test system message")
+    assert [(skill.id, skill.description) for skill in kwargs["skills"]] == [("lookup", "Look up a city.")]
+
+
 @pytest.mark.asyncio
 async def test_process_requests_multi_modal(runner):
     valid_b64 = base64.b64encode(b"test_data").decode("utf-8")
