@@ -190,9 +190,10 @@ latency at the start of each response.
 
 ### Live settings (Google ADK)
 
-How Gemini detects the caller's turns, and which languages it transcribes, come from the ADK
-`RunConfig` the call's starting agent declares as a run option, the same option a non-live run
-reads. It applies to every socket of the call, the sockets a transfer or a reconnect opens included:
+A Google ADK call runs on ADK's own live engine (`Runner.run_live`), which needs `google-adk` 2.7 or later. The
+call's ADK `RunConfig` is the one its starting agent declares as a run option, the same option a non-live run
+reads, and ADK applies it to every socket of the call, the sockets a transfer or a reconnect opens included. It
+sets, for example, how Gemini detects the caller's turns and which languages it transcribes:
 
 ```python
 from google.adk.agents.run_config import RunConfig
@@ -212,9 +213,30 @@ module.run_options(
 )
 ```
 
-Agent Kernel reads `realtime_input_config`, `input_audio_transcription` and `output_audio_transcription`;
-transcription of both sides stays on when they are unset, since the runner depends on it. A run-options
-factory is not called for realtime calls: the call has no per-run requests to give it.
+The whole `RunConfig` reaches ADK, `session_resumption` included. Agent Kernel only turns on transcription of
+both sides when it is unset, since the call's transcripts depend on it. The starting agent's ADK `Runner` options
+(`plugins`, `memory_service`, `artifact_service`, `credential_service`) reach the call's `Runner` too, as on a
+non-live run. A run-options factory is not called for realtime calls: the call has no per-run requests to give it.
+
+Each agent speaks in the voice of its model: give it `Gemini(model=..., speech_config=...)`. ADK's live run does
+not read `generate_content_config.speech_config`.
+
+```python
+from google.adk.agents import Agent as GoogleAgent
+from google.adk.models import Gemini
+from google.genai import types
+
+billing = GoogleAgent(
+    name="billing",
+    model=Gemini(
+        model="gemini-3.1-flash-live-preview",
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Charon"))
+        ),
+    ),
+    instruction="Answer billing questions.",
+)
+```
 
 ### Tools and framework context
 
@@ -249,7 +271,7 @@ if __name__ == "__main__":
     IOHandler.run(gateways=[GatewayRunner(LiveKitEdgeGateway(session_id="room_01", agent_name="supervisor"))])
 ```
 
-The conversation, and the context the caller has given, carries over to the agent that takes the call. On Google ADK, the agent that takes the call sees each earlier turn with who said it (`[billing] said: ...`), as ADK presents another agent's turns, so agents can put questions to each other and answer them.
+The conversation, and the context the caller has given, carries over to the agent that takes the call. On Google ADK, the agent that takes the call sees its teammates' turns with who said them (`[billing] said: ...`), as ADK presents another agent's turns, so agents can put questions to each other and answer them. ADK fences those turns, tool results included, as data the agent must never take instructions from: tell the agent taking the call who it is and why it has the call in its own `instruction` (an `InstructionProvider` is built again each time it takes the call), not in a transfer's result.
 
 ### What the caller sees in the room
 
@@ -267,10 +289,10 @@ Each agent participant needs a token of its own, so the gateway needs `AK_LIVEKI
 
 | | OpenAI Agents SDK | Google ADK |
 |---|---|---|
-| Handoff | Same model socket; the session is switched to the new agent's instructions and tools | A new Gemini Live socket for the new agent, seeded with the conversation so far |
-| Gap the caller hears | None | About 1 to 2 seconds; what the caller says during it is held (its latest 5 seconds) and sent to the new agent |
-| Voice and model | Every agent speaks with the entry agent's model and voice | Each agent its own model and voice (`generate_content_config.speech_config`) |
-| Rejected when the call connects | A handoff with `input_filter` or `nest_handoff_history`, which realtime cannot apply | Any reachable agent that is not an `LlmAgent` with a Gemini Live model and a string `instruction` |
+| Handoff | Same model socket; the session is switched to the new agent's instructions and tools | ADK's own transfer: a new Gemini Live socket for the new agent, given the conversation so far |
+| Gap the caller hears | None | About 1 to 2 seconds. ADK keeps the old socket for about a second after the transfer: what the caller says then goes to the agent handing over and is not heard by the new one; after that, it waits for the new agent |
+| Voice and model | Every agent speaks with the entry agent's model and voice | Each agent its own model and voice (`Gemini(model=..., speech_config=...)`) |
+| Rejected when the call connects | A handoff with `input_filter` or `nest_handoff_history`, which realtime cannot apply | Nothing by Agent Kernel: ADK's live run decides when an agent's socket opens |
 
 For how handoffs flow through the pipeline, see [Realtime Voice Internals](../architecture/realtime-internals.md).
 
@@ -279,7 +301,7 @@ For how handoffs flow through the pipeline, see [Realtime Voice Internals](../ar
 Agents that can hand off to each other can also do so without the caller, back and forth. Each framework's own hook can refuse a handoff, and the refused agent keeps the call:
 
 - **OpenAI Agents SDK**: wrap the target in `handoff(agent, on_handoff=...)` and raise from the hook. The model gets the exception's message as the handoff's result.
-- **Google ADK**: give the agent a `before_tool_callback` that returns a result for `transfer_to_agent`. Realtime runs an agent's `before_tool_callback`, `on_tool_error_callback` and `after_tool_callback` around every tool call, as an ADK run does; ADK plugins do not run.
+- **Google ADK**: give the agent a `before_tool_callback` that returns a result for `transfer_to_agent`. ADK runs its plugins and the agent's `before_tool_callback`, `on_tool_error_callback` and `after_tool_callback` around every tool call, as on any ADK run.
 
 ```python
 from google.adk.agents import Agent as GoogleAgent
@@ -354,7 +376,8 @@ async def request_research(question: str) -> str:
 - **While it waits**: the call counts as busy (`is_responding`). Nothing posted with `post_when_idle` is said and
   `RealtimeCall.quiet_for()` is `None` until the result is sent. The caller's audio still reaches the model; what the model
   does with it while its tool call is open is the model's own behaviour. Gemini Live is not taken for stalled
-  meanwhile: its wait for an answer starts when the result is sent. The model may speak before it calls the tool,
+  meanwhile: its wait for an answer starts when the result is sent. On Google ADK, ADK reads nothing from the
+  socket while its tools run, so the caller's words and interruptions during the wait arrive after it. The model may speak before it calls the tool,
   but the model decides when it makes the call, so that speech is not guaranteed to be heard first.
 - **Failures and time limits**: an agent's failed run comes back from `run_multi` as error text, as on every other
   surface; detect it through the framework's own signal (with the OpenAI Agents SDK, `RunHooks.on_agent_end` is called
@@ -364,10 +387,8 @@ async def request_research(question: str) -> str:
   running for the connection (`asyncio.CancelledError` inside them, which unwinds the nested run and its session
   lock) and gives them 2 seconds to unwind. A result that comes after the connection closed or its socket failed is
   not sent.
-- **A dropped socket (Google ADK)**: the runner reconnects the same agent and waits up to
-  `LOST_TOOL_WAIT_SECONDS` (2 s) for tools still running for the lost socket, so a result that comes in time seeds the
-  new socket with the call and its result. A tool that takes longer is not run again and its result is sent to no
-  socket; it is kept in the history for a later transfer or reconnect.
+- **A dropped socket (Google ADK)**: ADK notices a lost socket only once its tools have returned, so the result is
+  in the conversation the restarted run is given, however long the tool took, and the agent does not run it again.
 
 Agent Kernel decides no policy here: no retries, no wording, no time limit.
 
@@ -398,7 +419,7 @@ RealtimeCall.observe(Transcript())
 | `edge_text` | Text the edge sent into the call: what the caller typed, or a prompt the edge sends for them (the gateway's greeting) |
 | `agent_said` | An agent's words in one turn, as they reached the edge; `interrupted` when the caller talked over it |
 | `agent_changed` | The call moved to `event.agent`, and once for the agent it starts with |
-| `reconnected` | Within one connection, the model socket dropped or stopped answering and was replaced, with `event.agent` still on the call (Gemini: reconnected with the conversation, the agent told the line dropped) |
+| `reconnected` | Within one connection, the model socket dropped or stopped answering and was replaced, with `event.agent` still on the call; reported once the new socket is answering (Gemini: restarted with the conversation, the agent told the line dropped; a socket ADK resumes itself is not reported) |
 
 An observer sees every call the process connects after it is registered (`RealtimeCall.unobserve` stops it for later
 calls), handoffs' turns included, named in `event.agent`; `agent` is the agent the call started with. Observers run
@@ -417,12 +438,13 @@ Complete working examples (with In-Memory, Kafka, NATS, and AWS SQS architecture
 ## Limitations
 
 - **No guardrails or pre/post hooks on realtime turns**: voice and chat turns go to the model socket directly, not through `Runtime.run()`, so input/output guardrails, pre/post hooks and the multimodal pre-hook do not run. [Realtime observers](#watching-a-live-call) see the call, and cannot change what is said.
-- **Tool limits**: OpenAI tools that need approval or have tool guardrails are not offered in realtime mode (a warning is logged), and ADK toolsets such as MCP are not supported. Plain function tools work on both frameworks.
+- **Tool limits**: OpenAI tools that need approval or have tool guardrails are not offered in realtime mode (a warning is logged). On Google ADK, ADK's live runner resolves an agent's tools as on any run; toolsets such as MCP have not been tested in a live call. Plain function tools work on both frameworks.
 - **One room per gateway**: each `LiveKitEdgeGateway` joins one room, and all audio in that room goes to one session; an application that gives each meeting a room hosts one runner per room.
-- **History is held by the model connection**: the conversation lives in the model's own session (for a Google ADK transfer, Agent Kernel replays it into the new agent's socket).
-  - **Google ADK**: a Gemini socket that drops, stalls or reaches the Live API's connection time limit (about 10 minutes) is replaced with the same agent, seeded with the conversation and a short note that the line dropped (see [Connection recovery](../architecture/realtime-internals.md#connection-recovery-google-adk)); what the caller says meanwhile is held and passed on. Only when every attempt fails, or the new sockets keep dropping, is the call failed.
+- **History is held by the call**: on OpenAI, in the model's own session; on Google ADK, in the call's ADK session, which ADK gives each new socket.
+  - **Google ADK**: ADK resumes a dropped socket itself when it holds a session resumption handle. A socket that still drops, stalls or reaches the Live API's connection time limit (about 10 minutes) is replaced by starting ADK's run again with the same agent, the conversation and a short note that the line dropped (see [Connection recovery](../architecture/realtime-internals.md#connection-recovery-google-adk)); what the caller says meanwhile waits for the new socket. Only when the restarted runs keep dropping is the call failed.
   - **OpenAI**, and any adapter after a failed call: the next connection starts with no earlier turns, at the entry agent. So does a call evicted after five idle minutes.
-  - The replayed conversation is text: tone of voice is not carried over, and a very long call replays a long history on every transfer or reconnect.
+  - The conversation a new Gemini socket is given is text: tone of voice is not carried over, and a very long call sends a long history on every transfer or restart.
+  - **Words said with a transfer**: ADK records an agent's words when Gemini marks their transcription finished, or at the end of the turn; words said in a turn that ends in a transfer may not reach the agent taking the call.
 - **One LiveKit connection per agent**: with handoffs, every agent in the team is a participant for the whole call, and LiveKit bills connection minutes for each.
 - **Single replicas**: one Agent Runner replica and one IOHandler process, as described above.
-- **A waiting tool holds its turn**: while a tool awaits long work the agent says nothing more, and a result outliving a dropped Gemini socket's short wait reaches no socket (see [Tools that wait for long work](#tools-that-wait-for-long-work)).
+- **A waiting tool holds its turn**: while a tool awaits long work the agent says nothing more, and on Google ADK nothing the model sends is read until the tool returns (see [Tools that wait for long work](#tools-that-wait-for-long-work)).

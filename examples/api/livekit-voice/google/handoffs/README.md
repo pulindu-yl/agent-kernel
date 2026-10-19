@@ -18,13 +18,13 @@ It uses the `in_memory` queue transport, so the LiveKit gateway and the agent ru
 
 An agent that can transfer is given ADK's own `transfer_to_agent` tool and ADK's transfer instructions. When the model calls it, the tool runs exactly as it does on an ADK run. Any of your own tools can also trigger a transfer by setting `tool_context.actions.transfer_to_agent`, as ADK allows.
 
-A Gemini Live session's instructions and tools are fixed when it opens. So, as ADK's own live runner does, Agent Kernel then closes the socket and opens a new one configured for the new agent, with its instructions, tools and voice. The new socket is seeded with the conversation so far as text, so the new agent knows what the caller already said and answers the question that triggered the transfer.
+Agent Kernel runs the call on ADK's own live runner (`Runner.run_live`). A Gemini Live session's instructions and tools are fixed when it opens, so on a transfer ADK closes the socket and opens a new one configured for the new agent, with its instructions, tools and voice, and gives it the conversation so far as text: the new agent knows what the caller already said and answers the question that triggered the transfer. Each agent's voice comes from its model, `Gemini(model=..., speech_config=...)` (`voice()` in `server.py`).
 
-Every transfer is logged (`Transferring from 'supervisor' to 'billing'`) and reaches the LiveKit gateway as an `agent_changed` event, in order with the audio around it. The new agent sees each earlier turn with who said it (`[supervisor] said: ...`), as ADK presents another agent's turns, so it can tell a teammate's words from its own.
+Every transfer is logged (`Transferring from 'supervisor' to 'billing'`) and reaches the LiveKit gateway as an `agent_changed` event, in order with the audio around it. The new agent sees its teammates' turns with who said them (`[supervisor] said: ...`), as ADK presents another agent's turns, so it can tell a teammate's words from its own.
 
 ## Refusing a handoff
 
-Realtime calls run an agent's ADK tool callbacks around every tool call, `transfer_to_agent` included, as an ADK run does. The supervisor's `before_tool_callback`, `require_account`, refuses a transfer to `billing` or `tech_support` until the caller's account is verified with `verify_account`: it returns a result in the tool's place, so the transfer does not happen, the supervisor keeps the call, and the model hears why. `verify_account` keeps the account in the ADK tool state, which lasts for the whole call, across transfers.
+ADK runs an agent's tool callbacks around every tool call, `transfer_to_agent` included, in a live call as on any ADK run. The supervisor's `before_tool_callback`, `require_account`, refuses a transfer to `billing` or `tech_support` until the caller's account is verified with `verify_account`: it returns a result in the tool's place, so the transfer does not happen, the supervisor keeps the call, and the model hears why. `verify_account` keeps the account in the ADK tool state, which lasts for the whole call, across transfers.
 
 ## A tool that waits
 
@@ -85,8 +85,7 @@ The tests need no model, LiveKit server or key: they check the handoff rule, the
 
 ## Limits
 
-- **A short gap on every transfer.** Opening the new socket takes about a second or two. What the caller says meanwhile is held (its latest 5 seconds) and passed to the new agent.
+- **A short gap on every transfer.** Opening the new socket takes about a second or two. ADK keeps the old socket for about a second after the transfer, so what the caller says then goes to the agent handing over and is not heard by the new one; after that it waits for the new agent.
 - **One LiveKit connection per agent.** Every agent in the graph is a participant for the whole call, so LiveKit bills connection minutes for each.
-- **LLM agents only.** Every agent the conversation can transfer to must be an `LlmAgent` with a Gemini Live model and a string `instruction`; a workflow agent (e.g. `SequentialAgent`) or an instruction provider is rejected when the call connects.
-- **One transfer per model turn.** If the model asks for two transfers in one turn, the first is performed and the second is answered as not performed. Any other tool called in the same turn runs, and its result reaches the new agent, as on an ADK run.
-- **Function tools only.** As for a single realtime agent, toolsets (e.g. MCP) are not offered.
+- **Words said with a transfer.** ADK gives the new agent an agent's words once Gemini marks their transcription finished, or at the end of the turn, so words said in the same turn as a transfer may not reach it.
+- **ADK's live runner decides.** Which agents can take a call, how several transfers in one turn are handled and how toolsets (e.g. MCP) are resolved are ADK's: Agent Kernel checks none of them. This example uses function tools only.

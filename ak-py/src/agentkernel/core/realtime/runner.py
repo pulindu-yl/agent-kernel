@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from abc import abstractmethod
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from ..base import Agent, Runner, Session
 from ..event import StreamEvent
@@ -23,6 +23,19 @@ class RealtimeRunner(Runner):
     # ``interrupt`` (a model with server voice activity detection that signals the end of speech).
     # The pool then counts the user as speaking until it arrives.
     reports_speech_stopped: bool = False
+    # True when the framework runs the model's tool calls itself, inside its own engine. Such an adapter reports no
+    # ``tool_call`` (the pool runs none), and opens the pool's tool scope from the task running each call (``use_tool_scope``).
+    runs_tools: bool = False
+    _open_tool_scope: Callable[[], Awaitable["ToolContext"]] | None = None
+
+    def use_tool_scope(self, open_scope: Callable[[], Awaitable["ToolContext"]]) -> None:
+        """Called by the pool before :meth:`connect` on an adapter that :attr:`runs_tools`.
+
+        ``await open_scope()``, from the task running one tool call, gives that task what a tool the pool runs has:
+        the session lock, ``Session.current()``, ``Agent.current()`` and a ``ToolContext``. They last until the task
+        ends, the call counts as running until then, and the pool cancels the task when the call closes.
+        """
+        self._open_tool_scope = open_scope
 
     async def run(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AgentReply:
         """Not supported for realtime runners."""
@@ -60,15 +73,14 @@ class RealtimeRunner(Runner):
         """Sends a text message and requests a response."""
         raise NotImplementedError()
 
-    @abstractmethod
     async def send_tool_result(self, call_id: str, result: str) -> None:
-        """Sends a tool execution result back to the model."""
-        raise NotImplementedError()
+        """Sends a tool execution result back to the model; required unless the adapter :attr:`runs_tools`."""
+        raise NotImplementedError(f"{type(self).__name__} runs its tools itself")
 
-    @abstractmethod
     async def execute_tool(self, name: str, arguments: str, context: "ToolContext", call_id: str) -> str:
-        """Executes the named tool with JSON ``arguments`` in the framework's own tool context and returns its string result."""
-        raise NotImplementedError()
+        """Executes the named tool with JSON ``arguments`` in the framework's own tool context and returns its string result;
+        required unless the adapter :attr:`runs_tools`."""
+        raise NotImplementedError(f"{type(self).__name__} runs its tools itself")
 
     @abstractmethod
     async def disconnect(self) -> None:

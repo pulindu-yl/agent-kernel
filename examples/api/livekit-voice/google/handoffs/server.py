@@ -8,6 +8,7 @@ from agentkernel.integration.adapter import GatewayRunner
 from agentkernel.livekit import LiveKitEdgeGateway
 from agentkernel.pipeline import IOHandler, RealtimeCall
 from google.adk.agents import Agent as GoogleAgent
+from google.adk.models import Gemini
 from google.adk.tools import ToolContext
 from google.genai import types
 
@@ -23,11 +24,13 @@ DISPATCH_SECONDS = 5.0
 NEEDS_ACCOUNT = {"billing", "tech_support"}
 
 
-def voice(name: str) -> types.GenerateContentConfig:
-    return types.GenerateContentConfig(
+def voice(name: str) -> Gemini:
+    """The Live model speaking in a Gemini prebuilt voice: ADK's live run takes each agent's voice from its model."""
+    return Gemini(
+        model=MODEL,
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=name))
-        )
+        ),
     )
 
 
@@ -119,7 +122,7 @@ class CallLog(RealtimeObserver):
 
 billing = GoogleAgent(
     name="billing",
-    model=MODEL,
+    model=voice("Charon"),
     description="Handles invoices, charges, payments and refunds.",
     instruction=(
         "You are Acme Internet's billing specialist, taking over a call from the front desk. Introduce yourself in a few "
@@ -127,12 +130,11 @@ billing = GoogleAgent(
         "conversation, so do not ask for it again. Keep answers short and spoken."
     ),
     tools=GoogleADKToolBuilder.bind([get_latest_invoice]),
-    generate_content_config=voice("Charon"),
 )
 
 tech_support = GoogleAgent(
     name="tech_support",
-    model=MODEL,
+    model=voice("Puck"),
     description="Handles internet connection problems, outages and technician visits.",
     instruction=(
         "You are Acme Internet's technical support specialist, taking over a call from the front desk. Introduce "
@@ -140,12 +142,11 @@ tech_support = GoogleAgent(
         "said. Check for an outage before suggesting a technician visit. Keep answers short and spoken."
     ),
     tools=GoogleADKToolBuilder.bind([check_outage, book_technician]),
-    generate_content_config=voice("Puck"),
 )
 
 supervisor = GoogleAgent(
     name="supervisor",
-    model=MODEL,
+    model=voice("Aoede"),
     description="Greets callers, answers general questions and routes them to the right team.",
     instruction=(
         "You are the front desk of Acme Internet's support line, speaking with a caller. Keep every answer short and "
@@ -156,7 +157,6 @@ supervisor = GoogleAgent(
     sub_agents=[billing, tech_support],
     # Realtime calls run ADK's tool callbacks too, transfer_to_agent included: this one can refuse a transfer.
     before_tool_callback=require_account,
-    generate_content_config=voice("Aoede"),
 )
 
 module = GoogleADKModule([supervisor])

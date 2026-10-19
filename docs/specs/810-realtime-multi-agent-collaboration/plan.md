@@ -10,6 +10,10 @@ Revised: the background jobs (`RealtimeCall.run_in_background` and its hosting) 
 guardrails were built and then removed from this PR (design.md "Open questions"); the iterations below describe what
 remains, with research and review in the application as awaited tools.
 
+Revised: iterations 2, 4 and 6 built a Gemini adapter that drove Gemini Live itself and re-implemented ADK's tool
+callbacks, history and recovery. Iteration 17 replaces them with ADK's own live engine; they are kept below as built,
+marked superseded.
+
 ## Iteration 1: Core contracts
 
 - **Goal:** realtime observers and the new adapter events exist in `core/`; nothing uses them yet.
@@ -19,7 +23,7 @@ remains, with research and review in the application as awaited tools.
   2. Add `RealtimeRunner.reports_speech_stopped` and document every new adapter event in the callback contract, `reconnected` and the `reconnecting` status included (Rule 2).
 - **Verify:** `cd ak-py && uv run pytest tests/test_realtime_pool.py`.
 
-## Iteration 2: ADK tool callbacks
+## Iteration 2: ADK tool callbacks (superseded by Iteration 17)
 
 - **Goal:** realtime ADK tool calls run the agent's tool callbacks.
 - **Files:** `ak-py/src/agentkernel/framework/adk/adk.py`
@@ -37,7 +41,7 @@ remains, with research and review in the application as awaited tools.
   3. Keep the turn state on `RealtimeConnection`, per the spec.md "Turn state" table, and pass `from_edge=True` from `dispatch`.
 - **Verify:** `TestRealtimeTurnState`, `TestADKRealtimeSpeechStarted`, `TestADKCallerTranscript`, `TestOpenAIBargeIn`; `test_ecs_akagentrunner_realtime.py`.
 
-## Iteration 4: Authored history and Live settings
+## Iteration 4: Authored history and Live settings (superseded by Iteration 17)
 
 - **Goal:** a transfer's seed shows who said what, and every socket uses the call's `RunConfig`.
 - **Files:** `adk.py`
@@ -52,12 +56,12 @@ remains, with research and review in the application as awaited tools.
 - **Files:** `realtime_pool.py`, `ak-py/src/agentkernel/pipeline/__init__.py`
 - **Steps:**
   1. Add `RealtimeOutbox` and its delivery from the pool's loop, per spec.md "Outbox", with every state write under its lock.
-  2. Add the pool's `post_when_idle`, `withdraw`, `close`, `is_connected`, `quiet_for`, `agent_has_spoken`, and `RealtimeCall` over them; export `RealtimeCall`.
+  2. Add the pool's `post_when_idle`, `withdraw` and `close`, its lookups (`open_connection`, `live_connection`, `outbox`), and `RealtimeCall` reading the call's facts through them; export `RealtimeCall`.
   3. Add `RealtimeCall.observe` / `unobserve` and the observer queue and task, per spec.md "Observers".
   4. Add the loop-lag warning, and make the sweep close failed connections, per spec.md "Sweep and loop lag".
 - **Verify:** `TestRealtimeOutbox`, `TestRealtimeCall`, `TestRealtimeObservers`, the sweep and loop-lag tests.
 
-## Iteration 6: Connection recovery
+## Iteration 6: Connection recovery (superseded by Iteration 17)
 
 - **Goal:** a lost or stalled Gemini socket reconnects the same agent by replaying the conversation, and a recovering call takes no post.
 - **Files:** `adk.py`, `realtime_pool.py`
@@ -150,3 +154,22 @@ Iterations 11 to 16 build spec.md "Application building blocks", in the same PR,
 
 - **Goal:** the application that drove the change runs on the building blocks: research and review as awaited voice tools running their agents through `AgentService` in sessions of their own (failure detected natively, as before), its nudges a task polling `RealtimeCall.quiet_for()` that its observer runs per connection, its rooms one `GatewayRunner` each, its handoff rules one policy class on ADK's callbacks.
 - **Verify:** its tests pass, against a fresh AK build; a live call: handoffs, research and a review (how long the caller waits), a refused handoff, a nudge, the meeting ended while research runs.
+
+## Iteration 17: Google ADK on its own live engine
+
+- **Goal:** the Gemini adapter runs each call on ADK's `Runner.run_live`; ADK owns tools, callbacks, plugins, transfers,
+  history and session resumption, and AK keeps only the tool scope, event reporting and restarting a failed run.
+- **Files:** `core/realtime/runner.py`, `pipeline/realtime_pool.py`, `framework/adk/adk.py`, `ak-py/pyproject.toml`,
+  `ak-py/uv.lock`, `examples/api/livekit-voice/google/handoffs/server.py`, `ak-py/tests/test_adk_realtime.py`,
+  `ak-py/tests/test_realtime_pool.py`
+- **Steps:**
+  1. Add `runs_tools` and `use_tool_scope()` to `RealtimeRunner`, and `open_tool_scope()` to the pool, per spec.md
+     "Core contracts" Rule 5.
+  2. Rewrite `GoogleADKRealtimeRunner` on `Runner.run_live`, per spec.md "ADK realtime runner": the tool scope plugin
+     first, the starting agent's Runner options and `RunConfig`, the event table, the restart and stall rules.
+  3. Remove the manual callbacks, transfers, history, socket handling and held input, and their tests.
+  4. Raise the `adk` extra to `google-adk>=2.7.0`, checked by running `test_adk_realtime.py` on 2.6.0 and 2.7.0.
+  5. Move each agent's voice to its model (`Gemini(model=..., speech_config=...)`) in the example.
+- **Verify:** `test_adk_realtime.py` on ADK 2.7.0, 2.8.0 and 2.11.0; `TestRealtimeToolScope`; the full suite;
+  `make lint-check-all`; a live call through the driving application.
+

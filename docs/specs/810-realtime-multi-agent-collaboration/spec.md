@@ -2,8 +2,8 @@
 
 Implements the requirements in [`design.md`](design.md). The realtime pool keeps each call's turn state, says
 application posts at quiet moments through `RealtimeOutbox` / `RealtimeCall`, and feeds `RealtimeObserver`s. The Gemini
-adapter runs ADK's tool callbacks, seeds transfers with authored history, applies the call's `RunConfig`, and recovers
-lost sockets by replaying the conversation. A connection owns its tool calls, so a tool that awaits long work (another
+adapter runs each call on ADK's own live engine (`Runner.run_live`): ADK runs the tools and their callbacks, transfers
+and keeps the conversation, in the pool's tool scope, and the adapter starts a run that failed again. A connection owns its tool calls, so a tool that awaits long work (another
 agent's run) is cancelled with its call. The LiveKit gateway signs participant tokens. The idea: voice is the meeting
 room, not the engine.
 
@@ -38,6 +38,25 @@ Each item was checked against `develop` at `4c78c482`, the branch at `58015003`,
 - AG-UI cannot carry a voice call: `ag-ui-protocol` 0.1.22 has no audio events, AK's AG-UI handler answers one HTTP
   request per run (`integration/agui/handler.py:221`) on the stream path, and rejects audio input (`run_input.py:216`)
 
+Checked for the native ADK path (installed `google-adk==2.8.0`; the 2.6.0, 2.7.0, 2.11.0 and 2.12.0 wheels):
+
+- `handle_function_calls_live` runs each call of a tool-call message as its own `asyncio` task, and the plugins'
+  `before_tool_callback` runs first in that task, before the agent's callbacks (2.8.0
+  `flows/llm_flows/functions.py:717-934`; 2.11/2.12 `flows/llm_flows/tools/_live_caller.py`)
+- `run_live` awaits the tool calls inside its receive loop (2.8.0 `base_llm_flow.py:1611`): nothing is read from the
+  socket while a tool runs
+- A transfer is performed on the result's `actions.transfer_to_agent` from 2.7.0 (2.8.0 `base_llm_flow.py:784`);
+  2.0.0 to 2.6.0 close the socket on any `transfer_to_agent` result, so a refused transfer ends the run. The floor is
+  therefore `google-adk>=2.7.0`, confirmed by running `test_adk_realtime.py` on 2.6.0 (the refused transfer fails),
+  2.7.0, 2.8.0 and 2.11.0 (all pass)
+- The live connect config takes `speech_config` from the `RunConfig` or the agent's `Gemini` model object
+  (`flows/llm_flows/basic.py:145`, `models/google_llm.py:518`), not from `generate_content_config`
+- The contents processor turns finished transcriptions into text turns, so a new socket is given what was said;
+  ADK's Gemini connection marks a transcription finished on Gemini's `finished`, `turn_complete`, `interrupted` or
+  `generation_complete` (`models/gemini_llm_connection.py:435-530`)
+- ADK resumes a dropped socket when it holds a session resumption handle (up to 5 attempts); transparent resumption is
+  set only on Vertex AI (`base_llm_flow.py:651-690`). Gemini 3.1 Live sent handles in live runs without being asked
+
 ## Design
 
 ### Package layout
@@ -49,15 +68,15 @@ ak-py/src/agentkernel/
 │   ├── __init__.py            # exports RealtimeEvent, RealtimeObserver
 │   └── realtime/
 │       ├── observer.py        # NEW: RealtimeEvent, RealtimeObserver
-│       └── runner.py          # reports_speech_stopped; the new adapter events
+│       └── runner.py          # reports_speech_stopped; runs_tools / use_tool_scope; the new adapter events
 ├── framework/
-│   ├── adk/adk.py             # GoogleADKRealtimeRunner; the ADK tool wrapper
+│   ├── adk/adk.py             # GoogleADKRealtimeRunner on Runner.run_live; the ADK tool wrapper
 │   └── openai/openai.py       # speech_stopped
 ├── integration/
 │   └── livekit/adapter.py     # participant_token
 └── pipeline/
     ├── __init__.py            # exports RealtimeCall
-    └── realtime_pool.py       # turn state, RealtimeOutbox, RealtimeCall, observers, recovery readiness, sweep
+    └── realtime_pool.py       # turn state, the tool scope, RealtimeOutbox, RealtimeCall, observers, recovery readiness, sweep
 ```
 
 ### Core contracts (`core/`)
@@ -83,6 +102,12 @@ class RealtimeCall:   # pipeline/realtime_pool.py
 
 class RealtimeRunner:
     reports_speech_stopped: bool = False   # True only where the model signals the end of the caller's speech
+    runs_tools: bool = False               # True where the framework runs the model's tool calls itself
+    def use_tool_scope(self, open_scope: Callable[[], Awaitable[ToolContext]]) -> None: ...   # set by the pool
+    # execute_tool / send_tool_result: no longer abstract; required unless runs_tools
+
+class RealtimeConnection:   # pipeline/realtime_pool.py
+    async def open_tool_scope(self) -> ToolContext: ...   # from the framework's task running one tool call
 ```
 
 Rules:
@@ -92,77 +117,89 @@ Rules:
    - `speech_heard {}`: the caller is still speaking;
    - `speech_stopped {}`: the caller stopped; only from an adapter with `reports_speech_stopped`;
    - `caller_transcript {"text"}`: optional, the caller's words in one turn;
-   - `reconnected {"agent", "seconds", "seeded"}`: the socket was replaced, with `seeded` true when the conversation was replayed;
+   - `reconnected {"agent", "seconds", "seeded"}`: the socket was replaced and is answering, with `seeded` true when the new socket was given the conversation;
    - `done` with status `reconnecting`: the turn under way ended because the socket was lost.
 3. Observers live on the pool class (`RealtimeConnectionPool._observers`), not on `Agent`: a call is observed, not an agent, and the list can be filled before the pool starts. `get_or_create` passes it to each new `RealtimeConnection(..., observers=)`.
 4. `set()` / `reset()` are unchanged for their callers, which activate once per run.
+5. An adapter with `runs_tools` reports no `tool_call`. The pool calls `use_tool_scope(self.open_tool_scope)` before
+   `connect()`. `open_tool_scope()`, awaited from the task running one tool call, counts the call as running, adds the
+   task to `_tool_tasks`, starts a holder task (`_hold_tool_scope`) that holds `async with session` and keeps the
+   `ToolContext` fetchable, waits until the holder has the lock or has ended (a holder ended first raises
+   `RuntimeError`), then sets `Session.current()`, `Agent.current()` and the `ToolContext` in the calling task's own
+   context. The task's done-callback ends it all: the holder lets go, the count drops, a holder still waiting for the
+   lock is cancelled, and a task not cancelled marks `last_tool_result_at`.
 
 ### ADK realtime runner (`GoogleADKRealtimeRunner`)
 
-#### Tool callbacks
+`runs_tools = True`. Per call, `connect()` creates an `InMemorySessionService` session named after the AK session, a
+`Runner(app_name="AgentKernel", agent=<the starting agent>, plugins=[_ToolScope, *declared plugins], **declared
+options)` (the starting agent's `GoogleADKRunner.RUNNER_CONSTRUCTOR_OPTIONS` run options), the call's `RunConfig` and a
+`LiveRequestQueue`, then starts `_supervise()` and the stall watchdog and returns: ADK opens the socket on that task.
 
-`execute_tool` runs `_run_tool(caller, tool, args, tool_context)`, `caller` being the agent that made the call:
+#### The call's settings
 
-1. Before-callbacks (`caller.canonical_before_tool_callbacks`) in order, each awaited when it returns an awaitable; stop at the first truthy result.
-2. If the result is still `None`, run `tool.run_async`. If it raises, error callbacks in order until one returns non-`None`, which becomes the result; with none, re-raise.
-3. After-callbacks in order with `tool_response`; stop at the first truthy result; a non-`None` one replaces the result.
-4. Then read `tool_context.actions.transfer_to_agent`, as today.
+- `RunConfig`: a copy of the starting agent's `run_config` run option, else `RunConfig()`; `response_modalities`
+  defaults to audio, and input and output transcription are turned on when unset. Everything else is ADK's
+- Voices come from each agent's model object; nothing is read from `generate_content_config`
 
-The order matches ADK's (Verification); plugins do not run.
+#### Input
 
-#### Caller turn events
+- `append_audio` → `LiveRequestQueue.send_realtime(Blob)`; `send_text` → `send_content(Content(role="user"))`. The queue
+  holds both while no socket is open; ADK sends text as each Live model takes it
 
-- `_caller_turn_reported` is set when a caller turn is reported (`speech_started` or `interrupt`) and cleared when the model speaks or the turn completes
-- A transcription of the caller (interim or final) while the model is silent reports `speech_started` once per turn, then `speech_heard` for each later one; while the model speaks, the existing barge-in rule applies
-- The caller's words are reported as `caller_transcript` and logged (`Caller said: ...`) when the turn ends: `turn_complete`, a tool call, text sent in, a transfer or a lost socket
+#### Tools
 
-#### Authored history
+- `_ToolScope(BasePlugin)`, the first plugin: `before_tool_callback` calls `_enter_tool(tool.name, agent)`, which
+  refuses to run on the live run's own task (`RuntimeError`: the scope would hold the session for the whole call),
+  logs the call, counts it for the stall watch and awaits the pool's `open_tool_scope()`. `after_tool_callback` and
+  `on_tool_error_callback` log the result or the error and return `None`, so they change nothing
 
-- `_history` holds `_Said(author, content)`: `"user"` for the caller, else the agent's name
-- `_presented_history()` builds a seed: caller entries as they are; agent entries through `_present_other_agent_message(Event(author=..., content=...))`
-- A seed ends on the user's side, so it is sent with `turn_complete=True`, followed by `"."` on Gemini 3.x Live, as ADK does
+#### Events reported (`_report`)
 
-#### Live settings
+| ADK event | Reported |
+|---|---|
+| The first event of a restarted run | `reconnected {"agent", "seconds", "seeded": True}` |
+| Caller transcription (partial or final) | `interrupt` while the model speaks (once per turn), else `speech_started` once per caller turn, then `speech_heard`; a final one is also `caller_transcript` and logged |
+| `interrupted` | `interrupt`, once per turn |
+| A partial output transcription | `transcript_delta` (the finished, whole one is not repeated) |
+| Audio in the content of a model event | `audio_delta` |
+| A function response carrying `actions.transfer_to_agent` | `done {"status": "transferred"}`, then `agent_changed` |
+| A model event from another agent than the one with the call | `agent_changed` (a restarted run resumed another agent) |
+| `turn_complete` | `done {"status": "completed"}` |
 
-- `connect` reads `agent.run_options.get("run_config")` once; `_connect_config` sets, on every socket:
-  - `realtime_input_config` from the `RunConfig`;
-  - `input_audio_transcription` / `output_audio_transcription` from the `RunConfig`, else `AudioTranscriptionConfig()`.
+No `tool_call` is reported.
 
 #### Recovery
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `RECONNECT_ATTEMPTS` | 3 | Attempts per loss; also the quick drops in a row that give up |
-| `RECONNECT_DELAYS_SECONDS` | (1, 2, 4) | Wait before each attempt |
-| `RECONNECT_TIMEOUT_SECONDS` | 10 | Bound on one attempt's connect |
-| `QUICK_DROP_SECONDS` | 20 | A socket lost this soon after a reconnect is a quick drop |
-| `STALL_SECONDS` / `STALL_CHECK_SECONDS` | 15 / 1 | No model progress this long is a stall; checked this often |
-| `HOLD_AUDIO_SECONDS` | 5 | Caller audio held while no socket is open |
-| `SPEECH_LEVEL` | 500 | RMS of 16-bit samples above which held audio is speech |
-| `RECONNECTED_NOTE` / `RECONNECTED_QUIET_NOTE` | text | The replay note when the caller spoke / did not; `""` adds none |
+| `RESTART_DELAYS_SECONDS` | (1, 2, 4) | Wait before each restart; their number is also the quick drops in a row that give up |
+| `QUICK_DROP_SECONDS` | 20 | A run lost this soon after a restart is a quick drop |
+| `STALL_SECONDS` / `STALL_CHECK_SECONDS` | 15 / 1 | No model progress this long, while it owes an answer and no tool runs, is a stall; checked this often |
+| `SPEECH_LEVEL` | 500 | RMS of 16-bit samples above which caller audio sent while the line is down is speech |
+| `RECONNECTED_NOTE` / `RECONNECTED_QUIET_NOTE` | text | The note when the caller spoke / did not; `""` adds none |
 
-Triggers: `_listen` raising (a socket error, or the server closing the connection at its ~10 minute limit) and the
-stall watchdog. Each calls
-`_recover_soon(reason)`, which starts `_recover` unless one is running or the runner is closing.
+`_supervise()` runs `_run_live()` (`Runner.run_live` over the queue, each event to `_report`) as a task and waits for it.
+A run cancelled by the call closing ends it; a run that ended, raised, or was cancelled by the watchdog (`_stalled`)
+calls `_restart(reason)`:
 
-`_recover(reason)`:
-
-1. Set `_connection = None`, stop listening, close the socket.
-2. Move the open socket's batches to `_lost_batches`; clear `_callers`, `_transfers` and the stall wait.
-3. End the turn (report the caller's words), reset the turn flags, report `done {"status": "reconnecting"}`.
-4. Count a quick drop when the last reconnect was under `QUICK_DROP_SECONDS` ago, else reset the count; at `RECONNECT_ATTEMPTS`, report `error` and stop.
-5. For each attempt, after its delay (stop if closing):
-   1. **Replay**: the note (`RECONNECTED_NOTE` when the caller was speaking at the loss or held audio has speech, else `RECONNECTED_QUIET_NOTE`), passed to `_open_socket(..., extra=[note])`, which adds it to that seed only. `_history` never holds a note.
-   2. On success: listen, report `reconnected {"agent", "seconds", "seeded"}`, then send the held input.
-6. When every attempt fails, report `error`.
+1. Mark the line down; keep whether the caller spoke while it was down, or had said something the model had not
+   answered (`_caller_said_at` later than `_model_said_at`); end the turn; report `done {"status": "reconnecting"}`.
+2. After as many quick drops in a row as there are delays, report `error` and stop.
+3. Wait the next delay (stop if closing), queue the note, keep the time of the first loss, and return: `_supervise()`
+   starts the run again. ADK resumes the agent that last had the call (`Runner._find_agent_to_run`) with its session.
+4. The new run's first event reports `reconnected` with the seconds since the first loss. A run that fails before
+   sending one is restarted in turn and is never reported.
 
 Rules:
 
-1. **Late tool results.** `send_tool_result` for a call in `_lost_batches` records the result; when its batch is complete, the calls and responses are appended to `_history` under the agent that made them, without ending the current turn, and nothing is sent to the socket. A transfer asked by a lost call is dropped.
-2. **Stall wait.** `_owed_since` is set to now after a tool response, after text is sent, after a seed that completes a turn, and on each model audio or output transcription while a response is open; it is cleared on `turn_complete`, `interrupted` and a tool call. No other message touches it.
-3. **Held input.** While `_connection` is `None` and the runner is not closing, `append_audio` keeps the latest `HOLD_AUDIO_SECONDS` and `send_text` queues the text; both go to the next socket after a reconnect or a transfer.
-5. **Text.** `send_text` sends as ADK's live connection does, by the model the open socket runs (`_socket_model`): `send_realtime_input(text=...)` on Gemini 3.x Live, a completed `send_client_content` turn otherwise. A seed stays client content (`history_config.initial_history_in_client_content`) followed by ADK's placeholder realtime text.
-4. **Shutdown.** `disconnect()` cancels and awaits the watchdog and any recovery before closing the socket.
+1. **Stall wait.** `_owed_since` is set on a caller's final transcription, text sent, a tool's result (its task ended),
+   a queued note, and each model audio or transcript; cleared on `turn_complete`, `interrupted`, a tool call and while
+   any tool runs. Text sent while a wait is running does not restart it.
+2. **ADK owns the socket.** Session resumption (with a handle), the history a new socket is given, transfers and their
+   delay are ADK's; the adapter never opens, closes or seeds a socket.
+3. **Shutdown.** `disconnect()` stops the watchdog, closes the queue, cancels `_supervise()` (and with it the run) and
+   closes the `Runner`. It is safe before `connect()` and twice.
 
 ### OpenAI realtime runner (`OpenAIRealtimeRunner`)
 
@@ -236,15 +273,16 @@ Rule: every write to the outbox's state (`_pending`, `_connection`, `_last_post_
 ### Packaging
 
 - `agentkernel/livekit.py` re-exports `integration.livekit`, as `slack.py` does
-- No new extra; `ak-py/pyproject.toml` and `ak-py/uv.lock` unchanged
+- No new extra; the `adk` extra's floor rises to `google-adk>=2.7.0` (`ak-py/pyproject.toml`, the matching specifier in
+  `ak-py/uv.lock`; the locked 2.8.0 is unchanged)
 
 ### Example (`examples/api/livekit-voice/google/handoffs/`)
 
 | File | Change |
 |---|---|
-| `server.py` | `verify_account(account_id, tool_context)`, a supervisor tool, keeps a verified account in the ADK tool state, which lasts for the call across transfers; `require_account`, the supervisor's `before_tool_callback`, answers in place of `transfer_to_agent` to `billing` or `tech_support` until an account is verified; `book_technician`, an `async` tool, waits for the dispatch system and answers with the confirmation (Application building blocks, Example); a `CallLog(RealtimeObserver)` logging `caller_said`, `agent_said`, `agent_changed` and `reconnected`, registered with `RealtimeCall.observe` under `__main__`, where the gateway is built |
+| `server.py` | `verify_account(account_id, tool_context)`, a supervisor tool, keeps a verified account in the ADK tool state, which lasts for the call across transfers; `require_account`, the supervisor's `before_tool_callback`, answers in place of `transfer_to_agent` to `billing` or `tech_support` until an account is verified; `book_technician`, an `async` tool, waits for the dispatch system and answers with the confirmation (Application building blocks, Example); a `CallLog(RealtimeObserver)` logging `caller_said`, `agent_said`, `agent_changed` and `reconnected`, registered with `RealtimeCall.observe` under `__main__`, where the gateway is built; each agent's voice from its model, `voice()` returning `Gemini(model=..., speech_config=...)` |
 | `server_test.py` (new) | Offline tests (Testing) |
-| `README.md` | Refusing a handoff, a tool that waits, the call log, the walkthrough, tests; the transfer gap now holds the caller's words |
+| `README.md` | Refusing a handoff, a tool that waits, the call log, the walkthrough, tests; ADK's own live runner, and the limits of its transfer |
 
 `.github/test-config.yaml`: `- type: api` / `path: examples/api/livekit-voice/google/handoffs`; the tests need no
 model, LiveKit server or key.
@@ -291,7 +329,8 @@ class RealtimeConnection:
 Rules:
 
 1. **Owned.** `handle_framework_event("tool_call", ...)` creates `_execute_tool_and_reply` as a task of the
-   connection, adds it to `_tool_tasks`, and removes it when it is done (`add_done_callback(discard)`).
+   connection, adds it to `_tool_tasks`, and removes it when it is done (`add_done_callback(discard)`). A tool an
+   adapter's framework runs (`runs_tools`) is added by `open_tool_scope()` (Core contracts, Rule 5).
 2. **Busy.** A running tool call counts toward `_tools_in_flight`, so `is_responding` is true: the outbox says no post
    and `quiet_for()` is `None`. Unchanged; a tool that awaits long work makes it last.
 3. **Closing.** `close()` sets `closed` and, the first time, stops pacing, then `_cancel_tools()`: cancel every
@@ -303,10 +342,9 @@ Rules:
    once the connection was closed or its socket failed (`_fail`), even one that ignored its cancellation, is logged
    and its result dropped. `last_tool_result_at` moves only for a result that was sent. A cancelled tool sends
    nothing and its `CancelledError` propagates out of its task.
-5. **Recovered sockets.** A socket the Gemini adapter replaces itself leaves the connection open (`closed` false): a
-   result goes to `send_tool_result`, whose lost-call rule (above, Recovery rule 1) keeps it in the history and sends
-   it to no socket; `_wait_for_lost_calls` waits up to `LOST_TOOL_WAIT_SECONDS` for it first. AK never runs a tool
-   again.
+5. **Recovered sockets.** A socket the Gemini adapter replaces itself leaves the connection open (`closed` false).
+   ADK notices a lost socket only once its tools have returned, so their results are in the conversation the
+   restarted run is given, and no tool is run again.
 6. **Nothing else.** No time limit, no retry, no queue: the tool's own code bounds its wait.
 
 #### Call facts and `while_quiet` posts (`pipeline/realtime_pool.py`)
@@ -368,12 +406,12 @@ Rules:
 
 ### Behavioural changes
 
-1. ADK realtime tool calls run the agent's tool callbacks. Intentional, the feature.
-2. A lost or stalled Gemini socket reconnects the same agent instead of failing the call and restarting at the entry agent. Intentional.
-3. Audio and text sent while no Gemini socket is open are held and sent to the next one, instead of dropped. Intentional.
-4. A transfer's seed presents every agent's turn as user-side `[agent] ...` context, instead of model turns. Intentional, ADK's own presentation.
+1. ADK realtime calls run on ADK's `Runner.run_live`: ADK runs the tools with their plugins and callbacks, transfers and keeps the conversation. Intentional, the feature.
+2. A Gemini socket ADK cannot resume, or a stalled one, restarts the run with the same agent instead of failing the call and restarting at the entry agent. Intentional.
+3. Audio and text sent while no Gemini socket is open wait in ADK's queue for the next one, instead of being dropped; what the caller says in ADK's transfer delay goes to the agent handing over. Intentional, ADK's behaviour.
+4. A new socket is given teammates' turns as user-side `[agent] ...` context and the agent's own turns as its own, ADK's presentation. An agent's voice comes from its model (`Gemini(speech_config=...)`), no longer from `generate_content_config`. Intentional, ADK's behaviour.
 5. The ADK adapter reports `speech_started`, `speech_heard` and `caller_transcript`; the OpenAI adapter reports `speech_stopped`. None reaches the edge; `speech_started` is a barge-in only while paced audio is queued, as before.
-6. The Live config takes turn detection and transcription from the call's `RunConfig`. Without a `run_config` option it is as before.
+6. The call's `RunConfig` and ADK `Runner` options (plugins, services) come from the starting agent's run options. Without them it is as before, transcription on.
 7. The pool's loop wakes every 0.25 s instead of 0.5 s; the idle sweep still runs every 5 s and now also closes failed connections.
 8. LiveKit agent tokens are signed through `_sign`, with the same claims.
 9. Closing a realtime connection cancels its running tool calls, and a result that comes once it is closed or its socket failed is not sent. Before, such a tool ran on with the session lock, and its result went to the disconnected adapter. Intentional.
@@ -386,12 +424,12 @@ LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the
 
 | Condition | Where | Surfaces as |
 |---|---|---|
-| Socket drops, server closes, stall | `GoogleADKRealtimeRunner._recover` | `done {"status": "reconnecting"}`, then `reconnected`; observers get `reconnected` |
-| Every reconnect attempt fails | `_recover` | `error` → the pool fails the connection; the edge gets an error chunk |
-| Quick drops `RECONNECT_ATTEMPTS` times in a row | `_recover` | `error` ("keeps dropping") |
-| A transfer's socket does not open in 15 s | `_transfer` | `error`, as before |
-| A tool raises with no error callback answering | `_run_tool` → the pool | `Error: ...` as the tool result, as before |
-| A tool result arrives for a lost socket | `send_tool_result` | recorded in the history; info log |
+| A socket drops with a resumption handle | ADK's `run_live` | resumed by ADK; nothing reported |
+| A run ends, fails or stalls | `GoogleADKRealtimeRunner._supervise` / `_restart` | `done {"status": "reconnecting"}`, then `reconnected` on the restarted run's first event; observers get `reconnected` |
+| Restarted runs lost quickly, three times in a row | `_restart` | `error` ("keeps dropping") → the pool fails the connection; the edge gets an error chunk |
+| A tool raises with no error callback answering | ADK | ADK's error response to the model |
+| A tool scope opened on the live run's own task | `_enter_tool` | `RuntimeError`: an ADK version that runs tools inline is not supported |
+| A tool scope's holder ends before it has the lock | `open_tool_scope` | `RuntimeError` in the tool |
 | A realtime observer raises | `_serve_observers` | logged; the next observer runs |
 | An observer is still busy at close | `_finish_observers` | warning after 2 s; its task cancelled |
 | `post_when_idle` with no pool in the process | `RealtimeCall` | warning; the post is dropped |
@@ -406,16 +444,12 @@ LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the
 ### Changed: `ak-py/tests/test_realtime_pool.py`
 
 - `TestRealtimeTurnState`: each row of the turn-state table; a pause mid-answer; a lost `done`; readable from another thread; `is_ready` false between `reconnecting` and `reconnected`
-- `TestADKRealtimeToolCallbacks`: before-callbacks stop a transfer, run in order, can ask for one; error and after-callbacks; async callbacks; the calling agent's callbacks
-- `TestADKRealtimeSpeechStarted`, `TestADKCallerTranscript`, `TestOpenAIBargeIn`: the caller events of both adapters
-- `TestADKRealtimeTransfers`: seeds as ADK presents them
-- `TestADKConnectConfig`: the `RunConfig`'s turn detection and transcription on every socket
-- `TestADKRealtimeRecovery`: replay with the right note; the note absent from the next seed; held audio and text; quick drops give up; every attempt failing fails; a late tool result in the next seed; stalls (a caller transcription keeps the wait; a response that stops mid-way recovers; an answering socket does not)
+- `TestOpenAIBargeIn`: the OpenAI adapter's caller events
+- `TestRealtimeToolScope`: a tool run by the adapter's framework gets the call's scope until its task ends; one cancelled while the session is busy leaves no holder behind; a holder ended before it had the lock fails the tool
 - `TestRealtimeOutbox`: quiet, busy, unready and recovering calls; owed replies, a seeded reconnect included; keys, withdrawal, expiry, overflow; a new connection
 - `TestRealtimeCall`: posts with and without a call; `quiet_for`, `agent_has_spoken`; no pool; `close()` with and without a pool
 - `TestRealtimeObservers`: events from connect to close, `reconnected` included; a failing observer; edge text from another thread; no observers, no queue; observers registered with `RealtimeCall.observe` reach the connections made after
 - The pool: the sweep closes a failed connection without further input; the loop-lag warning
-- `TestADKFirstAudioLog`: the wait logged once per turn
 
 ### New in `ak-py/tests/test_realtime_pool.py`
 
@@ -423,8 +457,26 @@ LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the
   `quiet_for()` is `None`), its result is sent once and the call's session and agent are current again after it; closing the
   connection, directly or through `RealtimeCall.close()`, cancels it, releases both sessions' locks, leaves no task and
   sends nothing; a tool that ignores its cancellation still sends nothing; a result after a failed socket is not sent
-- `TestADKRealtimeRecovery`: a tool slower than `STALL_SECONDS` is not taken for a stall, and its result is answered
-  on the same socket
+
+### New: `ak-py/tests/test_adk_realtime.py`
+
+ADK's real `run_live` through a `RealtimeConnection`, against a scripted Gemini Live socket standing in for
+`google.genai.Client`:
+
+- Talking: a turn's events and observations, text sent as ADK sends it, one interrupt per turn, each agent's voice and
+  the call's `RunConfig` on its sockets
+- Tools: a bound tool runs once in the call's scope (and is logged), an ADK tool gets ADK's `ToolContext`, the calling
+  agent's before / error / after callbacks once each, a tool asking another agent in a session of its own, a waiting
+  tool keeping the call busy and holding the session, closing during a tool, two calls at once, the application's
+  plugins inside the scope
+- Handoffs: a three-agent handoff with the conversation carried over and each socket's voice, a refused handoff
+  keeping the agent and its socket open, the caller's audio in and after ADK's transfer delay, words said with a
+  transfer with and without their transcription end, the team
+- Recovery: ADK resuming with a handle, a drop restarting the same agent with the conversation and a note, the note
+  chosen by whether the caller's words were answered, a finished tool not run again, a stall restarted, a slow tool
+  not a stall, quick drops given up on, a restart reported only once its run says something, closing while restarting
+- Lifecycle: disconnect safe twice and before connect, a socket that cannot open failing the call, the tool scope
+  refused on the run's own task
 
 ### Changed: other files
 
@@ -450,7 +502,7 @@ socket drop, and a call past 10 minutes.
 ### Commands
 
 ```bash
-cd ak-py && ./build.sh && uv run pytest tests/test_realtime_pool.py tests/test_module.py tests/test_livekit_gateway.py tests/test_ecs_akagentrunner_realtime.py -v
+cd ak-py && ./build.sh && uv run pytest tests/test_realtime_pool.py tests/test_adk_realtime.py tests/test_livekit_gateway.py tests/test_ecs_akagentrunner_realtime.py -v
 cd ak-py && uv run pytest
 make lint-check-all
 cd examples/api/livekit-voice/google/handoffs && ./build.sh local && uv run pytest -s
@@ -472,7 +524,10 @@ cd examples/api/livekit-voice/google/handoffs && ./build.sh local && uv run pyte
 ## Open items for review
 
 - `RECONNECTED_NOTE` is prompt text inside an adapter; it is a class constant a subclass can change or empty
-- The replayed history is unbounded; a long call sends every turn on a transfer or a replayed reconnect
+- The history ADK gives a new socket is unbounded; a long call sends every turn on a transfer or a restart
+- ADK's transfer: the caller's words in its delay go to the agent handing over, and words said with a transfer reach the
+  next agent only if Gemini marks their transcription finished; both are ADK's, not verified live
+- ADK reads nothing from the socket while its tools run, so the caller's words during a long tool arrive after it
 - The outbox, reconnect and stall thresholds come from one application's live runs
 - Neither adapter acts on Gemini's `toolCallCancellation`; what Gemini does with the caller's speech while a blocking tool call is open is not verified live
 - `RealtimeCall.connected` and `quiet_for()` lost their only consumer with the job runner, and `withdraw` has none in the driving application or the examples; kept as the public reading of the quiet rule, for review

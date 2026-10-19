@@ -613,16 +613,22 @@ Caller <-> LiveKitEdgeGateway (StatefulEdgeAdapter, hosted by GatewayRunner via 
   failed (every 5 s), paces model audio at playback speed (`execution.realtime.playback_lead_ms`), and
   warns when it was blocked for over a second. Tools run inside `async with session` and
   `Agent._activate()`, so they hold the session lock; a tool that asks another agent runs it in a session of
-  its own. The realtime path loads the AK session once per connection and never stores it.
+  its own. A tool an adapter's framework runs itself gets the same scope from `open_tool_scope()` (below). The realtime path loads the AK session once per connection and never stores it.
 - **Tool calls that wait** (#810): a tool call is a task of its connection (`RealtimeConnection._tool_tasks`); an
   `async` tool may await long work (another agent's `AgentService.run_multi`, which yields the pool's loop) and
   return its result through the original call. While it runs the call is `is_responding` (no posts, `quiet_for()` is `None`),
-  and ADK's stall wait restarts only when the result is sent. `RealtimeConnection.close()` (application close,
+  and the ADK adapter's stall wait is suspended. `RealtimeConnection.close()` (application close,
   eviction, shutdown) cancels the tool tasks, waits `_TOOL_CANCEL_SECONDS` (2 s) for them to unwind, and a result
   that comes once the connection is `closed` (closed or socket failed) is never sent. No AK time limit, retries or
   wording: those are the application's. No background-job runner (removed from #810).
 - **Adapter contract** (`core/realtime/runner.py`, `RealtimeRunner`): `connect(session, agent, callback)`,
-  `append_audio`, `send_text`, `execute_tool`, `send_tool_result`, `disconnect`, `team(agent)`. Callback
+  `append_audio`, `send_text`, `execute_tool`, `send_tool_result` (required unless `runs_tools`), `disconnect`,
+  `team(agent)`. **`runs_tools`**: an adapter whose framework runs the model's tool calls itself (ADK) reports no
+  `tool_call`, so the pool never runs a tool twice; before `connect()` the pool calls `use_tool_scope(open_tool_scope)`,
+  and the adapter awaits it from the framework's task running each call. `RealtimeConnection.open_tool_scope()` holds the
+  session lock in a holder task of its own (a lock and its context token live in one task), sets `Session.current()`,
+  `Agent.current()` and a `ToolContext` in the tool task's own context, and counts the call as running until that task
+  ends; `close()` cancels the task, and a holder still waiting for the lock is cancelled with it. Callback
   events: `audio_delta`, `transcript_delta`, `tool_call`, `done` (status `reconnecting` when a lost socket
   is being replaced), `interrupt`, `speech_started`, `speech_heard`, `speech_stopped` (only with
   `reports_speech_stopped`), `agent_changed`, `caller_transcript`, `reconnected`, `error`. Built-ins:
@@ -656,15 +662,20 @@ Caller <-> LiveKitEdgeGateway (StatefulEdgeAdapter, hosted by GatewayRunner via 
 - **OpenAI specifics** (`framework/openai/openai.py`): tools needing approval or carrying tool guardrails (input or
   output) are not offered, since this runner calls the tool directly and would skip them. A handoff is refused by
   `on_handoff` raising.
-- **Google ADK specifics** (`framework/adk/adk.py`): every tool call runs between the calling agent's
-  `before/on_error/after_tool_callback`, mirroring ADK's order, so a callback can refuse
-  `transfer_to_agent`; plugins do not run. A transfer seeds the new socket with the call's history,
-  each agent's turn presented through ADK's `_present_other_agent_message`. The starting agent's static
-  `run_config` run option sets `realtime_input_config` and transcription on every socket (a run-options
-  factory is not called). A dropped, closed or stalled socket is replaced with the same agent by
-  replaying the history plus a one-time note (never kept in the history); input is held while no
-  socket is open; repeated quick drops give up as `error`. Gemini's native session resumption is not
-  used (a follow-up).
+- **Google ADK specifics** (`framework/adk/adk.py`): each call runs on ADK's own live engine,
+  `Runner.run_live`, with a `LiveRequestQueue` and an in-memory ADK session of the connection's own (needs
+  `google-adk>=2.7.0`: earlier 2.x releases end the run on a refused `transfer_to_agent`). ADK runs the tools with their
+  plugins and the agent's `before/on_error/after_tool_callback` (so a callback can refuse `transfer_to_agent`), performs
+  transfers (a new socket for the new agent, after its ~1 s `DEFAULT_TRANSFER_AGENT_DELAY`), gives each new socket the
+  conversation from its session (teammates' turns as quoted context, an agent's own as its own), and resumes a dropped
+  socket when it holds a session resumption handle. AK adds: the `_ToolScope` plugin, first among the call's plugins,
+  which opens the pool's tool scope and logs each call and result; the mapping of ADK's events to the pool's callback
+  (`agent_changed` on a result carrying the transfer action); and restarting a run that ended, failed or stalled
+  (`STALL_SECONDS`, never while a tool runs) on the same ADK session with a one-time note, reporting `reconnected` only
+  on the restarted run's first event, and giving up after `QUICK_DROP_SECONDS` drops in a row. The starting agent's
+  static `run_config` and `RUNNER_CONSTRUCTOR_OPTIONS` (`plugins`, services) reach the call (a run-options factory is
+  not called); each agent's voice comes from its model (`Gemini(model=..., speech_config=...)`). ADK reads nothing from
+  the socket while its tools run.
 - **LiveKit** (`integration/livekit/adapter.py`, alias `agentkernel.livekit`): each agent of the team is
   its own room participant, `ak.active` marks the speaker; `participant_token(identity, ...)` signs
   tokens for the application's users with the gateway's own key.
