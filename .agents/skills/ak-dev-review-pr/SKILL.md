@@ -156,6 +156,7 @@ Evaluate the delta on each dimension. For each finding, record: file, line (in t
 ### 3. Code quality
 
 - Type hints on all function signatures; Pydantic `BaseModel` for data models; `ABC`/`@abstractmethod` for interfaces.
+- Annotations in the modern style from `ak-dev-code-quality`: `list[...]`/`dict[...]`/`X | None` and `collections.abc` imports. New `typing.List`/`Dict`/`Tuple`/`Type`/`Optional`/`Union` (or `typing.Callable`/`Mapping`/...) is a `[nit]`.
 - Logging via `logging.getLogger("ak.<module>")` at appropriate levels — no `print`, no root logger.
 - Formatting consistent with `black`/`isort` config (line length 150 in `ak-py`, 120 in examples).
 - No dead code, commented-out blocks, leftover debug output, or unrelated drive-by changes.
