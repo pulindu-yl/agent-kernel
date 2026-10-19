@@ -3,10 +3,10 @@
 Realtime support for applications in which voice agents and other agents work together: voice agents talk to the
 caller and hand off to each other; a voice agent's tool can ask another registered agent and wait for its answer,
 which returns through the tool call. The design idea: voice is the meeting room, not the engine. The pool gains the
-turn state and an outbox that let application code speak into a call at a quiet moment, hooks that let it watch one,
+turn state and an outbox that let application code speak into a call at a quiet moment, observers that let it watch one,
 and ownership of its tool calls, so a call that ends cancels a tool still waiting; the Gemini adapter gains ADK's tool
 callbacks, authored history, the call's `RunConfig` and connection recovery. On top of these, the building blocks
-such an application otherwise builds itself: facts about a call and an idle event, and gateways opened and closed per
+such an application otherwise builds itself: facts about a call, and gateways opened and closed per
 session. AK provides the mechanism; the application keeps the policy and the words. The changes were driven by a full
 application kept outside this repository.
 
@@ -61,7 +61,7 @@ flowchart TB
     V -- "async tool, awaited" --> J["Another registered agent<br/>AgentService.run_multi<br/>a session of its own"]
     J -- "result or failure: the tool's reply" --> V
     APP["Application code<br/>policies and wording"] -- "RealtimeCall.post_when_idle" --> V
-    V -. "RealtimeHook events" .-> APP
+    V -. "RealtimeObserver events" .-> APP
 ```
 
 ### ADK tool callbacks in realtime (`GoogleADKRealtimeRunner.execute_tool`)
@@ -92,11 +92,12 @@ flowchart TB
 - `RealtimeCall(session_id)` in `agentkernel.pipeline`: `post_when_idle`, `withdraw`, `connected`, `quiet_for()`, `agent_has_spoken`, `close()`
 - No configuration: thresholds are constants
 
-### Realtime hooks (`RealtimeHook`)
+### Realtime observers (`RealtimeObserver`)
 
-- `RealtimeHook.on_event(session, agent, event)` in `core/hooks.py`, attached with `Module.realtime_hook(agent, hooks)` to the agent a call starts with; handoffs report to the same hooks
+- `RealtimeObserver.on_event(session, agent, event)` in `core/realtime/observer.py`, registered process-wide with `RealtimeCall.observe(observer)` (`unobserve` to stop); each new connection takes the observers registered by then, and handoffs report to them too
+- An observer, not a hook: AK hooks (`PreHook`, `PostHook`) wrap a run and can change or halt it; a call has no run to wrap, and an observer cannot change what is said. Not attached to `Agent`: what is observed is the call, and an attachment on the entry agent alone would be silently ignored on any other
 - `RealtimeEvent.type`: `connected`, `caller_said`, `edge_text`, `agent_said`, `agent_changed`, `reconnected`, `disconnected`
-- In order, off the audio path; a failing hook is logged and the next runs
+- In order, off the audio path; a failing observer is logged and the next runs
 - Optional adapter event `caller_transcript`: Gemini reports it; OpenAI does not enable input transcription and reports none
 
 ### LiveKit tokens and alias
@@ -125,22 +126,19 @@ flowchart TB
   - It runs on the pool's loop, through the existing tool path (the framework's tool builder, the adapter's `execute_tool`, the call's session and `Agent._activate()`); an SDK's async client yields the loop while it waits, so other calls' audio keeps its pace; blocking work belongs in `asyncio.to_thread`
   - The nested run uses its own session: the waiting tool holds the call's session lock
 - The connection owns its tool calls: each is a task of the connection, and the connection knows which are still running
-- While a tool call runs, the call is busy (`is_responding`): no post is said and no `idle` is reported; on Gemini the stall wait starts again only when the result is sent, so a slow tool is not taken for a stalled socket
+- While a tool call runs, the call is busy (`is_responding`): no post is said and `quiet_for()` is `None`; on Gemini the stall wait starts again only when the result is sent, so a slow tool is not taken for a stalled socket
 - Closing the connection (`RealtimeCall.close()`, an idle or failed-socket eviction, pool shutdown) cancels its running tool calls and waits briefly (`_TOOL_CANCEL_SECONDS`, 2 s) for them to unwind before the adapter disconnects; the cancellation unwinds a nested run and releases its session
 - No result is sent once the connection is closed or its socket failed, whether the tool was cancelled, ignored its cancellation, or finished just then: a late result never reaches a dead socket or the session's next connection
 - A socket the Gemini adapter recovers keeps its existing rule: tools still running are waited for briefly (`LOST_TOOL_WAIT_SECONDS`), a later result is kept in the history, sent to no socket, and the tool is never rerun by AK
 - No time limit, retries or wording in AK: an application bounds its own wait (`asyncio.timeout`)
 
-### Facts about a live call, and an idle event (`RealtimeCall`, `RealtimeHook`)
+### Facts about a live call (`RealtimeCall`)
 
 - `RealtimeCall` reads, `None` without a connection: `last_caller_input_at` (the caller last spoke, or edge text arrived), `last_agent_change_at`, `last_tool_result_at`
-- `RealtimeEvent.type` gains `idle`, with `quiet_for` (seconds)
-  - Given only to a hook that sets `idle_after_seconds`, once the call has been quiet that long (the outbox's notion of quiet)
-  - Each time another `idle_after_seconds` of the same quiet stretch passes (at `n`, `2n`, `3n` seconds), so a policy can wait longer than the threshold without a thread; anything that ends the quiet (caller input, model output, an agent change, a tool result, a post said) starts the count over
-  - Delivered through the hook's existing queue: in order with the other events, never two at once, a failure logged; one whose stretch ended before its hook's turn is dropped
 - A handover ends a quiet stretch, as caller input and model output do
 - `post_when_idle(..., while_quiet=True)`: for the quiet stretch it is made in: not queued unless the call is quiet, and dropped once that stretch ends (anything happens, or a new connection takes over) before it is said
-- AK decides nothing: whether to act on `idle`, and what to say, is the hook's
+- No quiet-call event: an application that acts on a quiet call reads `quiet_for()` from a task of its own on the realtime loop (started by an observer on `connected`, cancelled on `disconnected`), so it needs no thread; a `while_quiet` post guards against a stretch that ended meanwhile
+- AK decides nothing: whether to act on a quiet call, and what to say, is the application's
 
 ### Gateways per session (`GatewayRunner.stop`)
 
@@ -157,27 +155,26 @@ flowchart TB
 - **No new configuration fields.** Reason each candidate was rejected:
   - Turn detection, languages: ADK's `RunConfig` already holds them, carried by `Module.run_options`
   - Post timing, reconnect and stall thresholds: values settled in live runs, kept as constants rather than knobs nobody has asked to tune
-  - The idle threshold: per hook (`idle_after_seconds`), since two hooks may want different ones
-  - The tool-cancel wait: a constant, at the scale of the hook drain (2 s); a tool's own time limit is the application's
+  - The tool-cancel wait: a constant, at the scale of the observer drain (2 s); a tool's own time limit is the application's
 - No new extra; existing YAML and `AK_*` env vars stay valid
 
 ### Example (`examples/api/livekit-voice/google/handoffs/`)
 
-- The existing handoffs example gains: a `before_tool_callback` that refuses a handoff to a specialist until the caller's account is verified, a technician booking whose tool waits for the dispatch system's confirmation, and a `RealtimeHook` that logs the call
+- The existing handoffs example gains: a `before_tool_callback` that refuses a handoff to a specialist until the caller's account is verified, a technician booking whose tool waits for the dispatch system's confirmation, and a `RealtimeObserver` that logs the call
 - `book_technician` is an `async` tool that awaits the confirmation and returns it, instead of starting a thread; a second booking for the same account is refused while one is under way
 - Offline tests; the example runs them in the CI e2e matrix
 
 ### Tests
 
 - Offline, against scripted sockets: `ak-py/tests/test_realtime_pool.py`, `test_module.py`, `test_livekit_gateway.py`, `test_ecs_akagentrunner_realtime.py`; the example's `server_test.py`
-- New: `test_integration_gateway_runner.py` cases for `stop()`; `TestRealtimeAwaitedTools` in `test_realtime_pool.py`: busy while a tool waits (no post, no `idle`), the result sent once, the call's session and agent back after a nested run, cancellation on close (directly and through `RealtimeCall.close()`) with locks released and nothing sent, nothing sent after a failed socket or by a tool that ignored its cancellation; a Gemini tool slower than the stall wait not taken for a stall
+- New: `test_integration_gateway_runner.py` cases for `stop()`; `TestRealtimeAwaitedTools` in `test_realtime_pool.py`: busy while a tool waits (no post, `quiet_for()` is `None`), the result sent once, the call's session and agent back after a nested run, cancellation on close (directly and through `RealtimeCall.close()`) with locks released and nothing sent, nothing sent after a failed socket or by a tool that ignored its cancellation; a Gemini tool slower than the stall wait not taken for a stall
 - The application drives the awaited path end to end (its voice tools through `GoogleADKToolBuilder`, the Gemini adapter and the connection, its background agents through `AgentService` and the OpenAI Agents SDK against a local stand-in for the Responses API)
 - Live runs on `gemini-3.1-flash-live-preview`, done by the maintainer: handoffs, a forced drop, a call past 10 minutes, and how long callers wait for research and review
 
 ### Documentation and skills
 
 - `docs/docs/integrations/livekit.md`, `hooks.md`; `docs/docs/architecture/realtime-internals.md`
-- Tools that wait, the call facts, the idle event and a room per meeting in `livekit.md` and `realtime-internals.md`
+- Tools that wait, the call facts and a room per meeting in `livekit.md` and `realtime-internals.md`
 - `.agents/skills/ak-dev-architecture/SKILL.md` (a realtime section), `.agents/skills/ak-dev-testing-conventions/SKILL.md`
 - `docs/versioned_docs/` is never edited
 
@@ -185,7 +182,7 @@ flowchart TB
 
 - `RealtimeCall` across processes: it reaches a call only in the process running the realtime pool
 - ADK plugins in realtime; recovery for the OpenAI realtime adapter
-- Detecting a voice turn the model never answers; bounding the replayed history. The `idle` event reports a quiet call; it does not decide that the team is stuck
+- Detecting a voice turn the model never answers; bounding the replayed history.; `quiet_for()` reports a quiet call, it does not decide that the team is stuck
 - An AK gate for tools and handoffs: ADK's tool callbacks and the OpenAI SDK's tool guardrails and `on_handoff` already refuse them, on both paths; a realtime-only AK gate would make the same agent follow different rules in a call and over REST
 - Policies in AK: no handoff limits, retry counts, nudge wording, time limits or refusal rules; an application writes them in its own classes
 - Background work in AK: no job runner, queue or loop of its own; long work is an awaited tool, and work that must outlive its tool call is the application's
@@ -200,14 +197,15 @@ flowchart TB
 
 ## Open questions
 
-- Resolved: one PR (#818) for all of it; the parts depend on each other (posts on recovery, the example on posts and hooks)
+- Resolved: one PR (#818) for all of it; the parts depend on each other (posts on recovery, the example on posts and observers)
 - Resolved: no browser voice edge in this change. AG-UI cannot carry a voice call (no audio events; one HTTP request per turn; the stream path, not the realtime pool), and a browser edge is a new integration that needs its own design: hosting next to `GatewayRunner`, authentication, and the integration checklist. A separate issue if the team wants one
 - Resolved: no native session resumption in this change (Non-goals); recovery replays the conversation with a one-time note
 - Resolved: a late tool result is kept in the history, not sent to the recovered socket (unverified on Gemini 3.x Live)
 - Resolved: tool calls Gemini writes into its words (`transfer_to_agent{...}`) are not stripped in the adapter; edges filter what they show
-- Resolved: the building blocks an application needs (call facts and the idle event, per-session gateways, tool calls the connection owns) ship in this PR, proved by migrating the application that drove them
+- Resolved: the building blocks an application needs (call facts, per-session gateways, tool calls the connection owns) ship in this PR, proved by migrating the application that drove them
 - Resolved (revised): no background jobs. The application's product decision is that the caller may wait while research or review runs, so their result returns through the original tool call. Awaited tools need nothing new from AK beyond the connection owning its tool calls; the job runner, its hosting in both realtime runners, the pool's readiness wait, `BackgroundJobHost` and the job API are removed from this PR. Nothing of it was released
 - Resolved (revised): OpenAI realtime tool input guardrails are out of this PR, to keep it to what the application depends on; a tool with any tool guardrail stays unoffered, as before
 - Resolved: no failed-reply type and no agent tool in this PR (Non-goals): a check on the reply alone cannot tell an error from an answer, so failure is detected during the run, natively, by the application's own code
-- Resolved: the idle signal is a `RealtimeHook` event, not a new callback, so it inherits the hooks' ordering, isolation and attachment
+- Resolved (revised): no idle event. It made the observer a per-hook timer in AK (thresholds, per-stretch counts, stale-event drops) for one application's nudge; `RealtimeCall.quiet_for()` and `while_quiet` posts already give an application all it needs, polled from a task on the realtime loop
+- Resolved (revised): `RealtimeObserver`, registered with `RealtimeCall.observe`, replaces `RealtimeHook` / `Module.realtime_hook` / `Agent.realtime_hooks`: it is read-only, so not one of AK's hooks, and it observes the call, not an agent
 - Resolved (revised): the pool stays in `pipeline/realtime_pool.py`, the path released in agentkernel 0.9.5, so its imports, singleton and patch targets are unchanged; no `pipeline/realtime/` package. `core/realtime/` and `integration/adapter/` are unchanged

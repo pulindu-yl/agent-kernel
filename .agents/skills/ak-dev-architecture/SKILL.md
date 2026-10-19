@@ -11,7 +11,7 @@ description: >
   threads (the integration/thread package), secret resolution (agentkernel.secret: SecretManager,
   SecretProvider, env/aws_ssm), messaging integrations (the integration/adapter
   seam: InboundAdapter/OutboundAdapter, WebhookRESTRequestHandler, PollerRunner), realtime voice
-  (RealtimeConnectionPool, the RealtimeRunner adapters, RealtimeCall, RealtimeHook, tool calls that wait, GatewayRunner.stop, the LiveKit gateway),
+  (RealtimeConnectionPool, the RealtimeRunner adapters, RealtimeCall, RealtimeObserver, tool calls that wait, GatewayRunner.stop, the LiveKit gateway),
   the adapter pattern, the queue execution pipeline
   (agentkernel.pipeline: QueueMessage/QueueTransport/ConsumerLoop, the in_memory transport,
   AgentRunner/ResponseHandler/RequestHandler/IOHandler, the RESTAPI.run delegation rule, and the
@@ -616,7 +616,7 @@ Caller <-> LiveKitEdgeGateway (StatefulEdgeAdapter, hosted by GatewayRunner via 
   its own. The realtime path loads the AK session once per connection and never stores it.
 - **Tool calls that wait** (#810): a tool call is a task of its connection (`RealtimeConnection._tool_tasks`); an
   `async` tool may await long work (another agent's `AgentService.run_multi`, which yields the pool's loop) and
-  return its result through the original call. While it runs the call is `is_responding` (no posts, no `idle`),
+  return its result through the original call. While it runs the call is `is_responding` (no posts, `quiet_for()` is `None`),
   and ADK's stall wait restarts only when the result is sent. `RealtimeConnection.close()` (application close,
   eviction, shutdown) cancels the tool tasks, waits `_TOOL_CANCEL_SECONDS` (2 s) for them to unwind, and a result
   that comes once the connection is `closed` (closed or socket failed) is never sent. No AK time limit, retries or
@@ -638,19 +638,21 @@ Caller <-> LiveKitEdgeGateway (StatefulEdgeAdapter, hosted by GatewayRunner via 
   the session's `RealtimeOutbox` (nobody talking, no reply owed, quiet for `QUIET_SECONDS`); `withdraw`,
   `connected`, `quiet_for()`, `agent_has_spoken`, the times `last_caller_input_at` / `last_agent_change_at` /
   `last_tool_result_at`, `close()`. `post_when_idle(..., while_quiet=True)` ties a post to the current quiet
-  stretch (`RealtimeOutbox.quiet_since`, which a handover also ends): refused when the call is not quiet, dropped
-  once the stretch changes (a new connection included); a stale `idle` is dropped before its hook runs. In-process only: it reaches a call only in the process running the pool.
+  stretch (`RealtimeOutbox._quiet_since`, which a handover also ends): refused when the call is not quiet, dropped
+  once the stretch changes (a new connection included). `RealtimeCall.observe(observer)` / `unobserve` register
+  process-wide realtime observers. In-process only: it reaches a call only in the process running the pool.
 - **Module layout** (#810): `pipeline/realtime_pool.py` (the pool, `RealtimeConnection`, `RealtimeOutbox`,
   `RealtimeCall`), the path agentkernel 0.9.5 shipped, so its imports and patch targets (`_SHUTDOWN_GRACE_SECONDS`,
   ...) are unchanged; `core/realtime/` keeps the adapter contracts and audio primitives, `integration/adapter/` the
   gateways. The public path for `RealtimeCall` is `agentkernel.pipeline` (lazy export into `realtime_pool`). Logger:
   `ak.pipeline.realtime_pool`.
-- **`RealtimeHook` / `RealtimeEvent`** (`core/hooks.py`, #810): observe a call (`connected`, `caller_said`,
-  `edge_text`, `agent_said`, `agent_changed`, `reconnected`, `disconnected`, `idle`); attached with
-  `Module.realtime_hook(agent, hooks)` to the agent a call starts with; one queue and task per
-  connection, off the audio path; a failing hook is logged. `idle` goes only to a hook setting
-  `idle_after_seconds`, at `n`, `2n`, ... seconds of one quiet stretch (keyed by `RealtimeOutbox.quiet_since`), through the same queue as
-  `(event, only)`.
+- **`RealtimeObserver` / `RealtimeEvent`** (`core/realtime/observer.py`, #810): watch calls, read-only (`connected`,
+  `caller_said`, `edge_text`, `agent_said`, `agent_changed`, `reconnected`, `disconnected`); not a hook, since
+  AK hooks can change or halt a run and an observer cannot. Registered process-wide with `RealtimeCall.observe`
+  (`RealtimeConnectionPool._observers`, a class attribute), not on `Agent`: what is observed is the call, and each
+  new connection takes the list as it is then. One queue and task per connection, off the audio path; a failing
+  observer is logged. No quiet-call event: an application polls `RealtimeCall.quiet_for()` from a task it starts on
+  `connected`.
 - **OpenAI specifics** (`framework/openai/openai.py`): tools needing approval or carrying tool guardrails (input or
   output) are not offered, since this runner calls the tool directly and would skip them. A handoff is refused by
   `on_handoff` raising.

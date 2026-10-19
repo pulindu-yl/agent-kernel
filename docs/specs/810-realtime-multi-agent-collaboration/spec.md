@@ -1,7 +1,7 @@
 # #810: Realtime multi-agent collaboration — Implementation Spec
 
 Implements the requirements in [`design.md`](design.md). The realtime pool keeps each call's turn state, says
-application posts at quiet moments through `RealtimeOutbox` / `RealtimeCall`, and feeds `RealtimeHook`s. The Gemini
+application posts at quiet moments through `RealtimeOutbox` / `RealtimeCall`, and feeds `RealtimeObserver`s. The Gemini
 adapter runs ADK's tool callbacks, seeds transfers with authored history, applies the call's `RunConfig`, and recovers
 lost sockets by replaying the conversation. A connection owns its tool calls, so a tool that awaits long work (another
 agent's run) is cancelled with its call. The LiveKit gateway signs participant tokens. The idea: voice is the meeting
@@ -46,10 +46,10 @@ Each item was checked against `develop` at `4c78c482`, the branch at `58015003`,
 ak-py/src/agentkernel/
 ├── livekit.py                 # NEW: public alias of integration.livekit
 ├── core/
-│   ├── hooks.py               # RealtimeEvent, RealtimeHook
-│   ├── base.py                # Agent.realtime_hooks
-│   ├── module.py              # Module.realtime_hook
-│   └── realtime/runner.py     # reports_speech_stopped; the new adapter events
+│   ├── __init__.py            # exports RealtimeEvent, RealtimeObserver
+│   └── realtime/
+│       ├── observer.py        # NEW: RealtimeEvent, RealtimeObserver
+│       └── runner.py          # reports_speech_stopped; the new adapter events
 ├── framework/
 │   ├── adk/adk.py             # GoogleADKRealtimeRunner; the ADK tool wrapper
 │   └── openai/openai.py       # speech_stopped
@@ -57,7 +57,7 @@ ak-py/src/agentkernel/
 │   └── livekit/adapter.py     # participant_token
 └── pipeline/
     ├── __init__.py            # exports RealtimeCall
-    └── realtime_pool.py       # turn state, RealtimeOutbox, RealtimeCall, hooks, recovery readiness, sweep
+    └── realtime_pool.py       # turn state, RealtimeOutbox, RealtimeCall, observers, recovery readiness, sweep
 ```
 
 ### Core contracts (`core/`)
@@ -71,12 +71,15 @@ class RealtimeEvent(BaseModel):
     interrupted: bool = False
     at: float = Field(default_factory=time.time)
 
-class RealtimeHook(ABC):
+class RealtimeObserver(ABC):
     async def on_event(self, session: Session, agent: Agent, event: RealtimeEvent) -> None: ...
     def name(self) -> str: ...
 
-class Module:
-    def realtime_hook(self, agent: Any, hooks: list[RealtimeHook]) -> Self: ...   # chains like pre_hook / post_hook
+class RealtimeCall:   # pipeline/realtime_pool.py
+    @staticmethod
+    def observe(observer: RealtimeObserver) -> None: ...     # process-wide; each new connection takes the list
+    @staticmethod
+    def unobserve(observer: RealtimeObserver) -> None: ...
 
 class RealtimeRunner:
     reports_speech_stopped: bool = False   # True only where the model signals the end of the caller's speech
@@ -84,14 +87,14 @@ class RealtimeRunner:
 
 Rules:
 
-1. `core/hooks.py` imports nothing outside `core/` and pydantic.
+1. `core/realtime/observer.py` imports nothing outside `core/` and pydantic; `core/hooks.py`, `Agent` and `Module` are unchanged.
 2. The adapter callback contract (`RealtimeRunner` docstring) gains, none reaching the edge:
    - `speech_heard {}`: the caller is still speaking;
    - `speech_stopped {}`: the caller stopped; only from an adapter with `reports_speech_stopped`;
    - `caller_transcript {"text"}`: optional, the caller's words in one turn;
    - `reconnected {"agent", "seconds", "seeded"}`: the socket was replaced, with `seeded` true when the conversation was replayed;
    - `done` with status `reconnecting`: the turn under way ended because the socket was lost.
-3. `Agent.realtime_hooks` is a list on the wrapped agent, like `pre_hooks`.
+3. Observers live on the pool class (`RealtimeConnectionPool._observers`), not on `Agent`: a call is observed, not an agent, and the list can be filled before the pool starts. `get_or_create` passes it to each new `RealtimeConnection(..., observers=)`.
 4. `set()` / `reset()` are unchanged for their callers, which activate once per run.
 
 ### ADK realtime runner (`GoogleADKRealtimeRunner`)
@@ -178,7 +181,7 @@ Rules:
 | `done` with status `reconnecting` | recovering |
 | `reconnected` | not recovering; when `seeded`, `last_reconnect_at` |
 | a tool call / its result sent | `_tools_in_flight` up / down; `last_tool_result_at` |
-| `send_text(text, from_edge=True)` | `last_edge_text_at`; an `edge_text` hook event |
+| `send_text(text, from_edge=True)` | `last_edge_text_at`; an `edge_text` observer event |
 
 - `is_responding`: queued output, a tool in flight, or a response open with model output in the last `_UNFINISHED_RESPONSE_SECONDS` (15 s)
 - `is_ready`: connected, not closed, not recovering
@@ -213,11 +216,11 @@ Rule: every write to the outbox's state (`_pending`, `_connection`, `_last_post_
 | `agent_has_spoken -> bool \| None` | as on the connection | `None` |
 | `close() -> bool` | pops the connection and its outbox, closes it on the loop | `False` |
 
-#### Hooks
+#### Observers
 
-- An agent with `realtime_hooks` gets an `asyncio.Queue` and one task per connection; `_observe` puts on the loop, `_observe_soon` from other threads
+- A connection with observers gets an `asyncio.Queue` and one task; `_observe` puts on the loop, `_observe_soon` from other threads
 - Sources: `connect()` (`connected`); the pacing loop (`agent_changed`, `agent_said` at `done`, `interrupt` or a change); `caller_transcript` (`caller_said`); `send_text(from_edge=True)` (`edge_text`); `reconnected`; `close()` or a failure (`disconnected`, once)
-- On close, the hooks get `_HOOK_DRAIN_SECONDS` (2 s), then the task is cancelled
+- On close, the observers get `_OBSERVER_DRAIN_SECONDS` (2 s), then the task is cancelled
 
 #### Sweep and loop lag
 
@@ -239,7 +242,7 @@ Rule: every write to the outbox's state (`_pending`, `_connection`, `_last_post_
 
 | File | Change |
 |---|---|
-| `server.py` | `verify_account(account_id, tool_context)`, a supervisor tool, keeps a verified account in the ADK tool state, which lasts for the call across transfers; `require_account`, the supervisor's `before_tool_callback`, answers in place of `transfer_to_agent` to `billing` or `tech_support` until an account is verified; `book_technician`, an `async` tool, waits for the dispatch system and answers with the confirmation (Application building blocks, Example); a `CallLog(RealtimeHook)` logging `caller_said`, `agent_said`, `agent_changed` and `reconnected`, attached with `Module.realtime_hook(supervisor, ...)`; the gateway is built under `__main__` |
+| `server.py` | `verify_account(account_id, tool_context)`, a supervisor tool, keeps a verified account in the ADK tool state, which lasts for the call across transfers; `require_account`, the supervisor's `before_tool_callback`, answers in place of `transfer_to_agent` to `billing` or `tech_support` until an account is verified; `book_technician`, an `async` tool, waits for the dispatch system and answers with the confirmation (Application building blocks, Example); a `CallLog(RealtimeObserver)` logging `caller_said`, `agent_said`, `agent_changed` and `reconnected`, registered with `RealtimeCall.observe` under `__main__`, where the gateway is built |
 | `server_test.py` (new) | Offline tests (Testing) |
 | `README.md` | Refusing a handoff, a tool that waits, the call log, the walkthrough, tests; the transfer gap now holds the caller's words |
 
@@ -260,10 +263,9 @@ does for the current agent. `Runtime._current` is class-level (`core/runtime.py:
 ```
 ak-py/src/agentkernel/
 ├── core/
-│   └── hooks.py                 # RealtimeEvent "idle" + quiet_for; RealtimeHook.idle_after_seconds
 ├── integration/adapter/gateway.py  # GatewayRunner.stop
 └── pipeline/
-    ├── realtime_pool.py         # RealtimeCall facts; tool calls the connection owns; idle; while_quiet
+    ├── realtime_pool.py         # RealtimeCall facts; tool calls the connection owns; while_quiet
     └── __init__.py              # RealtimeCall's lazy export points at realtime_pool
 ```
 
@@ -291,7 +293,7 @@ Rules:
 1. **Owned.** `handle_framework_event("tool_call", ...)` creates `_execute_tool_and_reply` as a task of the
    connection, adds it to `_tool_tasks`, and removes it when it is done (`add_done_callback(discard)`).
 2. **Busy.** A running tool call counts toward `_tools_in_flight`, so `is_responding` is true: the outbox says no post
-   and `_report_idle` reports no `idle`. Unchanged; a tool that awaits long work makes it last.
+   and `quiet_for()` is `None`. Unchanged; a tool that awaits long work makes it last.
 3. **Closing.** `close()` sets `closed` and, the first time, stops pacing, then `_cancel_tools()`: cancel every
    running tool task except the current task (a tool that closes its own call), `asyncio.wait` them up to
    `_TOOL_CANCEL_SECONDS` (a warning for those still running), then `adapter.disconnect()`. The cancellation reaches
@@ -307,16 +309,9 @@ Rules:
    again.
 6. **Nothing else.** No time limit, no retry, no queue: the tool's own code bounds its wait.
 
-#### Call facts, the idle event and `while_quiet` posts (`pipeline/realtime_pool.py`, `core/hooks.py`)
+#### Call facts and `while_quiet` posts (`pipeline/realtime_pool.py`)
 
 ```python
-class RealtimeEvent(BaseModel):
-    type: Literal[..., "idle"]
-    quiet_for: Optional[float] = None               # idle only
-
-class RealtimeHook(ABC):
-    idle_after_seconds: Optional[float] = None      # set to receive "idle"
-
 class RealtimeCall:
     last_caller_input_at: Optional[float]           # max(last_caller_speech_at, last_edge_text_at)
     last_agent_change_at: Optional[float]
@@ -328,20 +323,15 @@ class RealtimeCall:
 Rules:
 
 1. The facts read the session's open connection (`closed` false), ready or recovering; `None` without one.
-2. `RealtimeOutbox.quiet_since(connection, now)`: the newest of the times `_quiet_for` takes, or `None` when busy;
-   `quiet_for` is `now - quiet_since`.
-3. Every `_POST_POLL_SECONDS`, after the posts, `_report_idle(now)`: for each ready connection whose agent has a hook with
-   `idle_after_seconds` (`n`), `since = quiet_since`; for each such hook, keep `(since, told)`, `told` reset to 0 for a
-   new `since`; when `now - since >= n * (told + 1)`, count one more and queue `idle` for that hook alone. So a hook is
-   told at `n`, `2n`, `3n` seconds of one stretch, never twice for the same `n`. A threshold of 0 or less asks for nothing.
-4. The hook queue holds `(event, only, stretch)`; `only` and `stretch` are `None` for every other event. `_serve_hooks`
-   drops an `idle` whose `stretch` is no longer the outbox's `quiet_since`, and gives an event to `only` when set, else
-   to every hook.
-5. `quiet_since` takes `last_agent_change_at` with the other times: a handover ends a quiet stretch.
-6. `while_quiet`: `add` takes the session's ready connection and records `stretch = quiet_since`; with no connection or
+2. `RealtimeOutbox._quiet_since(connection, now)` (under the outbox lock): the newest of the times `_quiet_for` takes,
+   or `None` when busy; `quiet_for` is `now - _quiet_since`.
+3. No quiet-call event: an application polls `RealtimeCall.quiet_for()` (from a task on the realtime loop that an
+   observer starts on `connected` and cancels on `disconnected`).
+4. `_quiet_since` takes `last_agent_change_at` with the other times: a handover ends a quiet stretch.
+5. `while_quiet`: `add` takes the session's ready connection and records `stretch = _quiet_since`; with no connection or
    a busy call it queues nothing and returns `False`. `take` drops (info log) each `while_quiet` post whose `stretch`
-   is not the current `quiet_since`, which a new connection also changes (its `connected_at`).
-7. `GatewayRunner` unregisters with `StatefulEdgeRegistry.unregister(session_id, adapter=...)`, which removes the
+   is not the current `_quiet_since`, which a new connection also changes (its `connected_at`).
+6. `GatewayRunner` unregisters with `StatefulEdgeRegistry.unregister(session_id, adapter=...)`, which removes the
    entry only while it is that adapter.
 
 #### Gateways (`integration/adapter/gateway.py`)
@@ -387,7 +377,7 @@ Rules:
 7. The pool's loop wakes every 0.25 s instead of 0.5 s; the idle sweep still runs every 5 s and now also closes failed connections.
 8. LiveKit agent tokens are signed through `_sign`, with the same claims.
 9. Closing a realtime connection cancels its running tool calls, and a result that comes once it is closed or its socket failed is not sent. Before, such a tool ran on with the session lock, and its result went to the disconnected adapter. Intentional.
-10. Realtime hooks receive the queue as `(event, only)` internally; a hook without `idle_after_seconds` sees exactly the events it saw before.
+10. No `Module.realtime_hook` / `Agent.realtime_hooks`: observers are registered with `RealtimeCall.observe`. Nothing of the hook API was released.
 
 **Non-changes:** the reply models and every adapter's error reply; the existing `RealtimeCall` members; `GatewayRunner.start()` for a runner never stopped; `IOHandler.run(gateways=...)`; the stream event union and `AgentChanged`'s fields; queue message formats; OpenAI handoffs and the
 LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the extras; other examples' behaviour.
@@ -396,14 +386,14 @@ LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the
 
 | Condition | Where | Surfaces as |
 |---|---|---|
-| Socket drops, server closes, stall | `GoogleADKRealtimeRunner._recover` | `done {"status": "reconnecting"}`, then `reconnected`; hooks get `reconnected` |
+| Socket drops, server closes, stall | `GoogleADKRealtimeRunner._recover` | `done {"status": "reconnecting"}`, then `reconnected`; observers get `reconnected` |
 | Every reconnect attempt fails | `_recover` | `error` → the pool fails the connection; the edge gets an error chunk |
 | Quick drops `RECONNECT_ATTEMPTS` times in a row | `_recover` | `error` ("keeps dropping") |
 | A transfer's socket does not open in 15 s | `_transfer` | `error`, as before |
 | A tool raises with no error callback answering | `_run_tool` → the pool | `Error: ...` as the tool result, as before |
 | A tool result arrives for a lost socket | `send_tool_result` | recorded in the history; info log |
-| A realtime hook raises | `_serve_hooks` | logged; the next hook runs |
-| A hook is still busy at close | `_finish_hooks` | warning after 2 s; its task cancelled |
+| A realtime observer raises | `_serve_observers` | logged; the next observer runs |
+| An observer is still busy at close | `_finish_observers` | warning after 2 s; its task cancelled |
 | `post_when_idle` with no pool in the process | `RealtimeCall` | warning; the post is dropped |
 | A full outbox / an expired post | `RealtimeOutbox` | the oldest dropped with a warning / dropped with an info log |
 | `participant_token` misuse | `LiveKitEdgeGateway` | `ValueError` |
@@ -423,14 +413,14 @@ LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the
 - `TestADKRealtimeRecovery`: replay with the right note; the note absent from the next seed; held audio and text; quick drops give up; every attempt failing fails; a late tool result in the next seed; stalls (a caller transcription keeps the wait; a response that stops mid-way recovers; an answering socket does not)
 - `TestRealtimeOutbox`: quiet, busy, unready and recovering calls; owed replies, a seeded reconnect included; keys, withdrawal, expiry, overflow; a new connection
 - `TestRealtimeCall`: posts with and without a call; `quiet_for`, `agent_has_spoken`; no pool; `close()` with and without a pool
-- `TestRealtimeHooks`: events from connect to close, `reconnected` included; a failing hook; edge text from another thread; no hooks, no queue
+- `TestRealtimeObservers`: events from connect to close, `reconnected` included; a failing observer; edge text from another thread; no observers, no queue; observers registered with `RealtimeCall.observe` reach the connections made after
 - The pool: the sweep closes a failed connection without further input; the loop-lag warning
 - `TestADKFirstAudioLog`: the wait logged once per turn
 
 ### New in `ak-py/tests/test_realtime_pool.py`
 
 - `TestRealtimeAwaitedTools`: a tool awaiting a nested run in a session of its own keeps the call busy (no post said,
-  no `idle`), its result is sent once and the call's session and agent are current again after it; closing the
+  `quiet_for()` is `None`), its result is sent once and the call's session and agent are current again after it; closing the
   connection, directly or through `RealtimeCall.close()`, cancels it, releases both sessions' locks, leaves no task and
   sends nothing; a tool that ignores its cancellation still sends nothing; a result after a failed socket is not sent
 - `TestADKRealtimeRecovery`: a tool slower than `STALL_SECONDS` is not taken for a stall, and its result is answered
@@ -438,19 +428,18 @@ LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the
 
 ### Changed: other files
 
-- `test_module.py`: `realtime_hook` attaches to the wrapped agent and chains
 - `test_livekit_gateway.py`: participant tokens (room, grants, refusals, no key); the alias
 - `test_ecs_akagentrunner_realtime.py`: `send_text(..., from_edge=True)`
-- `test_realtime_pool.py`: `TestRealtimeCallFacts` (each fact; `None` without a connection; read while recovering); `TestRealtimeIdle` (at each multiple of the threshold while quiet, started over by activity, a hook's own threshold, only to hooks that ask, in order with other events); `TestRealtimeOutbox` (`while_quiet` dropped by activity, said when quiet); `TestOpenAIRealtimeToolGuards` unchanged (approval and any tool guardrail excluded)
+- `test_realtime_pool.py`: `TestRealtimeCallFacts` (each fact; `None` without a connection; read while recovering); `TestRealtimeOutbox` (`while_quiet` dropped by activity, said when quiet); `TestOpenAIRealtimeToolGuards` unchanged (approval and any tool guardrail excluded)
 - `test_integration_gateway_runner.py`: `stop()` from another thread, before `start()`, and its wait; a failed start leaving nothing registered, a slowly leaving gateway not unregistering its replacement
-- Lifecycle cases (`test_realtime_pool.py`): a stale `idle` dropped, a `while_quiet` post refused when busy and dropped on a new connection or a handover
+- Lifecycle cases (`test_realtime_pool.py`): a `while_quiet` post refused when busy and dropped on a new connection or a handover
 
 ### New: `examples/api/livekit-voice/google/handoffs/server_test.py`
 
 - `require_account` answers in place of a transfer to a specialist until the account is verified, then lets it through; other tools and other transfers pass
 - `verify_account` records a verified account in the tool state and refuses a malformed one
 - `book_technician` answers with the confirmation once the dispatch system's wait ends, and refuses a second booking for the account made at the same time
-- `require_account` is the supervisor's callback, and `CallLog` its realtime hook; `CallLog` logs both sides of the call
+- `require_account` is the supervisor's callback; `CallLog`, a realtime observer, logs both sides of the call
 
 ### Live check
 
@@ -469,11 +458,11 @@ cd examples/api/livekit-voice/google/handoffs && ./build.sh local && uv run pyte
 
 ## Migration surface (docs and skills)
 
-- `docs/docs/integrations/livekit.md`: tool callbacks and refusing a handoff, "Tokens for your users", "Talking into a live call", "Watching a live call"; new sections on the call's Live settings (`run_config`) and on recovery; the limitation at `:285` (pre- and post-hooks do not run on realtime turns, realtime hooks do) and at `:288` (a Gemini socket failure no longer restarts the call)
-- `docs/docs/integrations/hooks.md`: `RealtimeHook`, its `idle` event
+- `docs/docs/integrations/livekit.md`: tool callbacks and refusing a handoff, "Tokens for your users", "Talking into a live call", "Watching a live call"; new sections on the call's Live settings (`run_config`) and on recovery; the limitation at `:285` (pre- and post-hooks do not run on realtime turns; realtime observers see the call) and at `:288` (a Gemini socket failure no longer restarts the call)
+- `docs/docs/integrations/hooks.md`: realtime mode runs no hooks; a pointer to realtime observers
 - `livekit.md`: "Tools that wait for long work" (a separate session, cancellation, detecting a failed run natively), "Rooms per session" (a `GatewayRunner` per room), the call facts and `while_quiet`
-- `realtime-internals.md`: tool calls that wait, the idle event, `while_quiet`
-- `docs/docs/architecture/realtime-internals.md`: the adapter events, turn state as internal to the pool, `RealtimeOutbox`, realtime hooks, tool callbacks, a connection recovery section, the stall limit
+- `realtime-internals.md`: tool calls that wait, `while_quiet`
+- `docs/docs/architecture/realtime-internals.md`: the adapter events, turn state as internal to the pool, `RealtimeOutbox`, realtime observers, tool callbacks, a connection recovery section, the stall limit
 - `core/realtime/runner.py`: the callback contract gains `reconnected` and the `reconnecting` status (Rule 2)
 - `.agents/skills/ak-dev-architecture/SKILL.md`: a realtime section (it has none); `.agents/skills/ak-dev-testing-conventions/SKILL.md`: the `test_realtime_pool.py` row
 - No new integration, so the docs-site landing and features pages are unchanged

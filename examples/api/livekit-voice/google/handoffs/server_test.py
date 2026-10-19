@@ -59,10 +59,8 @@ def test_a_second_booking_for_the_same_account_is_refused_while_the_first_is_con
     assert server.dispatch.booking == set()
 
 
-def test_the_supervisor_carries_the_rule_and_the_call_log():
+def test_the_supervisor_carries_the_rule():
     assert server.supervisor.before_tool_callback is server.require_account
-    [hook] = server.module.get_agent("supervisor").realtime_hooks
-    assert isinstance(hook, server.CallLog)
 
 
 def test_the_call_log_writes_both_sides_of_the_call(caplog):

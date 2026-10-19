@@ -2,11 +2,11 @@ import asyncio
 import logging
 from typing import Any, Optional
 
-from agentkernel import RealtimeEvent, RealtimeHook
+from agentkernel import RealtimeEvent, RealtimeObserver
 from agentkernel.adk import GoogleADKModule, GoogleADKToolBuilder
 from agentkernel.integration.adapter import GatewayRunner
 from agentkernel.livekit import LiveKitEdgeGateway
-from agentkernel.pipeline import IOHandler
+from agentkernel.pipeline import IOHandler, RealtimeCall
 from google.adk.agents import Agent as GoogleAgent
 from google.adk.tools import ToolContext
 from google.genai import types
@@ -100,7 +100,7 @@ def require_account(tool: Any, args: dict[str, Any], tool_context: ToolContext) 
     }
 
 
-class CallLog(RealtimeHook):
+class CallLog(RealtimeObserver):
     """Logs what each side of a call says, and who has it: what an application would store or show."""
 
     async def on_event(self, session: Any, agent: Any, event: RealtimeEvent) -> None:
@@ -159,9 +159,10 @@ supervisor = GoogleAgent(
     generate_content_config=voice("Aoede"),
 )
 
-module = GoogleADKModule([supervisor]).realtime_hook(supervisor, [CallLog()])
+module = GoogleADKModule([supervisor])
 
 
 if __name__ == "__main__":
+    RealtimeCall.observe(CallLog())
     gateway = LiveKitEdgeGateway(session_id="room_01", agent_name="supervisor")
     IOHandler.run(gateways=[GatewayRunner(gateway)])

@@ -25,7 +25,8 @@ from agentkernel.pipeline.transport.in_memory import InMemoryTransport
 
 
 @pytest.fixture(autouse=True)
-def _reset_pipeline_state():
+def _reset_pipeline_state(monkeypatch):
+    monkeypatch.setattr(RealtimeConnectionPool, "_observers", [])
     InMemoryTransport.reset()
     ThreadRunner.shutdown_event.clear()
     yield
@@ -97,8 +98,10 @@ class _Agent(Agent):
         pass
 
 
-def _connection(session_id="s1", agent=None, loop=None):
-    return RealtimeConnection(session_id, agent or _Agent(), Runtime(InMemorySessionStore()), Session(session_id), loop or asyncio.new_event_loop())
+def _connection(session_id="s1", agent=None, loop=None, observers=()):
+    return RealtimeConnection(
+        session_id, agent or _Agent(), Runtime(InMemorySessionStore()), Session(session_id), loop or asyncio.new_event_loop(), observers=observers
+    )
 
 
 def _drain_output(transport):
@@ -173,8 +176,8 @@ class TestRealtimeConnection:
 
 class TestRealtimeAwaitedTools:
     """A tool may await long work, such as another agent's run in a session of its own: the call is busy meanwhile,
-    nothing is posted into it or reported idle, the result goes back through the tool call that asked, and a call
-    closed meanwhile cancels the tool and is sent nothing."""
+    nothing is posted into it, the result goes back through the tool call that asked, and a call closed meanwhile
+    cancels the tool and is sent nothing."""
 
     class _SlowAdapter(_Adapter):
         """``execute_tool`` waits for ``release``, inside a nested run in a session of its own, as a tool asking
@@ -211,9 +214,8 @@ class TestRealtimeAwaitedTools:
         monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
         monkeypatch.setattr(RealtimeConnectionPool, "_instance", None)
 
-    async def _call(self, *hooks):
+    async def _call(self):
         agent = _Agent(realtime_runner_cls=self._SlowAdapter)
-        agent.realtime_hooks.extend(hooks)
         conn = _connection(agent=agent, loop=asyncio.get_running_loop())
         await conn.connect()
         await asyncio.sleep(0.05)  # the pacing loop sends the starting agent on
@@ -228,15 +230,13 @@ class TestRealtimeAwaitedTools:
     async def test_the_call_is_busy_while_the_tool_waits_and_hears_its_result_once(self):
         from agentkernel.pipeline import RealtimeCall
 
-        hook = TestRealtimeIdle._Hook(idle_after_seconds=0.01)
-        pool, conn = await self._call(hook)
+        pool, conn = await self._call()
         RealtimeCall("s1").post_when_idle("[Team update] something else")
 
         assert conn.is_responding and RealtimeCall("s1").quiet_for() is None
-        pool._report_idle(time.time() + 60)
         pool._deliver_posts(time.time() + 60)
         await asyncio.sleep(0.05)
-        assert TestRealtimeIdle._idle(hook) == [] and conn.adapter.texts == []  # no nudge, no post meanwhile
+        assert conn.adapter.texts == []  # no post meanwhile
         assert conn.adapter.tool_results == [] and conn.last_tool_result_at is None
 
         conn.adapter.release.set()
@@ -3830,8 +3830,8 @@ class TestRealtimeCall:
         assert conn.adapter.texts == ["[Team update] J1 finished."]
 
 
-class TestRealtimeHooks:
-    """An agent's realtime hooks see the call: who connected, what each side said, who has the call."""
+class TestRealtimeObservers:
+    """Realtime observers see the call: who connected, what each side said, who has the call."""
 
     class _Recorder:
         def __init__(self, fail=False):
@@ -3840,7 +3840,7 @@ class TestRealtimeHooks:
 
         async def on_event(self, session, agent, event):
             if self.fail:
-                raise RuntimeError("hook broke")
+                raise RuntimeError("observer broke")
             self.events.append((event.type, event.agent, event.text, event.interrupted))
 
         def name(self):
@@ -3851,11 +3851,9 @@ class TestRealtimeHooks:
         monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
 
     @pytest.mark.asyncio
-    async def test_the_hooks_follow_a_call_from_connect_to_close(self):
-        agent = _Agent(name="general")
+    async def test_the_observers_follow_a_call_from_connect_to_close(self):
         recorder = self._Recorder()
-        agent.realtime_hooks.append(recorder)
-        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+        conn = _connection(agent=_Agent(name="general"), loop=asyncio.get_running_loop(), observers=[recorder])
 
         await conn.connect()
         await asyncio.sleep(0.05)
@@ -3887,25 +3885,21 @@ class TestRealtimeHooks:
         ]
 
     @pytest.mark.asyncio
-    async def test_a_failing_hook_is_logged_and_the_next_still_runs(self, caplog):
-        agent = _Agent()
+    async def test_a_failing_observer_is_logged_and_the_next_still_runs(self, caplog):
         recorder = self._Recorder()
-        agent.realtime_hooks.extend([self._Recorder(fail=True), recorder])
-        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+        conn = _connection(loop=asyncio.get_running_loop(), observers=[self._Recorder(fail=True), recorder])
 
         with caplog.at_level(logging.ERROR, logger="ak.pipeline.realtime_pool"):
             await conn.connect()
             await conn.close()
 
         assert [event[0] for event in recorder.events] == ["connected", "disconnected"]
-        assert "Realtime hook _Recorder failed on connected" in caplog.text
+        assert "Realtime observer _Recorder failed on connected" in caplog.text
 
     @pytest.mark.asyncio
     async def test_a_failed_socket_is_reported_disconnected_once(self):
-        agent = _Agent()
         recorder = self._Recorder()
-        agent.realtime_hooks.append(recorder)
-        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+        conn = _connection(loop=asyncio.get_running_loop(), observers=[recorder])
         await conn.connect()
 
         await conn.handle_framework_event("error", {"message": "socket closed"})
@@ -3914,11 +3908,9 @@ class TestRealtimeHooks:
         assert [event[0] for event in recorder.events].count("disconnected") == 1
 
     @pytest.mark.asyncio
-    async def test_text_from_the_edge_on_another_thread_reaches_the_hooks(self):
-        agent = _Agent()
+    async def test_text_from_the_edge_on_another_thread_reaches_the_observers(self):
         recorder = self._Recorder()
-        agent.realtime_hooks.append(recorder)
-        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+        conn = _connection(loop=asyncio.get_running_loop(), observers=[recorder])
         await conn.connect()
 
         typed = threading.Thread(target=lambda: conn.send_text("example.com", from_edge=True))
@@ -3931,27 +3923,47 @@ class TestRealtimeHooks:
         assert ("edge_text", None, "example.com", False) in recorder.events
 
     @pytest.mark.asyncio
-    async def test_an_agent_without_realtime_hooks_queues_nothing(self):
+    async def test_a_call_without_observers_queues_nothing(self):
         conn = _connection(loop=asyncio.get_running_loop())
         await conn.connect()
 
         await conn.handle_framework_event("caller_transcript", {"text": "Hello"})
 
-        assert conn._hook_events is None and conn._hook_task is None
+        assert conn._observer_events is None and conn._observer_task is None
         await conn.close()
 
     @pytest.mark.asyncio
-    async def test_a_reconnect_reaches_the_hooks(self):
-        agent = _Agent()
+    async def test_a_reconnect_reaches_the_observers(self):
         recorder = self._Recorder()
-        agent.realtime_hooks.append(recorder)
-        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
+        conn = _connection(loop=asyncio.get_running_loop(), observers=[recorder])
         await conn.connect()
 
         await conn.handle_framework_event("reconnected", {"agent": "billing", "seconds": 2, "seeded": True})
         await conn.close()
 
         assert ("reconnected", "billing", "", False) in recorder.events
+
+    def test_observers_registered_for_the_process_watch_the_calls_connected_after(self, monkeypatch):
+        from agentkernel.pipeline import RealtimeCall
+
+        monkeypatch.setattr(RealtimeConnectionPool, "_instance", None)
+        recorder, dropped = self._Recorder(), self._Recorder()
+        RealtimeCall.observe(recorder)
+        RealtimeCall.observe(recorder)  # once only
+        RealtimeCall.observe(dropped)
+        RealtimeCall.unobserve(dropped)
+        pool = RealtimeConnectionPool.initialize()
+        thread = threading.Thread(target=pool.start, daemon=True)
+        thread.start()
+        try:
+            conn = pool.get_or_create("s1", _Agent(), Runtime(InMemorySessionStore()), Session("s1"))
+            assert conn._observers == [recorder]
+        finally:
+            ThreadRunner.shutdown_event.set()
+            thread.join(timeout=5)
+
+        kinds = [event[0] for event in recorder.events]
+        assert kinds[0] == "connected" and kinds[-1] == "disconnected" and dropped.events == []
 
 
 class TestADKCallerTranscript:
@@ -4068,7 +4080,7 @@ class TestRealtimeOutboxWhileQuiet:
     def test_a_handover_ends_the_quiet_stretch(self):
         outbox = self._outbox()
 
-        assert outbox.quiet_since(_call_state(last_agent_change_at=119.0), now=120.0) == 119.0
+        assert outbox.quiet_for(_call_state(last_agent_change_at=119.0), now=120.0) == 1.0
 
 
 class TestRealtimeCallFacts:
@@ -4126,145 +4138,3 @@ class TestRealtimeCallFacts:
         conn = types.SimpleNamespace(closed=True, last_caller_speech_at=1.0, last_edge_text_at=None)
         pool._connections["s1"] = conn
         assert call.last_caller_input_at is None
-
-
-class TestRealtimeIdle:
-    """A hook that asks for it is told that the call has gone quiet, each time as long again has passed."""
-
-    class _Hook:
-        def __init__(self, idle_after_seconds=None):
-            self.idle_after_seconds = idle_after_seconds
-            self.events = []
-
-        async def on_event(self, session, agent, event):
-            self.events.append(event)
-
-        def name(self):
-            return "hook"
-
-    @pytest.fixture(autouse=True)
-    def _transport(self, monkeypatch):
-        monkeypatch.setattr(QueueTransportFactory, "create", staticmethod(lambda *a, **k: InMemoryTransport()))
-        monkeypatch.setattr(RealtimeConnectionPool, "_instance", None)
-
-    async def _call(self, *hooks, quiet_for=10.0):
-        agent = _Agent()
-        agent.realtime_hooks.extend(hooks)
-        conn = _connection(agent=agent, loop=asyncio.get_running_loop())
-        await conn.connect()
-        await asyncio.sleep(0.05)  # the pacing loop sends the starting agent on
-        conn._connected_at = time.time() - quiet_for
-        pool = TestRealtimeCall._pool()
-        pool._connections["s1"] = conn
-        return pool, conn
-
-    @staticmethod
-    def _idle(hook):
-        return [event for event in hook.events if event.type == "idle"]
-
-    @pytest.mark.asyncio
-    async def test_a_quiet_call_is_reported_each_time_as_long_again_has_passed(self):
-        hook = self._Hook(idle_after_seconds=5.0)
-        pool, conn = await self._call(hook, quiet_for=7.0)
-
-        pool._report_idle(time.time())
-        pool._report_idle(time.time())  # not twice for the same five seconds
-        await asyncio.sleep(0.05)
-        [idle] = self._idle(hook)
-        assert idle.quiet_for == pytest.approx(7.0, abs=0.5) and idle.agent == "general"
-
-        pool._report_idle(time.time() + 3.5)  # ten seconds into the stretch
-        await asyncio.sleep(0.05)
-        assert len(self._idle(hook)) == 2 and self._idle(hook)[1].quiet_for >= 10.0
-
-        conn._last_model_generated_at = conn._last_model_output_at = time.time() - 6.0  # the model spoke: a new stretch
-        pool._report_idle(time.time())
-        await asyncio.sleep(0.05)
-        assert len(self._idle(hook)) == 3 and round(self._idle(hook)[-1].quiet_for) == 6
-        await conn.close()
-
-    @pytest.mark.asyncio
-    async def test_each_hook_has_its_own_threshold_and_others_see_no_idle(self):
-        soon, late, never = self._Hook(idle_after_seconds=5.0), self._Hook(idle_after_seconds=20.0), self._Hook()
-        pool, conn = await self._call(soon, late, never)
-
-        pool._report_idle(time.time())
-        await asyncio.sleep(0.05)
-
-        assert (len(self._idle(soon)), len(self._idle(late)), len(self._idle(never))) == (1, 0, 0)
-        await conn.close()
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("busy", ["recovering", "responding", "owed"])
-    async def test_a_busy_or_recovering_call_is_not_idle(self, busy):
-        hook = self._Hook(idle_after_seconds=5.0)
-        pool, conn = await self._call(hook)
-        if busy == "recovering":
-            conn._recovering = True
-        elif busy == "responding":
-            conn._tools_in_flight = 1
-        else:
-            conn._last_caller_speech_at = time.time() - 6.0  # the caller spoke and the model has not answered
-
-        pool._report_idle(time.time())
-        await asyncio.sleep(0.05)
-
-        assert self._idle(hook) == []
-        await conn.close()
-
-    @pytest.mark.asyncio
-    async def test_an_idle_event_whose_quiet_ended_before_its_hook_ran_is_dropped(self):
-        """An idle waiting behind a slow hook while the caller speaks again would nudge into a call that moved on."""
-        release = asyncio.Event()
-
-        class Slow:
-            idle_after_seconds = None
-
-            async def on_event(self, session, agent, event):
-                if event.type == "edge_text":
-                    await release.wait()
-
-            def name(self):
-                return "slow"
-
-        hook = self._Hook(idle_after_seconds=5.0)
-        pool, conn = await self._call(Slow(), hook)
-
-        conn._observe("edge_text", text="example.com")  # the slow hook holds the queue on this
-        await asyncio.sleep(0.01)
-        pool._report_idle(time.time())  # queued behind it
-        conn._last_caller_speech_at = time.time()  # the caller speaks before the idle reaches its hook
-        release.set()
-        await asyncio.sleep(0.05)
-
-        assert self._idle(hook) == []
-        await conn.close()
-
-    @pytest.mark.asyncio
-    async def test_a_hooks_while_quiet_answer_to_idle_is_said(self):
-        class Nudge(self._Hook):
-            async def on_event(self, session, agent, event):
-                if event.type == "idle":
-                    from agentkernel.pipeline import RealtimeCall
-
-                    self.queued = RealtimeCall(event.session_id).post_when_idle("Your turn.", while_quiet=True)
-
-        hook = Nudge(idle_after_seconds=5.0)
-        pool, conn = await self._call(hook)
-
-        pool._report_idle(time.time())
-        await asyncio.sleep(0.05)
-        pool._deliver_posts(time.time())
-        await asyncio.sleep(0.01)
-
-        assert hook.queued is True and conn.adapter.texts == ["Your turn."]
-        await conn.close()
-
-    @pytest.mark.asyncio
-    async def test_a_call_whose_hooks_ask_for_nothing_gets_no_outbox(self):
-        pool, conn = await self._call(self._Hook())
-
-        pool._report_idle(time.time())
-
-        assert pool._outboxes == {}
-        await conn.close()

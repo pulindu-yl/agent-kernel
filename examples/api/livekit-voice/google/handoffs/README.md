@@ -28,13 +28,13 @@ Realtime calls run an agent's ADK tool callbacks around every tool call, `transf
 
 ## A tool that waits
 
-`book_technician` is an `async` tool that waits for the dispatch system to confirm the visit (a few seconds, `DISPATCH_SECONDS`) and returns the confirmation as its result, which the agent then tells the caller. The tool waits on the realtime loop without blocking it, so every call's audio keeps playing. While it waits, the call counts as busy: nothing an application posts into the call is said, no `idle` event reaches a hook, and the model is not taken for stalled. The agent may say a short sentence before calling it, but Gemini decides when the call is made, so that sentence is not guaranteed to be heard first. If the call ends meanwhile, Agent Kernel cancels the tool and sends no result.
+`book_technician` is an `async` tool that waits for the dispatch system to confirm the visit (a few seconds, `DISPATCH_SECONDS`) and returns the confirmation as its result, which the agent then tells the caller. The tool waits on the realtime loop without blocking it, so every call's audio keeps playing. While it waits, the call counts as busy: nothing an application posts into the call is said, `RealtimeCall.quiet_for()` is `None`, and the model is not taken for stalled. The agent may say a short sentence before calling it, but Gemini decides when the call is made, so that sentence is not guaranteed to be heard first. If the call ends meanwhile, Agent Kernel cancels the tool and sends no result.
 
 While a booking for an account is with the dispatch system, a second one for the same account (two calls in one model turn) is refused, and the refusal is the tool's answer.
 
 ## Call log
 
-`CallLog`, a `RealtimeHook` attached with `realtime_hook(supervisor, [...])`, logs what the caller and each agent said and who has the call (`[call room_01] caller: ...`, `[call room_01] billing: ...`). It sees the specialists' turns too: hooks attach to the agent a call starts with. An application would store or show these instead of logging them.
+`CallLog`, a `RealtimeObserver` registered with `RealtimeCall.observe(...)` before the gateway starts, logs what the caller and each agent said and who has the call (`[call room_01] caller: ...`, `[call room_01] billing: ...`). It watches every call in the process, handoffs included. An application would store or show these instead of logging them.
 
 ## What you see in the room
 

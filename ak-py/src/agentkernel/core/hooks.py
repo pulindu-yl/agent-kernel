@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Literal, Optional
-
-from pydantic import BaseModel, Field
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .base import Agent, Session
@@ -132,34 +129,4 @@ class PostHook(ABC):
         """
         :return: the name of the posthook.
         """
-        raise NotImplementedError
-
-
-class RealtimeEvent(BaseModel):
-    """Something that happened in a live realtime call (``execution.mode: realtime``), as a ``RealtimeHook`` sees it."""
-
-    type: Literal["connected", "caller_said", "edge_text", "agent_said", "agent_changed", "reconnected", "disconnected", "idle"]
-    session_id: str
-    agent: Optional[str] = None
-    text: str = ""
-    interrupted: bool = False
-    # How long the call had been quiet, for ``idle``; ``None`` on every other event.
-    quiet_for: Optional[float] = None
-    at: float = Field(default_factory=time.time)
-
-
-class RealtimeHook(ABC):
-    """Observes the live realtime calls an agent serves, attached with ``Module.realtime_hook`` to the agent a call starts with."""
-
-    # Seconds of quiet after which this hook is told ``idle``; ``None`` (the default) for no ``idle`` events.
-    idle_after_seconds: Optional[float] = None
-
-    @abstractmethod
-    async def on_event(self, session: "Session", agent: "Agent", event: RealtimeEvent) -> None:
-        """Called for every event of a live call served by the agent the hook is attached to."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def name(self) -> str:
-        """Returns the name of the realtime hook."""
         raise NotImplementedError

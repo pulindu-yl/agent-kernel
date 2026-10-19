@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, List, Self
 
-from ..core.hooks import PostHook, PreHook, RealtimeHook
+from ..core.hooks import PostHook, PreHook
 from .base import Agent, RunOptionsFactory
 from .runtime import Runtime
 
@@ -96,11 +96,6 @@ class Module(ABC):
         :raises ValueError: If the agent is not loaded in this module.
         """
         self._wrapped(agent).post_hooks.extend(hooks)
-        return self
-
-    def realtime_hook(self, agent: Any, hooks: list[RealtimeHook]) -> Self:
-        """Attaches realtime hooks that observe every live call the agent serves, including the agents it hands off to; chained like ``pre_hook``."""
-        self._wrapped(agent).realtime_hooks.extend(hooks)
         return self
 
     def run_options(self, agent: Any, *factory: RunOptionsFactory, **options: Any) -> Self:

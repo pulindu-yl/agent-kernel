@@ -296,7 +296,7 @@ supervisor = GoogleAgent(name="supervisor", model="gemini-3.1-flash-live-preview
 
 ## Talking into a live call
 
-Application code outside a tool call (a realtime hook, a webhook, a timer) can speak into the call with
+Application code outside a tool call (a realtime observer, a webhook, a timer) can speak into the call with
 `RealtimeCall`, in the process that runs the realtime pool (every process of the single-process topology):
 
 ```python
@@ -351,8 +351,8 @@ async def request_research(question: str) -> str:
 - **Sessions**: a realtime tool runs inside the call's AK session and holds its lock until it returns, so the agent
   it asks must run in a session of its own; running it in the call's session would wait on that lock for ever. Tool
   calls the model makes in one turn share the call's session, so they run one after another.
-- **While it waits**: the call counts as busy (`is_responding`). Nothing posted with `post_when_idle` is said and no
-  `idle` event reaches a hook until the result is sent. The caller's audio still reaches the model; what the model
+- **While it waits**: the call counts as busy (`is_responding`). Nothing posted with `post_when_idle` is said and
+  `RealtimeCall.quiet_for()` is `None` until the result is sent. The caller's audio still reaches the model; what the model
   does with it while its tool call is open is the model's own behaviour. Gemini Live is not taken for stalled
   meanwhile: its wait for an answer starts when the result is sent. The model may speak before it calls the tool,
   but the model decides when it makes the call, so that speech is not guaranteed to be heard first.
@@ -373,12 +373,14 @@ Agent Kernel decides no policy here: no retries, no wording, no time limit.
 
 ## Watching a live call
 
-A `RealtimeHook` sees what happens in the calls an agent serves, without reading logs:
+A `RealtimeObserver` sees what happens in the process's realtime calls, without reading logs. It watches; it
+cannot change what is said. Register it before the calls begin:
 
 ```python
-from agentkernel import RealtimeEvent, RealtimeHook
+from agentkernel import RealtimeEvent, RealtimeObserver
+from agentkernel.pipeline import RealtimeCall
 
-class Transcript(RealtimeHook):
+class Transcript(RealtimeObserver):
     async def on_event(self, session, agent, event: RealtimeEvent) -> None:
         if event.type in ("caller_said", "agent_said"):
             print(event.agent or "caller", event.text)
@@ -386,47 +388,35 @@ class Transcript(RealtimeHook):
     def name(self) -> str:
         return "transcript"
 
-GoogleADKModule([pm]).realtime_hook(pm, [Transcript()])
+RealtimeCall.observe(Transcript())
 ```
 
 | Event | When |
 |---|---|
-| `connected` / `disconnected` | The session's model socket opened (on the caller's first input) or closed (idle, failed, shut down) |
+| `connected` / `disconnected` | The session's model connection opened (on the caller's first input) or closed (idle, failed, shut down). A new connection starts at the entry agent and remembers nothing |
 | `caller_said` | The caller's words in one turn, as the model transcribed them. Gemini Live only: the OpenAI adapter does not enable input transcription |
 | `edge_text` | Text the edge sent into the call: what the caller typed, or a prompt the edge sends for them (the gateway's greeting) |
 | `agent_said` | An agent's words in one turn, as they reached the edge; `interrupted` when the caller talked over it |
 | `agent_changed` | The call moved to `event.agent`, and once for the agent it starts with |
-| `reconnected` | The model socket dropped or stopped answering and was replaced, with `event.agent` still on the call (Gemini: reconnected with the conversation, the agent told the line dropped) |
-| `idle` | The call has been quiet for `event.quiet_for` seconds. Only to a hook that sets `idle_after_seconds`, then again each time as long again has passed while the call stays quiet |
+| `reconnected` | Within one connection, the model socket dropped or stopped answering and was replaced, with `event.agent` still on the call (Gemini: reconnected with the conversation, the agent told the line dropped) |
 
-Hooks are attached to the agent a call starts with and see its handoffs' turns too, named in `event.agent`.
-They run one event at a time, in order, on the pool's loop but off the audio path; keep them short. A hook that
-raises is logged, and the next one still runs.
+An observer sees every call the process connects after it is registered (`RealtimeCall.unobserve` stops it for later
+calls), handoffs' turns included, named in `event.agent`; `agent` is the agent the call started with. Observers run
+one event at a time, in order, on the pool's loop but off the audio path; keep them short. One that raises is logged,
+and the next one still runs.
 
-A hook that sets `idle_after_seconds` is told `idle` once the call has been quiet that long, and again each time
-as long again has passed while it stays quiet (`event.quiet_for` says how long); anything that ends the quiet
-starts the count over. It is how an application notices a stalled call without a
-thread of its own; whether to act, and what to say, is the hook's:
-
-```python
-class Nudge(RealtimeHook):
-    idle_after_seconds = 5.0
-
-    async def on_event(self, session, agent, event: RealtimeEvent) -> None:
-        if event.type == "idle" and team_owes_the_next_step(event.session_id):
-            RealtimeCall(event.session_id).post_when_idle("[Team update] Your turn: take the next step.", while_quiet=True)
-
-    def name(self) -> str:
-        return "nudge"
-```
+To act on a call that has gone quiet (nudge a stalled agent, say), read `RealtimeCall.quiet_for()`: an observer can
+start a task on `connected` that checks it every second or so and cancel it on `disconnected`, so the application
+needs no thread of its own. Whether to act, and what to say, is the application's; a
+`post_when_idle(..., while_quiet=True)` post is dropped if anything happens before it is said.
 
 ## Example Projects
 
-Complete working examples (with In-Memory, Kafka, NATS, and AWS SQS architectures) are available in the **examples/api/livekit-voice** directory. The `openai/handoffs` and `google/handoffs` variants show multi-agent handoffs with an internet support line (supervisor, billing and tech support). `google/handoffs` also refuses a handoff until the caller's account is verified (a `before_tool_callback`), books a technician with an `async` tool that waits for the dispatch system's confirmation, and logs the call with a `RealtimeHook`.
+Complete working examples (with In-Memory, Kafka, NATS, and AWS SQS architectures) are available in the **examples/api/livekit-voice** directory. The `openai/handoffs` and `google/handoffs` variants show multi-agent handoffs with an internet support line (supervisor, billing and tech support). `google/handoffs` also refuses a handoff until the caller's account is verified (a `before_tool_callback`), books a technician with an `async` tool that waits for the dispatch system's confirmation, and logs the call with a `RealtimeObserver`.
 
 ## Limitations
 
-- **No guardrails or pre/post hooks on realtime turns**: voice and chat turns go to the model socket directly, not through `Runtime.run()`, so input/output guardrails, pre/post hooks and the multimodal pre-hook do not run. [Realtime hooks](#watching-a-live-call) do: they observe the call, and cannot change what is said.
+- **No guardrails or pre/post hooks on realtime turns**: voice and chat turns go to the model socket directly, not through `Runtime.run()`, so input/output guardrails, pre/post hooks and the multimodal pre-hook do not run. [Realtime observers](#watching-a-live-call) see the call, and cannot change what is said.
 - **Tool limits**: OpenAI tools that need approval or have tool guardrails are not offered in realtime mode (a warning is logged), and ADK toolsets such as MCP are not supported. Plain function tools work on both frameworks.
 - **One room per gateway**: each `LiveKitEdgeGateway` joins one room, and all audio in that room goes to one session; an application that gives each meeting a room hosts one runner per room.
 - **History is held by the model connection**: the conversation lives in the model's own session (for a Google ADK transfer, Agent Kernel replays it into the new agent's socket).

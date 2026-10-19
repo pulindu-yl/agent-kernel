@@ -12,12 +12,12 @@ remains, with research and review in the application as awaited tools.
 
 ## Iteration 1: Core contracts
 
-- **Goal:** realtime hooks and the new adapter events exist in `core/`; nothing uses them yet.
-- **Files:** `ak-py/src/agentkernel/core/hooks.py`, `core/base.py`, `core/module.py`, `core/__init__.py`, `core/realtime/runner.py`
+- **Goal:** realtime observers and the new adapter events exist in `core/`; nothing uses them yet.
+- **Files:** `ak-py/src/agentkernel/core/realtime/observer.py`, `core/realtime/__init__.py`, `core/__init__.py`, `core/realtime/runner.py`
 - **Steps:**
-  1. Add `RealtimeEvent`, `RealtimeHook`, `Agent.realtime_hooks` and `Module.realtime_hook`, per spec.md "Core contracts".
+  1. Add `RealtimeEvent` and `RealtimeObserver`, per spec.md "Core contracts".
   2. Add `RealtimeRunner.reports_speech_stopped` and document every new adapter event in the callback contract, `reconnected` and the `reconnecting` status included (Rule 2).
-- **Verify:** `cd ak-py && uv run pytest tests/test_module.py`.
+- **Verify:** `cd ak-py && uv run pytest tests/test_realtime_pool.py`.
 
 ## Iteration 2: ADK tool callbacks
 
@@ -46,16 +46,16 @@ remains, with research and review in the application as awaited tools.
   2. Read the `run_config` run option at connect and set turn detection and transcription in `_connect_config`, per spec.md "Live settings".
 - **Verify:** `TestADKRealtimeTransfers`, `TestADKConnectConfig`.
 
-## Iteration 5: Talking into a live call and realtime hooks
+## Iteration 5: Talking into a live call and realtime observers
 
-- **Goal:** application code posts into a call at a quiet moment and watches it through hooks.
+- **Goal:** application code posts into a call at a quiet moment and watches it through observers.
 - **Files:** `realtime_pool.py`, `ak-py/src/agentkernel/pipeline/__init__.py`
 - **Steps:**
   1. Add `RealtimeOutbox` and its delivery from the pool's loop, per spec.md "Outbox", with every state write under its lock.
   2. Add the pool's `post_when_idle`, `withdraw`, `close`, `is_connected`, `quiet_for`, `agent_has_spoken`, and `RealtimeCall` over them; export `RealtimeCall`.
-  3. Add the hook queue and task, per spec.md "Hooks".
+  3. Add `RealtimeCall.observe` / `unobserve` and the observer queue and task, per spec.md "Observers".
   4. Add the loop-lag warning, and make the sweep close failed connections, per spec.md "Sweep and loop lag".
-- **Verify:** `TestRealtimeOutbox`, `TestRealtimeCall`, `TestRealtimeHooks`, the sweep and loop-lag tests.
+- **Verify:** `TestRealtimeOutbox`, `TestRealtimeCall`, `TestRealtimeObservers`, the sweep and loop-lag tests.
 
 ## Iteration 6: Connection recovery
 
@@ -111,12 +111,12 @@ remains, with research and review in the application as awaited tools.
 
 Iterations 11 to 16 build spec.md "Application building blocks", in the same PR, each leaving the suite green.
 
-## Iteration 11: Call facts, the idle event and `while_quiet`
+## Iteration 11: Call facts and `while_quiet`
 
-- **Goal:** application code reads the call's facts and gets an `idle` event, with no thread of its own.
-- **Files:** `core/hooks.py`, `pipeline/realtime_pool.py`
-- **Steps:** the facts; `quiet_since`; `_report_idle`; the `(event, only)` hook queue; `while_quiet` (spec.md "Call facts").
-- **Verify:** `TestRealtimeCallFacts`, `TestRealtimeIdle`, `TestRealtimeOutbox`.
+- **Goal:** application code reads the call's facts and acts on a quiet call, with no thread of its own.
+- **Files:** `pipeline/realtime_pool.py`
+- **Steps:** the facts; `_quiet_since`; `while_quiet` (spec.md "Call facts").
+- **Verify:** `TestRealtimeCallFacts`, `TestRealtimeOutbox`, `TestRealtimeOutboxWhileQuiet`.
 
 ## Iteration 12: Tool calls the connection owns
 
@@ -148,5 +148,5 @@ Iterations 11 to 16 build spec.md "Application building blocks", in the same PR,
 
 ## Iteration 16: The application (outside this repository)
 
-- **Goal:** the application that drove the change runs on the building blocks: research and review as awaited voice tools running their agents through `AgentService` in sessions of their own (failure detected natively, as before), its nudges an `idle` hook, its rooms one `GatewayRunner` each, its handoff rules one policy class on ADK's callbacks.
+- **Goal:** the application that drove the change runs on the building blocks: research and review as awaited voice tools running their agents through `AgentService` in sessions of their own (failure detected natively, as before), its nudges a task polling `RealtimeCall.quiet_for()` that its observer runs per connection, its rooms one `GatewayRunner` each, its handoff rules one policy class on ADK's callbacks.
 - **Verify:** its tests pass, against a fresh AK build; a live call: handoffs, research and a review (how long the caller waits), a refused handoff, a nudge, the meeting ended while research runs.

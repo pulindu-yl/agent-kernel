@@ -6,15 +6,14 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 from ..core.base import Agent as BaseAgent
 from ..core.base import Session
 from ..core.config import AKConfig
 from ..core.event import AgentChanged, AudioDelta, Interrupt, TextDelta
-from ..core.hooks import RealtimeEvent
 from ..core.model import StreamChunk
-from ..core.realtime import EDGE_SAMPLE_RATE, PCM16Resampler
+from ..core.realtime import EDGE_SAMPLE_RATE, PCM16Resampler, RealtimeEvent, RealtimeObserver
 from ..core.realtime import RealtimeRunner as BaseRealtimeRunner
 from ..core.runtime import Runtime
 from ..core.tool import ToolContext
@@ -38,8 +37,8 @@ _SWEEP_SECONDS = 5.0
 # At shutdown, how long work still running on the pool loop (a socket close, a tool call) may
 # finish before it is cancelled.
 _SHUTDOWN_GRACE_SECONDS = 2.0
-# When a connection closes, how long its realtime hooks may take over the events still waiting for them.
-_HOOK_DRAIN_SECONDS = 2.0
+# When a connection closes, how long its realtime observers may take over the events still waiting for them.
+_OBSERVER_DRAIN_SECONDS = 2.0
 # When a connection closes, how long its cancelled tool calls may take to unwind (release the session lock, close
 # what they opened) before the adapter is disconnected without them.
 _TOOL_CANCEL_SECONDS = 2.0
@@ -55,7 +54,15 @@ _LOOP_LAG_WARNING_SECONDS = 1.0
 class RealtimeConnection:
     """A persistent realtime model connection for one session that emits the framework adapter's output to the queue."""
 
-    def __init__(self, session_id: str, agent: BaseAgent, runtime: Runtime, session: Session, loop: asyncio.AbstractEventLoop):
+    def __init__(
+        self,
+        session_id: str,
+        agent: BaseAgent,
+        runtime: Runtime,
+        session: Session,
+        loop: asyncio.AbstractEventLoop,
+        observers: Sequence[RealtimeObserver] = (),
+    ):
         self.session_id = session_id
         self.agent = agent
         self.runtime = runtime
@@ -112,18 +119,14 @@ class RealtimeConnection:
         # When the model socket finished connecting; ``None`` until then. Nothing is posted into a
         # connection (``RealtimeOutbox``) before it, as the adapter has no socket to send to yet.
         self._connected_at: Optional[float] = None
-        # The agent's realtime hooks see the call's events one at a time, in order, on a task of
-        # their own, off the audio path (``_serve_hooks``); no queue when the agent has no hooks.
-        self._hook_events: Optional[asyncio.Queue] = None
-        self._hook_task: Optional[asyncio.Task] = None
+        # The realtime observers see the call's events one at a time, in order, on a task of their own,
+        # off the audio path (``_serve_observers``); no queue when there are none.
+        self._observers = list(observers)
+        self._observer_events: Optional[asyncio.Queue] = None
+        self._observer_task: Optional[asyncio.Task] = None
         self._closed_reported = False
-        # For each hook that asks for ``idle``: the quiet stretch it was last told about (when that stretch began),
-        # and how many times it was told about it.
-        self._idle_reported: dict[int, tuple[float, int]] = {}
-        # The session's outbox, which judges when the call is quiet; known once the pool first looks for idle.
-        self._quiet_outbox: Optional["RealtimeOutbox"] = None
         # The agent whose words are reaching the edge, and those words since its turn began, for the
-        # hooks' ``agent_said``.
+        # observers' ``agent_said``.
         self._speaker = agent.name
         self._said: list[str] = []
 
@@ -187,9 +190,9 @@ class RealtimeConnection:
         """Connect the framework adapter, bind its callback, start pacing its output and queue the starting agent with its team."""
         await self._audio_queue.put(("agent_changed", {"agent": self.agent.name, "agents": self.adapter.team(self.agent)}))
         await self.adapter.connect(self.session, self.agent, self.handle_framework_event)
-        if getattr(self.agent, "realtime_hooks", None):
-            self._hook_events = asyncio.Queue()
-            self._hook_task = asyncio.create_task(self._serve_hooks())
+        if self._observers:
+            self._observer_events = asyncio.Queue()
+            self._observer_task = asyncio.create_task(self._serve_observers())
         self._observe("connected", agent=self.agent.name)
         self._connected_at = time.time()
         self._pacing_task = asyncio.create_task(self._pacing_loop())
@@ -409,7 +412,7 @@ class RealtimeConnection:
             _log.error(f"Realtime session {self.session_id}: failed to {action}: {task.exception()}")
 
     async def close(self) -> None:
-        """Stop pacing, cancel running tool calls, disconnect the adapter and tell the hooks ``disconnected``; a second call returns at once."""
+        """Stop pacing, cancel running tool calls, disconnect the adapter and tell the observers ``disconnected``; a second call returns at once."""
         self.closed = True
         if self._disconnecting:
             return
@@ -422,7 +425,7 @@ class RealtimeConnection:
             await self.adapter.disconnect()
         finally:
             self._report_closed()
-            await self._finish_hooks()
+            await self._finish_observers()
 
     async def _cancel_tools(self) -> None:
         """Cancel the tool calls still running, and wait at most ``_TOOL_CANCEL_SECONDS`` for them to unwind."""
@@ -437,13 +440,13 @@ class RealtimeConnection:
             _log.warning(f"{len(pending)} tool calls of session {self.session_id} did not stop within {_TOOL_CANCEL_SECONDS}s of being cancelled")
 
     def _observe(self, event_type: str, **fields: Any) -> None:
-        """Queue a realtime event for the agent's realtime hooks; nothing when it has none. Call on the pool loop."""
-        if self._hook_events is not None:
-            self._hook_events.put_nowait((RealtimeEvent(type=event_type, session_id=self.session_id, **fields), None, None))
+        """Queue a realtime event for the observers; nothing when there are none. Call on the pool loop."""
+        if self._observer_events is not None:
+            self._observer_events.put_nowait(RealtimeEvent(type=event_type, session_id=self.session_id, **fields))
 
     def _observe_soon(self, event_type: str, **fields: Any) -> None:
-        """``_observe`` from any thread: input arrives on a consumer thread, and the hook queue belongs to the pool loop."""
-        if self._hook_events is None:
+        """``_observe`` from any thread: input arrives on a consumer thread, and the observer queue belongs to the pool loop."""
+        if self._observer_events is None:
             return
         event = RealtimeEvent(type=event_type, session_id=self.session_id, **fields)
         try:
@@ -451,33 +454,9 @@ class RealtimeConnection:
         except RuntimeError:
             running = None
         if running is self.loop:
-            self._hook_events.put_nowait((event, None, None))
+            self._observer_events.put_nowait(event)
         elif not self.loop.is_closed():
-            self.loop.call_soon_threadsafe(self._hook_events.put_nowait, (event, None, None))
-
-    @property
-    def wants_idle(self) -> bool:
-        """Whether one of the agent's realtime hooks asks to be told when the call goes quiet (``idle_after_seconds``)."""
-        hooks = getattr(self.agent, "realtime_hooks", None) or []
-        return self._hook_events is not None and any(getattr(hook, "idle_after_seconds", None) is not None for hook in hooks)
-
-    def notice_quiet(self, since: float, now: float, outbox: "RealtimeOutbox") -> None:
-        """Tell each hook with ``idle_after_seconds`` the call is ``idle``, at each multiple of it while the quiet lasts; call on the pool loop."""
-        if self._hook_events is None:
-            return
-        self._quiet_outbox = outbox
-        for hook in list(getattr(self.agent, "realtime_hooks", None) or []):
-            after = getattr(hook, "idle_after_seconds", None)
-            if after is None or after <= 0:
-                continue
-            stretch, told = self._idle_reported.get(id(hook), (None, 0))
-            if stretch != since:
-                told = 0
-            if now - since < after * (told + 1):
-                continue
-            self._idle_reported[id(hook)] = (since, told + 1)
-            event = RealtimeEvent(type="idle", session_id=self.session_id, agent=self._speaker, quiet_for=now - since)
-            self._hook_events.put_nowait((event, hook, since))
+            self.loop.call_soon_threadsafe(self._observer_events.put_nowait, event)
 
     @property
     def is_ready(self) -> bool:
@@ -501,52 +480,42 @@ class RealtimeConnection:
         return generated is not None and (changed is None or generated > changed)
 
     def _report_said(self, interrupted: bool = False) -> None:
-        """Tell the hooks what the agent speaking said since its turn began, if anything."""
+        """Tell the observers what the agent speaking said since its turn began, if anything."""
         text, self._said = "".join(self._said).strip(), []
         if text:
             self._observe("agent_said", agent=self._speaker, text=text, interrupted=interrupted)
 
     def _report_closed(self) -> None:
-        """Tell the hooks, once, what the agent last said and that the call's connection is gone."""
+        """Tell the observers, once, what the agent last said and that the call's connection is gone."""
         if self._closed_reported:
             return
         self._closed_reported = True
         self._report_said()
         self._observe("disconnected", agent=self._speaker)
 
-    async def _serve_hooks(self) -> None:
-        """Give each realtime event to the agent's hooks, in order, one at a time, until ``disconnected``."""
-        events = self._hook_events
+    async def _serve_observers(self) -> None:
+        """Give each realtime event to the observers, in order, one at a time, until ``disconnected``."""
+        events = self._observer_events
         if events is None:
             return
         while True:
-            # ``only``: the one hook an event is for (``idle``), else ``None`` for every hook; ``stretch``: the quiet
-            # stretch an ``idle`` is about, which must still be the call's when the hook's turn comes.
-            event, only, stretch = await events.get()
-            if stretch is not None and not self._still_quiet_since(stretch):
-                _log.debug(f"An idle event for session {self.session_id} was dropped: the call moved on before its hook ran")
-                continue
-            for hook in [only] if only is not None else list(getattr(self.agent, "realtime_hooks", None) or []):
+            event = await events.get()
+            for observer in self._observers:
                 try:
-                    await hook.on_event(self.session, self.agent, event)
+                    await observer.on_event(self.session, self.agent, event)
                 except Exception:
-                    _log.exception(f"Realtime hook {type(hook).__name__} failed on {event.type} in session {self.session_id}")
+                    _log.exception(f"Realtime observer {type(observer).__name__} failed on {event.type} in session {self.session_id}")
             if event.type == "disconnected":
                 return
 
-    def _still_quiet_since(self, stretch: float) -> bool:
-        """Whether the call is still in the quiet stretch that began at ``stretch``."""
-        outbox = self._quiet_outbox
-        return outbox is not None and outbox.quiet_since(self, time.time()) == stretch
-
-    async def _finish_hooks(self) -> None:
-        """Wait for the hooks to take the events left (at most ``_HOOK_DRAIN_SECONDS``), then stop them."""
-        task, self._hook_task = self._hook_task, None
+    async def _finish_observers(self) -> None:
+        """Wait for the observers to take the events left (at most ``_OBSERVER_DRAIN_SECONDS``), then stop them."""
+        task, self._observer_task = self._observer_task, None
         if task is None:
             return
-        done, _ = await asyncio.wait({task}, timeout=_HOOK_DRAIN_SECONDS)
+        done, _ = await asyncio.wait({task}, timeout=_OBSERVER_DRAIN_SECONDS)
         if not done:
-            _log.warning(f"Realtime hooks of session {self.session_id} did not finish in {_HOOK_DRAIN_SECONDS}s; stopping them")
+            _log.warning(f"Realtime observers of session {self.session_id} did not finish in {_OBSERVER_DRAIN_SECONDS}s; stopping them")
             task.cancel()
             await asyncio.wait({task})
 
@@ -557,7 +526,7 @@ class _Post:
     key: Optional[str]
     expires_at: float
     # For a ``while_quiet`` post (``post_when_idle(..., while_quiet=True)``): the quiet stretch it was made in, named by
-    # when it began (``RealtimeOutbox.quiet_since``); it is dropped once the call is no longer in that stretch.
+    # when it began (``RealtimeOutbox._quiet_since``); it is dropped once the call is no longer in that stretch.
     stretch: Optional[float] = None
 
 
@@ -631,11 +600,6 @@ class RealtimeOutbox:
         with self._lock:
             return self._quiet_for(connection, now)
 
-    def quiet_since(self, connection: RealtimeConnection, now: float) -> Optional[float]:
-        """When ``connection``'s call last stopped being quiet (``quiet_for`` is ``now`` minus it), or ``None`` while it is busy."""
-        with self._lock:
-            return self._quiet_since(connection, now)
-
     def take(self, connection: RealtimeConnection, now: float) -> Optional[str]:
         """The next post to say into ``connection`` now, removed from the outbox; ``None`` while the call is busy."""
         self.expire(now)
@@ -656,7 +620,8 @@ class RealtimeOutbox:
         return None if since is None else now - since
 
     def _quiet_since(self, connection: RealtimeConnection, now: float) -> Optional[float]:
-        """``quiet_since``, with the lock held: it may forget the last post, which a new connection owes nothing to."""
+        """When the call last stopped being quiet, or ``None`` while it is busy; with the lock held, as it may forget the
+        last post, which a new connection owes nothing to."""
         self._notice(connection)
         if not connection.is_ready or connection.is_responding or connection.is_caller_speaking or self._owes_reply(connection, now):
             return None
@@ -708,6 +673,10 @@ class RealtimeConnectionPool:
 
     _instance: Optional["RealtimeConnectionPool"] = None
     _lock = threading.Lock()
+    # The process's realtime observers (``RealtimeCall.observe``), kept apart from the instance since the application
+    # registers them before the pool starts; each new connection takes those registered by then.
+    _observers: list[RealtimeObserver] = []
+    _observers_lock = threading.Lock()
 
     @classmethod
     def get(cls) -> Optional["RealtimeConnectionPool"]:
@@ -720,6 +689,19 @@ class RealtimeConnectionPool:
             if cls._instance is None:
                 cls._instance = cls()
             return cls._instance
+
+    @classmethod
+    def observe(cls, observer: RealtimeObserver) -> None:
+        """Have ``observer`` watch every realtime call this process connects from now on; thread-safe."""
+        with cls._observers_lock:
+            if observer not in cls._observers:
+                cls._observers = [*cls._observers, observer]
+
+    @classmethod
+    def unobserve(cls, observer: RealtimeObserver) -> None:
+        """Stop giving ``observer`` the calls connected from now on; thread-safe."""
+        with cls._observers_lock:
+            cls._observers = [o for o in cls._observers if o is not observer]
 
     @classmethod
     def reset(cls) -> None:
@@ -796,10 +778,6 @@ class RealtimeConnectionPool:
                 self._deliver_posts(now)
             except Exception:
                 _log.exception("Failed to deliver posts into realtime calls")
-            try:
-                self._report_idle(now)
-            except Exception:
-                _log.exception("Failed to report idle realtime calls")
             before = time.monotonic()
             await asyncio.sleep(_POST_POLL_SECONDS)
             lag = time.monotonic() - before - _POST_POLL_SECONDS
@@ -884,17 +862,6 @@ class RealtimeConnectionPool:
             conn = self._connections.get(session_id)
         return conn if conn is not None and conn.is_ready else None
 
-    def _report_idle(self, now: float) -> None:
-        """Tell the hooks that ask for it which calls have gone quiet (``RealtimeConnection.notice_quiet``)."""
-        with self._conn_lock:
-            connections = [conn for conn in self._connections.values() if conn.is_ready and conn.wants_idle]
-        for conn in connections:
-            with self._outbox_lock:
-                outbox = self._outboxes.setdefault(conn.session_id, RealtimeOutbox(conn.session_id))
-            since = outbox.quiet_since(conn, now)
-            if since is not None:
-                conn.notice_quiet(since, now, outbox)
-
     def _deliver_posts(self, now: float) -> None:
         """Say each session's next post into its call if the call is quiet; forget outboxes left with nothing to do."""
         with self._outbox_lock:
@@ -974,7 +941,7 @@ class RealtimeConnectionPool:
                 return existing
             # Reserve the slot so a concurrent caller for a different session proceeds
             # without waiting for this session's connect.
-            conn = RealtimeConnection(session_id, agent, runtime, session, self._loop)
+            conn = RealtimeConnection(session_id, agent, runtime, session, self._loop, observers=self._observers)
             conn.update_delivery_context(request_id, user_id, integration, reply_context or {})
             self._connections[session_id] = conn
 
@@ -1037,6 +1004,16 @@ class RealtimeCall:
     def __init__(self, session_id: str):
         """Bind the call to the session id the edge serves it under."""
         self.session_id = session_id
+
+    @staticmethod
+    def observe(observer: RealtimeObserver) -> None:
+        """Have ``observer`` watch every realtime call this process connects from now on; register it before calls begin."""
+        RealtimeConnectionPool.observe(observer)
+
+    @staticmethod
+    def unobserve(observer: RealtimeObserver) -> None:
+        """Stop giving ``observer`` the calls connected from now on."""
+        RealtimeConnectionPool.unobserve(observer)
 
     @property
     def connected(self) -> bool:

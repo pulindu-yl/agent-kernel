@@ -72,11 +72,11 @@ A `RealtimeRunner` adapter talks to the model and reports what it does through t
 | `transcript_delta` | A piece of the model's transcript | In order with its audio |
 | `tool_call` | The model called a function (a tool, or a handoff) | Runs `execute_tool()`, then `send_tool_result()` |
 | `done` | The model's turn ended; with status `reconnecting`, because the adapter lost its socket and is replacing it | In order, after its audio. A `reconnecting` one also marks the connection not ready for posts until `reconnected` or `error` |
-| `reconnected` | Optional: the adapter replaced a lost socket, and `agent` still has the call; `seeded` when the new socket was given the conversation to answer (see [Connection recovery](#connection-recovery-google-adk)) | Nothing reaches the edge; the connection is ready again, a `seeded` one owes a reply first, and the realtime hooks get `reconnected` |
+| `reconnected` | Optional: the adapter replaced a lost socket, and `agent` still has the call; `seeded` when the new socket was given the conversation to answer (see [Connection recovery](#connection-recovery-google-adk)) | Nothing reaches the edge; the connection is ready again, a `seeded` one owes a reply first, and the realtime observers get `reconnected` |
 | `interrupt` / `speech_started` | The caller started speaking: over the model (`interrupt`), or while it is silent (`speech_started`, reported once per caller turn by both adapters) | An `interrupt`, or a `speech_started` while paced audio is still queued, drops unheard audio and text and keeps `done` and `agent_changed`. Either one marks when the caller last spoke (see [Turn state](#turn-state)) |
 | `speech_heard` / `speech_stopped` | The caller is still speaking (`speech_heard`: Gemini, on each later transcription of their words), or has stopped (`speech_stopped`: OpenAI's server VAD, from an adapter with `reports_speech_stopped`) | Nothing reaches the edge; both mark when the caller last spoke, and `speech_stopped` ends `is_caller_speaking` |
 | `agent_changed` | A handoff moved the call to another agent | In order: after the old agent's output, before the new agent's |
-| `caller_transcript` | Optional: the caller's words in a turn, once the model has transcribed the whole turn (Gemini) | Nothing reaches the edge; the agent's [realtime hooks](#realtime-hooks) get it as `caller_said` |
+| `caller_transcript` | Optional: the caller's words in a turn, once the model has transcribed the whole turn (Gemini) | Nothing reaches the edge; the [realtime observers](#realtime-observers) get it as `caller_said` |
 | `error` | The socket failed | Tells the caller, then replaces the connection |
 
 Two more members of the contract:
@@ -120,11 +120,11 @@ The pool cannot see the model generating before its first output, after the call
 
 Applications do not read these properties themselves: `RealtimeCall` (see [Talking into a live call](../integrations/livekit.md#talking-into-a-live-call)) is the public face of this rule. Its `post_when_idle` queues text in the session's `RealtimeOutbox`, which the pool keeps per session rather than per connection, so posts survive a reconnect. Every `_POST_POLL_SECONDS` the pool's loop says each session's next post if `RealtimeOutbox.quiet_for` finds the call quiet long enough, with `RealtimeConnection.send_text`. `RealtimeCall.quiet_for()` and `agent_has_spoken` read the same state, and `last_caller_input_at`, `last_agent_change_at` and `last_tool_result_at` read the connection's times (from an open connection, recovering included).
 
-A handover ends a quiet stretch too (`last_agent_change_at` is one of the times). A `while_quiet` post records the quiet stretch it was made in (`RealtimeOutbox.quiet_since`); it is not queued when the call is not quiet, and `take` drops it once the current stretch is a different one, which anything happening, another post said, or a new connection makes it.
+A handover ends a quiet stretch too (`last_agent_change_at` is one of the times). A `while_quiet` post records the quiet stretch it was made in (`RealtimeOutbox._quiet_since`); it is not queued when the call is not quiet, and `take` drops it once the current stretch is a different one, which anything happening, another post said, or a new connection makes it.
 
-## Realtime hooks
+## Realtime observers
 
-A connection whose agent has `realtime_hooks` (`Module.realtime_hook`) queues `RealtimeEvent`s for them, and one task gives each event to the hooks in order, off the audio path:
+`RealtimeCall.observe` adds an observer to the pool's process-wide list (`RealtimeConnectionPool._observers`, a class attribute so observers can be registered before the pool starts); `get_or_create` hands each new connection the list as it is then. A connection with observers queues `RealtimeEvent`s for them, and one task gives each event to the observers in order, off the audio path:
 
 | Event | Raised by |
 |---|---|
@@ -134,13 +134,12 @@ A connection whose agent has `realtime_hooks` (`Module.realtime_hook`) queues `R
 | `caller_said` | The adapter's optional `caller_transcript` event; the Gemini adapter reports the caller's words when a turn ends (the model finishes, calls a tool, or text is sent in) |
 | `edge_text` | `send_text(..., from_edge=True)`, from the consumer thread, handed to the pool's loop |
 | `disconnected` | `close()` or a socket failure, once |
-| `idle` | The pool's loop, every `_POST_POLL_SECONDS`, for a ready connection whose hooks ask for it: `RealtimeOutbox.quiet_since` (when the call last stopped being quiet), and for each hook with `idle_after_seconds` of `n`, once the stretch is `n`, `2n`, ... seconds old (counted per hook and stretch) |
 
-The queue holds `(event, only, stretch)`: `only` is the one hook an `idle` is for and `stretch` the quiet stretch it is about, `None` for every other event; an `idle` whose stretch has ended by the time it is taken is dropped. On `close()` the hooks get up to `_HOOK_DRAIN_SECONDS` to take the events still queued. An agent without hooks gets no queue and no task.
+On `close()` the observers get up to `_OBSERVER_DRAIN_SECONDS` to take the events still queued. A connection without observers gets no queue and no task. There is no quiet-call event: an application that acts on a quiet call reads `RealtimeCall.quiet_for()` itself.
 
 ## Tool calls that wait
 
-The pool runs each tool call as a task of its connection (`RealtimeConnection._tool_tasks`), inside the call's AK session and `Agent._activate()`, so the tool holds the session lock until it returns. A tool may await long work, such as another agent's run through `AgentService.run_multi` in a session of its own; the await yields the pool's loop, so other calls' audio keeps its pace. While the task runs it counts toward `is_responding`, so the call is not quiet: no post is said and no `idle` is reported, and on Google ADK the stall wait (`_owed_since`) is cleared when the tool call arrives and starts again only when the result is sent.
+The pool runs each tool call as a task of its connection (`RealtimeConnection._tool_tasks`), inside the call's AK session and `Agent._activate()`, so the tool holds the session lock until it returns. A tool may await long work, such as another agent's run through `AgentService.run_multi` in a session of its own; the await yields the pool's loop, so other calls' audio keeps its pace. While the task runs it counts toward `is_responding`, so the call is not quiet: no post is said and `quiet_for()` is `None`, and on Google ADK the stall wait (`_owed_since`) is cleared when the tool call arrives and starts again only when the result is sent.
 
 `RealtimeConnection.close()` (called by `RealtimeCall.close()`, an idle or failed-socket eviction, and pool shutdown) marks the connection closed, cancels its tool tasks and waits for them up to `_TOOL_CANCEL_SECONDS` (2 s) before disconnecting the adapter. A cancelled tool sends no result, and `_execute_tool_and_reply` sends none for a tool that finishes once the connection is closed or its socket failed (`closed`), even one that ignored its cancellation, so a late result never reaches a dead socket or the session's next connection, which has an adapter of its own. A socket the adapter recovers itself (Google ADK) keeps the connection open: a late result follows the lost-call rules in [Connection recovery](#connection-recovery-google-adk).
 
@@ -289,7 +288,7 @@ The replay is the same as a transfer's: text, not the original audio. Gemini's o
 | `RealtimeRunner` | `agentkernel.core.realtime.runner` | The adapter contract, `team()`, shared cleanup |
 | `RealtimeConnectionPool`, `RealtimeConnection` | `agentkernel.pipeline.realtime_pool` | Connections per session, ordering, pacing, tool calls and their cancellation |
 | `RealtimeCall`, `RealtimeOutbox` | `agentkernel.pipeline` (`realtime_pool`) | Talking into a call at a quiet moment, and what the call is doing, for application code |
-| `RealtimeHook`, `RealtimeEvent` | `agentkernel.core.hooks` | Observing a call: connection, transcripts, speaker changes, quiet stretches (`idle`) |
+| `RealtimeObserver`, `RealtimeEvent` | `agentkernel.core.realtime.observer` | Observing calls (`RealtimeCall.observe`): connection, transcripts, speaker changes |
 | `GatewayRunner` | `agentkernel.integration.adapter` | Hosting one gateway until shutdown or `stop()`; an application with a room per meeting keeps one runner per room |
 | `OpenAIRealtimeRunner` | `agentkernel.framework.openai` | OpenAI socket, handoffs by `session.update` |
 | `GoogleADKRealtimeRunner` | `agentkernel.framework.adk` | Gemini socket, transfers by reconnect + history |
