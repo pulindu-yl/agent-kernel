@@ -91,7 +91,7 @@ Two decisions taken up front, so no iteration stalls on them:
      `agui_state` chunk to `StateSnapshotEvent`.
   4. Offload attachments before enqueue.
   5. Export the class.
-- **Verify:** a first pass of `tests/test_agui_pipeline.py` over the `in_memory` topology — the
+- **Verify:** a first pass of `tests/test_agui_queue_handler.py` over the `in_memory` topology — the
   protocol bracket holds and both preconditions raise.
 
 ## Iteration 6: The STREAM route precondition
@@ -106,7 +106,7 @@ Two decisions taken up front, so no iteration stalls on them:
 ## Iteration 7: Tests
 
 - **Goal:** every requirement has a case, and the mechanism is proven against a real broker.
-- **Files:** `tests/test_agui_pipeline.py`, `tests/test_pipeline_agent_runner.py`,
+- **Files:** `tests/test_agui_queue_handler.py`, `tests/test_pipeline_agent_runner.py`,
   `tests/test_pipeline_response_handler.py`, `tests/test_pipeline_request_handler.py`,
   `tests/test_shared_drivers.py`, `tests/test_response_store_contract_live.py` (new)
 - **Steps:**

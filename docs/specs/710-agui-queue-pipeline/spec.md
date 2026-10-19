@@ -166,7 +166,7 @@ fallback delegates to `super()._process_run`. **The invariant: marker dispatch h
 above whichever class `IOHandler` selected from `execution.mode`** — which is the point, since that
 mode must no longer decide whether an AG-UI run streams. A subclass that overrides `process` instead
 compiles, passes every ordinary test, and silently drops the AG-UI branch for its mode; the structural
-test in `test_agui_pipeline.py` asserts `cls.process is AgentRunner.process` for every subclass so the
+test in `test_agui_queue_handler.py` asserts `cls.process is AgentRunner.process` for every subclass so the
 invariant cannot be broken quietly.
 
 `_process_agui` is a method on `AgentRunner`, not a separate class: it is one execution path of the
@@ -463,7 +463,7 @@ Run: `cd ak-py && uv run pytest`.
 | `pipeline/response_store/testing.py`    | `ResponseStoreContract` — the reusable suite. Subclass, implement `make_store()`. Pins chunk order, the terminal `done` chunk ending the stream, `close_stream` unblocking a reader parked mid-wait, a reader that attaches after the writer finished, the per-chunk timeout, and that `shared` is declared. Docstring states that `add_chunk` is **not** required to be idempotent — duplicate delivery is a reader concern (design §8), so no BYO store inherits that obligation by accident. |
 | `tests/test_response_store_contract.py` | The contract against `in_memory`, and against `redis`/`valkey` through a fake redis-like client injected as `store._driver._client`, the shape `test_schedule_store.py` already uses.                                                                                                                                                                                                                                                                                                           |
 | `tests/test_response_store_redis.py`    | Key layout, TTL refresh on `add_chunk`, the `blpop` sentinel path. There is no redis response-store test today — only valkey.                                                                                                                                                                                                                                                                                                                                                                   |
-| `tests/test_agui_pipeline.py`           | The handler end to end over `in_memory`: the bracket holds; both preconditions raise; the marker survives; attachments are offloaded; the envelope reaches the tools.                                                                                                                                                                                                                                                                                                                           |
+| `tests/test_agui_queue_handler.py`      | The handler end to end over `in_memory`: the bracket holds; both preconditions raise; the marker survives; attachments are offloaded; the envelope reaches the tools.                                                                                                                                                                                                                                                                                                                           |
 
 
 
