@@ -21,7 +21,7 @@ from agentkernel.core.config import AKConfig
 from agentkernel.core.event import MessageEnd, MessageStart, PausedInterruption, RunPaused, TextDelta
 from agentkernel.core.model import AgentRequestAttachmentRef, AgentRequestImage, ExecutionMode, StreamChunk
 from agentkernel.core.util.factory import AKConfigError
-from agentkernel.integration.agui.pipeline import AGUIPipelineRequestHandler
+from agentkernel.integration.agui.queue_handler import AGUIPipelineRequestHandler
 from agentkernel.integration.agui.run_input import AGUIRunEnvelope, AGUIRunRequest
 from agentkernel.integration.agui.state import AGUIState
 from agentkernel.pipeline.agent_runner import AgentRunner, RealtimeAgentRunner, StreamAgentRunner
@@ -554,7 +554,7 @@ class TestPreconditions:
             def resolve_type():
                 return transport
 
-        with patch.multiple("agentkernel.integration.agui.pipeline", ResponseStoreFactory=_Factory, QueueTransportFactory=_Transport):
+        with patch.multiple("agentkernel.integration.agui.queue_handler", ResponseStoreFactory=_Factory, QueueTransportFactory=_Transport):
             return AGUIPipelineRequestHandler(authoriser=_Auth())
 
     def test_a_store_that_cannot_stream_chunks_is_refused(self):

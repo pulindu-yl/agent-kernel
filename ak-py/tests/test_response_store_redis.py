@@ -77,21 +77,60 @@ def test_chunks_use_a_key_separate_from_the_record(client):
     assert store.get_record("r1") == {"request_id": "r1", "session_id": "s1", "body": {"text": "hi"}}
 
 
-def test_each_chunk_refreshes_the_ttl(client):
-    """A long run must not have its chunk list expire mid-stream."""
-    store = _store(ttl=120)
+@pytest.fixture
+def chunk_wait(monkeypatch):
+    """Pin the per-chunk wait the chunk TTL derives from.
+
+    `_chunk_timeout` reads the AKConfig singleton, which another test in the same pytest process
+    may have populated, so the derived TTL is only predictable once this is fixed.
+    """
+    monkeypatch.setattr(RedisLikeResponseStore, "_chunk_timeout", staticmethod(lambda chunk_timeout=None: 10.0))
+    return 10.0
+
+
+def test_each_chunk_refreshes_the_ttl(client, chunk_wait):
+    """A long run must not have its chunk list expire mid-stream.
+
+    The record TTL is a week here and the chunk TTL is twice the per-chunk wait: the two budgets
+    are independent, because a chunk list is transient and a record is not (PR #755 review).
+    """
+    store = _store(ttl=604800)
     store.add_chunk("r1", {"delta": "a"})
-    assert client.expires["ak:resp:chunks:r1"] == 120
+    assert client.expires["ak:resp:chunks:r1"] == 20
 
     client.expires.clear()
     store.add_chunk("r1", {"delta": "b"})
-    assert client.expires["ak:resp:chunks:r1"] == 120
+    assert client.expires["ak:resp:chunks:r1"] == 20
 
 
-def test_no_ttl_is_applied_when_the_driver_has_none(client):
+def test_a_chunk_list_expires_even_when_the_driver_has_no_ttl(client, chunk_wait):
+    """Inheriting the driver's TTL would keep a chunk list forever here (PR #755 review).
+
+    0 means "keep forever" for a record, which is a reasonable thing to configure. A chunk list
+    kept forever is a leak, since the only code that deletes one is a reader that has finished.
+    """
     store = _store(ttl=0)
     store.add_chunk("r1", {"delta": "a"})
-    assert client.expires == {}
+    assert client.expires["ak:resp:chunks:r1"] == 20
+
+
+def test_a_chunk_pushed_after_the_reader_left_still_expires(client, chunk_wait):
+    """The leak CodeRabbit found on PR #755: nothing deletes a list no reader is left to drain.
+
+    The runner keeps producing after a reader times out or disconnects, and the reader's `finally`
+    has already deleted the key, so the next `add_chunk` creates it again. With the TTL taken from
+    the driver that orphan would sit there for the record budget - a week by default.
+    """
+    store = _store(ttl=604800)
+    store.add_chunk("r1", {"done": True})
+    list(store.stream("r1", chunk_timeout=5))
+    assert "ak:resp:chunks:r1" not in client.lists
+    client.expires.clear()
+
+    store.add_chunk("r1", {"delta": "late"})
+
+    assert client.lists["ak:resp:chunks:r1"], "the late chunk recreated the key"
+    assert client.expires["ak:resp:chunks:r1"] == 20
 
 
 def test_closing_a_stream_with_no_reader_drops_the_key_instead_of_signalling(client):

@@ -71,7 +71,7 @@ Chunk state is one list per request, separate from the record key:
 | Key                           | Holds                                  |
 | ----------------------------- | -------------------------------------- |
 | `{prefix}{request_id}`        | the existing single record (unchanged) |
-| `{prefix}chunks:{request_id}` | the chunk list, TTL from the driver    |
+| `{prefix}chunks:{request_id}` | the chunk list, on its own short TTL   |
 
 
 ```python
@@ -79,9 +79,10 @@ def supports_chunk_streaming(self) -> bool:
     return True
 
 def add_chunk(self, request_id: str, chunk: Dict) -> None:
-    key = self._chunk_key(request_id)
-    self._driver.rpush(key, json.dumps(chunk))
-    self._driver.expire(key)                      # no-op when the driver's ttl is 0
+    # Twice the per-chunk wait, not the driver's record TTL: a list left behind by a reader
+    # that gave up must expire on its own, and 0 (keep forever) would never expire at all.
+    ttl = max(1, int(self._chunk_timeout() * 2))
+    self._driver.rpush_with_expiry(self._chunk_key(request_id), json.dumps(chunk), ttl)
 
 def stream(self, request_id: str, chunk_timeout: Optional[float] = None) -> Iterator[Dict]:
     timeout = self._chunk_timeout(chunk_timeout)
@@ -293,7 +294,7 @@ subclass needs no producer change.
 AG-UI path always passes a prebuilt `requests` list, so `RequestBuilder` is skipped — the entry means
 that guarantee does not rest on a call-site invariant holding forever.
 
-### 7. The queue-mode handler — `integration/agui/pipeline.py` (new)
+### 7. The queue-mode handler — `integration/agui/queue_handler.py` (new)
 
 ```python
 class AGUIPipelineRequestHandler(AGUIRequestHandler):

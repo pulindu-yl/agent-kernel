@@ -466,7 +466,7 @@ already receive survives to a frontend instead of being discarded at the text-on
   the session is written, then hands off to `_events`, an `AsyncGenerator` that always yields
   `RunStartedEvent` first and **one of three terminal shapes** last — every failure
   after the stream starts is reported as `RunErrorEvent` since the HTTP status is already sent
-- **`AGUIPipelineRequestHandler`** (`pipeline.py`, #710): the queue-mode counterpart, mounted as
+- **`AGUIPipelineRequestHandler`** (`queue_handler.py`, #710): the queue-mode counterpart, mounted as
   `IOHandler.run(handlers=[AGUIPipelineRequestHandler(...)])` — AG-UI owns `agui.prefix`, so unlike
   `ThreadRequestHandler` it joins the pipeline's routes rather than replacing one, and `IOHandler`
   needs no change. It subclasses the direct handler and shares its edge half verbatim
@@ -1033,7 +1033,7 @@ ak-py/src/agentkernel/
 │   ├── thread/              # Conversation Thread Support: AgentThreadRequestHandler (direct) and
 │   │                        #   ThreadRequestHandler (queue pipeline), ThreadRecorder,
 │   │                        #   ConversationThreadManager, models, naming, store/ backends (alias: agentkernel.thread)
-│   ├── agui/                # AG-UI protocol surface: AGUIRequestHandler (routes), pipeline.py
+│   ├── agui/                # AG-UI protocol surface: AGUIRequestHandler (routes), queue_handler.py
 │   │                        #   (AGUIPipelineRequestHandler, queue mode), mapping.py
 │   │                        #   (StreamEvent -> AG-UI events), run_input.py (RunAgentInput parsing),
 │   │                        #   state.py (shared-state accessors + the state/client-context tools)

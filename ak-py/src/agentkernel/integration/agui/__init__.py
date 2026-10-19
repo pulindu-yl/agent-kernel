@@ -12,5 +12,5 @@ except importlib.metadata.PackageNotFoundError:
     __version__ = "0.1.0"
 
 from .handler import AGUIRequestHandler
-from .pipeline import AGUIPipelineRequestHandler
+from .queue_handler import AGUIPipelineRequestHandler
 from .state import AGUIState

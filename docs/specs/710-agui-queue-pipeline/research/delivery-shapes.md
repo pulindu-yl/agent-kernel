@@ -85,7 +85,7 @@ AG-UI:   IOHandler    --pull-->  the store       (address = a live socket)
 | `pipeline/response_handler.py` | dispatch on the marker first | Otherwise chunks take the `execution.mode` path — stored as one finished record, or pushed at a WebSocket nobody holds. |
 | `response_store/redis.py`, `valkey.py` | implement chunk streaming | The actual blocker. `in_memory` streams but is process-local (`response_store/in_memory.py:29`); redis and valkey are shared but cannot stream; `ResponseStoreFactory` requires a shared store on a broker (`response_store/factory.py:50-63`). No single store has both halves. |
 | `core/util/driver/redis_like.py` | add a blocking pop | The reader must wait for a chunk that does not exist yet. Without a blocking primitive the only option is a polling loop. |
-| `integration/agui/pipeline.py` | **new** — the queue-mode handler | Something must keep the socket, enqueue the run, and drain the store. The only genuinely new class. |
+| `integration/agui/queue_handler.py` | **new** — the queue-mode handler | Something must keep the socket, enqueue the run, and drain the store. The only genuinely new class. |
 | `integration/agui/handler.py` | extract the shared edge half | Auth, 404, 400 and body parsing are identical in both handlers; copied, the two paths drift on the error contract. |
 
 ## What deliberately does not change

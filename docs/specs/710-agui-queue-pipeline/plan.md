@@ -83,7 +83,7 @@ Two decisions taken up front, so no iteration stalls on them:
 ## Iteration 5: The queue-mode handler
 
 - **Goal:** end to end. An AG-UI client works against `IOHandler.run(handlers=[...])`.
-- **Files:** `integration/agui/pipeline.py` (new), `integration/agui/__init__.py`
+- **Files:** `integration/agui/queue_handler.py` (new), `integration/agui/__init__.py`
 - **Steps:**
   1. Write `AGUIPipelineRequestHandler` with `requires_pipeline = True` (spec §7).
   2. Implement `_validate_topology`'s four checks (spec §8).

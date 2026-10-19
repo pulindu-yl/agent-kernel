@@ -61,7 +61,7 @@ class AGUIPipelineRequestHandler(AGUIRequestHandler):
         :raises AKConfigError: If the configured stores cannot serve a run from another process.
         """
         super().__init__(authoriser, auth_validator)
-        self._log = logging.getLogger("ak.integration.agui.pipeline")
+        self._log = logging.getLogger("ak.integration.agui.queue_handler")
         self._validate_topology()
         self._store = ResponseStoreFactory.create()
         self._producer = RequestProducer()

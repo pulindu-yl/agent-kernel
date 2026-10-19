@@ -28,7 +28,8 @@ class RedisLikeResponseStore(ResponseStore):
 
     Records are plain JSON strings under ``<prefix><request_id>``; a streaming run's chunks are a
     separate list under ``<prefix>chunks:<request_id>``, drained with BLPOP so the reader parks on
-    the server instead of polling.
+    the server instead of polling. The chunk key carries its own short TTL (``_chunk_list_ttl``)
+    rather than the driver's record TTL, so a list no reader is left to drain expires on its own.
 
     ``_live_streams`` holds the chunk keys that currently have a live ``stream()`` generator in
     this process, so ``close_stream`` can tell a reader that still needs waking from one that has
@@ -76,11 +77,30 @@ class RedisLikeResponseStore(ResponseStore):
     def _chunk_key(self, request_id: str) -> str:
         return self._driver.key(f"chunks:{request_id}")
 
+    def _chunk_list_ttl(self) -> int:
+        """Seconds a chunk list may live: twice the per-chunk wait, at least one second.
+
+        The driver's own TTL is the *record* budget — seven days by default, and no expiry at all
+        when it is 0 — which a transient chunk list must not inherit. The list can outlive every
+        reader: one that times out or disconnects deletes the key on its way out, and a chunk the
+        runner pushes afterwards recreates a list nobody will ever drain.
+
+        Twice ``_chunk_timeout()`` bounds that orphan without threatening a live stream. A gap
+        longer than one ``_chunk_timeout`` has already made the reader give up, so no reader can
+        outlive this budget, and every push refreshes it, so a long run cannot expire mid-stream.
+
+        :return: The TTL in seconds for a chunk key.
+        """
+        return max(1, int(self._chunk_timeout() * 2))
+
     def add_chunk(self, request_id: str, chunk: dict) -> None:
-        """Append one streaming chunk for the request (consumed by ``stream``)."""
-        key = self._chunk_key(request_id)
-        self._driver.rpush(key, json.dumps(chunk))
-        self._driver.expire(key)
+        """Append one streaming chunk for the request (consumed by ``stream``).
+
+        Pushed with its TTL in one pipeline for the reason ``close_stream``'s marker is: RPUSH on a
+        missing key creates it with no expiry, and this call is itself the one that can resurrect a
+        key every reader has finished with.
+        """
+        self._driver.rpush_with_expiry(self._chunk_key(request_id), json.dumps(chunk), self._chunk_list_ttl())
 
     def stream(self, request_id: str, chunk_timeout: Optional[float] = None) -> Iterator[dict]:
         """Yield the request's chunks in order until its done chunk.
