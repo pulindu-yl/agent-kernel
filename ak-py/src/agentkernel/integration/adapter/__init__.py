@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any
 
 _LAZY_EXPORTS = {
     "StatefulEdgeAdapter": ".base",
-    "GatewayPool": ".gateway",
     "GatewayRunner": ".gateway",
     "InboundAdapter": ".base",
     "InboundParseResult": ".base",
@@ -35,7 +34,7 @@ __all__ = sorted(_LAZY_EXPORTS)
 if TYPE_CHECKING:  # pragma: no cover: static resolution only, preserves laziness at runtime
     from .base import InboundAdapter, InboundParseResult, InboundRequest, OutboundAdapter, PollingInboundAdapter, Source, StatefulEdgeAdapter
     from .factory import IntegrationAdapterFactory
-    from .gateway import GatewayPool, GatewayRunner
+    from .gateway import GatewayRunner
     from .poller import PollerRunner
     from .producer import IntegrationProducer
     from .registry import StatefulEdgeRegistry

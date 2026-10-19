@@ -261,7 +261,7 @@ does for the current agent. `Runtime._current` is class-level (`core/runtime.py:
 ak-py/src/agentkernel/
 ├── core/
 │   └── hooks.py                 # RealtimeEvent "idle" + quiet_for; RealtimeHook.idle_after_seconds
-├── integration/adapter/gateway.py  # GatewayRunner.stop, GatewayPool
+├── integration/adapter/gateway.py  # GatewayRunner.stop
 └── pipeline/
     ├── realtime_pool.py         # RealtimeCall facts; tool calls the connection owns; idle; while_quiet
     └── __init__.py              # RealtimeCall's lazy export points at realtime_pool
@@ -349,15 +349,6 @@ Rules:
 ```python
 class GatewayRunner:
     def stop(self, timeout: Optional[float] = None) -> bool: ...   # whether start() has returned (or never ran)
-
-class GatewayPool:
-    STOP_TIMEOUT_SECONDS = 10.0
-    def __init__(self, factory: Callable[[str], StatefulEdgeAdapter]): ...
-    def open(self, session_id: str) -> StatefulEdgeAdapter: ...
-    def get(self, session_id: str) -> Optional[StatefulEdgeAdapter]: ...
-    def is_open(self, session_id: str) -> bool: ...
-    def close(self, session_id: str, timeout: float = STOP_TIMEOUT_SECONDS) -> bool: ...
-    def close_all(self) -> None: ...
 ```
 
 Rules:
@@ -365,10 +356,9 @@ Rules:
 1. `stop()` sets a `threading.Event`; `_run_until_shutdown` ends on it as on the shutdown event, stopping the adapter on
    its own loop. `start()` after `stop()` returns at once, registering nothing. `stop(timeout)` waits for `start()` to
    return when it has begun.
-2. `open`: under the pool's lock, the open gateway, else `factory(session_id)`, a `ValueError` when its `session_id`
-   differs, a `GatewayRunner`, and a daemon thread `gateway-<session_id>` running `start()`. The thread forgets its entry
-   when `start()` returns or raises (logged), only if the entry is still its own.
-3. `close`: pops the entry under the lock and calls `stop(timeout)` outside it.
+2. A gateway per session is the application's: it keeps a `GatewayRunner` per session under its own lock, hosts each
+   on a daemon thread running `start()`, forgets the entry when `start()` returns or raises (only if it is still its
+   own), and calls `stop(timeout)` outside the lock.
 
 #### Example (`examples/api/livekit-voice/google/handoffs/server.py`)
 
@@ -420,8 +410,6 @@ LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the
 | A tool still running when its connection closes | `RealtimeConnection.close` | cancelled (info log); no result sent |
 | A cancelled tool still running after 2 s | `_cancel_tools` | warning; the adapter disconnects; its result is never sent |
 | A tool finishes after its connection closed or its socket failed | `_execute_tool_and_reply` | info log; result not sent |
-| A pooled gateway's `start()` fails | `GatewayPool` | logged; the entry forgotten |
-| A factory raises, or returns an adapter for another session | `GatewayPool.open` | raised / `ValueError` |
 
 ## Testing
 
@@ -454,7 +442,7 @@ LiveKit gateway's participants; `ToolContext.set()` / `reset()`; `AKConfig`; the
 - `test_livekit_gateway.py`: participant tokens (room, grants, refusals, no key); the alias
 - `test_ecs_akagentrunner_realtime.py`: `send_text(..., from_edge=True)`
 - `test_realtime_pool.py`: `TestRealtimeCallFacts` (each fact; `None` without a connection; read while recovering); `TestRealtimeIdle` (at each multiple of the threshold while quiet, started over by activity, a hook's own threshold, only to hooks that ask, in order with other events); `TestRealtimeOutbox` (`while_quiet` dropped by activity, said when quiet); `TestOpenAIRealtimeToolGuards` unchanged (approval and any tool guardrail excluded)
-- `test_integration_gateway_runner.py`: `stop()` from another thread, before `start()`, and its wait; `GatewayPool` open, reuse, close, a failed start forgotten, a factory error, a mismatched session, a slowly leaving gateway not unregistering its replacement
+- `test_integration_gateway_runner.py`: `stop()` from another thread, before `start()`, and its wait; a failed start leaving nothing registered, a slowly leaving gateway not unregistering its replacement
 - Lifecycle cases (`test_realtime_pool.py`): a stale `idle` dropped, a `while_quiet` post refused when busy and dropped on a new connection or a handover
 
 ### New: `examples/api/livekit-voice/google/handoffs/server_test.py`
@@ -483,7 +471,7 @@ cd examples/api/livekit-voice/google/handoffs && ./build.sh local && uv run pyte
 
 - `docs/docs/integrations/livekit.md`: tool callbacks and refusing a handoff, "Tokens for your users", "Talking into a live call", "Watching a live call"; new sections on the call's Live settings (`run_config`) and on recovery; the limitation at `:285` (pre- and post-hooks do not run on realtime turns, realtime hooks do) and at `:288` (a Gemini socket failure no longer restarts the call)
 - `docs/docs/integrations/hooks.md`: `RealtimeHook`, its `idle` event
-- `livekit.md`: "Tools that wait for long work" (a separate session, cancellation, detecting a failed run natively), "Rooms per session" (`GatewayPool`), the call facts and `while_quiet`
+- `livekit.md`: "Tools that wait for long work" (a separate session, cancellation, detecting a failed run natively), "Rooms per session" (a `GatewayRunner` per room), the call facts and `while_quiet`
 - `realtime-internals.md`: tool calls that wait, the idle event, `while_quiet`
 - `docs/docs/architecture/realtime-internals.md`: the adapter events, turn state as internal to the pool, `RealtimeOutbox`, realtime hooks, tool callbacks, a connection recovery section, the stall limit
 - `core/realtime/runner.py`: the callback contract gains `reconnected` and the `reconnecting` status (Rule 2)

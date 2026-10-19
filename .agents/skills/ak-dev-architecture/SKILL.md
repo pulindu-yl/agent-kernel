@@ -11,7 +11,7 @@ description: >
   threads (the integration/thread package), secret resolution (agentkernel.secret: SecretManager,
   SecretProvider, env/aws_ssm), messaging integrations (the integration/adapter
   seam: InboundAdapter/OutboundAdapter, WebhookRESTRequestHandler, PollerRunner), realtime voice
-  (RealtimeConnectionPool, the RealtimeRunner adapters, RealtimeCall, RealtimeHook, tool calls that wait, GatewayPool, the LiveKit gateway),
+  (RealtimeConnectionPool, the RealtimeRunner adapters, RealtimeCall, RealtimeHook, tool calls that wait, GatewayRunner.stop, the LiveKit gateway),
   the adapter pattern, the queue execution pipeline
   (agentkernel.pipeline: QueueMessage/QueueTransport/ConsumerLoop, the in_memory transport,
   AgentRunner/ResponseHandler/RequestHandler/IOHandler, the RESTAPI.run delegation rule, and the
@@ -667,13 +667,12 @@ Caller <-> LiveKitEdgeGateway (StatefulEdgeAdapter, hosted by GatewayRunner via 
   its own room participant, `ak.active` marks the speaker; `participant_token(identity, ...)` signs
   tokens for the application's users with the gateway's own key.
 - **Gateways** (`integration/adapter/gateway.py`): `GatewayRunner.stop(timeout=None)` from any thread, before or
-  after `start()` (a runner stopped first never starts its adapter); `GatewayPool(factory)` opens one gateway per
-  session on a thread of its own (`open`, `get`, `is_open`, `close`, `close_all`), forgets one whose `start()`
-  failed, and refuses an adapter built for another session. A leaving gateway unregisters only its own registry
+  after `start()` (a runner stopped first never starts its adapter); One gateway per session is the application's
+  to compose: it keeps a `GatewayRunner` per session and hosts each on a thread of its own (there is no pool class). A leaving gateway unregisters only its own registry
   entry (`StatefulEdgeRegistry.unregister(session_id, adapter=...)`), so it cannot remove its replacement's.
 - **Testing**: `tests/test_realtime_pool.py` drives the pool and both adapters against scripted sockets
   (`_FakeLiveClient` / `_FakeLiveSession` for Gemini), awaited tool calls included (`TestRealtimeAwaitedTools`);
-  `tests/test_integration_gateway_runner.py` `stop()` and `GatewayPool`; `tests/test_livekit_gateway.py` covers the edge;
+  `tests/test_integration_gateway_runner.py` `stop()`; `tests/test_livekit_gateway.py` covers the edge;
   `examples/api/livekit-voice/google/handoffs/server_test.py` runs offline in the e2e matrix.
 
 ## Scheduling (`ak-py/src/agentkernel/schedule/`)

@@ -127,9 +127,9 @@ Iterations 11 to 16 build spec.md "Application building blocks", in the same PR,
 
 ## Iteration 13: Gateways per session
 
-- **Goal:** a gateway stops on its own; `GatewayPool` opens one per session.
+- **Goal:** a gateway stops on its own, so an application can host one per session.
 - **Files:** `integration/adapter/gateway.py`, `integration/adapter/__init__.py`
-- **Steps:** `GatewayRunner.stop`; `GatewayPool` (spec.md "Gateways").
+- **Steps:** `GatewayRunner.stop` (spec.md "Gateways").
 - **Verify:** `test_integration_gateway_runner.py`.
 
 ## Iteration 14: Example, docs and skills
@@ -148,5 +148,5 @@ Iterations 11 to 16 build spec.md "Application building blocks", in the same PR,
 
 ## Iteration 16: The application (outside this repository)
 
-- **Goal:** the application that drove the change runs on the building blocks: research and review as awaited voice tools running their agents through `AgentService` in sessions of their own (failure detected natively, as before), its nudges an `idle` hook, its rooms a `GatewayPool`, its handoff rules one policy class on ADK's callbacks.
+- **Goal:** the application that drove the change runs on the building blocks: research and review as awaited voice tools running their agents through `AgentService` in sessions of their own (failure detected natively, as before), its nudges an `idle` hook, its rooms one `GatewayRunner` each, its handoff rules one policy class on ADK's callbacks.
 - **Verify:** its tests pass, against a fresh AK build; a live call: handoffs, research and a review (how long the caller waits), a refused handoff, a nudge, the meeting ended while research runs.

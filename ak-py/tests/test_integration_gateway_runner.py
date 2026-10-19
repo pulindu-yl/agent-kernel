@@ -133,38 +133,9 @@ class TestGatewayRunnerStop:
         assert adapter.started is False
         assert StatefulEdgeRegistry.get("room-1") is None
 
-
-class TestGatewayPool:
-    def test_a_session_gets_one_gateway_until_it_is_closed(self):
-        from agentkernel.integration.adapter import GatewayPool
-
-        built = []
-
-        def factory(session_id):
-            built.append(session_id)
-            return StayingGateway(session_id)
-
-        pool = GatewayPool(factory)
-        gateway = pool.open("room-1")
-        _wait(lambda: gateway.started)
-
-        assert pool.open("room-1") is gateway and built == ["room-1"]
-        assert pool.is_open("room-1") and pool.get("room-1") is gateway
-
-        assert pool.close("room-1", timeout=5) is True
-        assert gateway.stopped and not pool.is_open("room-1") and pool.get("room-1") is None
-        assert pool.close("room-1") is False
-
-        reopened = pool.open("room-1")
-        assert reopened is not gateway and built == ["room-1", "room-1"]
-        pool.close_all(timeout=5)
-        assert not pool.is_open("room-1")
-
     def test_a_gateway_leaving_slowly_does_not_unregister_its_replacement(self):
         import asyncio
         import threading
-
-        from agentkernel.integration.adapter import GatewayPool
 
         release = threading.Event()
 
@@ -174,54 +145,26 @@ class TestGatewayPool:
                     await asyncio.sleep(0.01)
                 await super().stop()
 
-        built = []
-
-        def factory(session_id):
-            built.append((SlowToLeave if not built else StayingGateway)(session_id))
-            return built[-1]
-
-        pool = GatewayPool(factory)
-        old = pool.open("room-1")
+        old, new = SlowToLeave("room-1"), StayingGateway("room-1")
+        old_runner, new_runner = GatewayRunner(old), GatewayRunner(new)
+        threading.Thread(target=old_runner.start, daemon=True).start()
         _wait(lambda: old.started)
-        old_runner = pool._runners["room-1"]
-        pool.close("room-1", timeout=0)
-        new = pool.open("room-1")
+        assert old_runner.stop(timeout=0) is False  # still leaving
+        threading.Thread(target=new_runner.start, daemon=True).start()
         _wait(lambda: new.started and StatefulEdgeRegistry.get("room-1") is new)
 
         release.set()
         assert old_runner.stop(timeout=5)
 
         assert StatefulEdgeRegistry.get("room-1") is new
-        pool.close_all(timeout=5)
+        assert new_runner.stop(timeout=5)
         assert StatefulEdgeRegistry.get("room-1") is None
 
-    def test_a_gateway_that_fails_to_start_is_forgotten(self, caplog):
-        import logging
+    def test_a_gateway_that_fails_to_start_leaves_nothing_registered(self):
+        runner = GatewayRunner(StayingGateway(fail=True))
 
-        from agentkernel.integration.adapter import GatewayPool
+        with pytest.raises(RuntimeError, match="could not join the room"):
+            runner.start()
 
-        pool = GatewayPool(lambda session_id: StayingGateway(session_id, fail=True))
-        with caplog.at_level(logging.ERROR, logger="ak.integration.gateway_pool"):
-            pool.open("room-1")
-            _wait(lambda: not pool.is_open("room-1"))
-
-        assert "The gateway of session room-1 failed" in caplog.text
-
-    def test_a_factory_error_opens_nothing(self):
-        from agentkernel.integration.adapter import GatewayPool
-
-        def factory(session_id):
-            raise ValueError("no LiveKit settings")
-
-        pool = GatewayPool(factory)
-        with pytest.raises(ValueError, match="no LiveKit settings"):
-            pool.open("room-1")
-        assert not pool.is_open("room-1")
-
-    def test_a_gateway_built_for_another_session_is_refused(self):
-        from agentkernel.integration.adapter import GatewayPool
-
-        pool = GatewayPool(lambda session_id: StayingGateway("room-2"))
-        with pytest.raises(ValueError, match="for session 'room-2', not 'room-1'"):
-            pool.open("room-1")
-        assert not pool.is_open("room-1")
+        assert StatefulEdgeRegistry.get("room-1") is None
+        assert runner.stop(timeout=1) is True  # start() has returned

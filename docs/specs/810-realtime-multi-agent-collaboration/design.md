@@ -142,15 +142,11 @@ flowchart TB
 - `post_when_idle(..., while_quiet=True)`: for the quiet stretch it is made in: not queued unless the call is quiet, and dropped once that stretch ends (anything happens, or a new connection takes over) before it is said
 - AK decides nothing: whether to act on `idle`, and what to say, is the hook's
 
-### Gateways per session (`GatewayRunner.stop`, `GatewayPool`)
+### Gateways per session (`GatewayRunner.stop`)
 
 - `GatewayRunner.stop()`: callable from any thread, before or after `start()`; the runner stops its adapter on its own loop, as at shutdown; a runner stopped before `start()` never starts the adapter
-- `GatewayPool(factory)`, `integration/adapter/gateway.py`: one gateway per session, for an application that opens a room per meeting
-  - `open(session_id)` builds the adapter with `factory(session_id)` and hosts it on a thread, unless one is already open; returns the adapter
-  - `close(session_id)` stops it; `is_open(session_id)`; `close_all()`
-  - A gateway whose `start()` fails is logged and forgotten, so the next `open` starts a new one; a factory that raises raises from `open`
-  - Any `StatefulEdgeAdapter` with a `session_id`; runs in the process of the Response Handler, as `GatewayRunner` does
-  - A gateway leaving unregisters only its own entry, never the one a later `open` registered for the same session
+- One gateway per session is the application's to compose: it keeps a `GatewayRunner` per session and hosts each on a thread of its own; AK has no pool class
+  - A gateway leaving unregisters only its own entry, never the one a later join registered for the same session
 
 ### Diagnostics
 
@@ -174,14 +170,14 @@ flowchart TB
 ### Tests
 
 - Offline, against scripted sockets: `ak-py/tests/test_realtime_pool.py`, `test_module.py`, `test_livekit_gateway.py`, `test_ecs_akagentrunner_realtime.py`; the example's `server_test.py`
-- New: `test_integration_gateway_runner.py` cases for `stop()` and `GatewayPool`; `TestRealtimeAwaitedTools` in `test_realtime_pool.py`: busy while a tool waits (no post, no `idle`), the result sent once, the call's session and agent back after a nested run, cancellation on close (directly and through `RealtimeCall.close()`) with locks released and nothing sent, nothing sent after a failed socket or by a tool that ignored its cancellation; a Gemini tool slower than the stall wait not taken for a stall
+- New: `test_integration_gateway_runner.py` cases for `stop()`; `TestRealtimeAwaitedTools` in `test_realtime_pool.py`: busy while a tool waits (no post, no `idle`), the result sent once, the call's session and agent back after a nested run, cancellation on close (directly and through `RealtimeCall.close()`) with locks released and nothing sent, nothing sent after a failed socket or by a tool that ignored its cancellation; a Gemini tool slower than the stall wait not taken for a stall
 - The application drives the awaited path end to end (its voice tools through `GoogleADKToolBuilder`, the Gemini adapter and the connection, its background agents through `AgentService` and the OpenAI Agents SDK against a local stand-in for the Responses API)
 - Live runs on `gemini-3.1-flash-live-preview`, done by the maintainer: handoffs, a forced drop, a call past 10 minutes, and how long callers wait for research and review
 
 ### Documentation and skills
 
 - `docs/docs/integrations/livekit.md`, `hooks.md`; `docs/docs/architecture/realtime-internals.md`
-- Tools that wait, the call facts, the idle event and `GatewayPool` in `livekit.md` and `realtime-internals.md`
+- Tools that wait, the call facts, the idle event and a room per meeting in `livekit.md` and `realtime-internals.md`
 - `.agents/skills/ak-dev-architecture/SKILL.md` (a realtime section), `.agents/skills/ak-dev-testing-conventions/SKILL.md`
 - `docs/versioned_docs/` is never edited
 

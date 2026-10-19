@@ -1,6 +1,6 @@
 import logging
 import threading
-from typing import Callable, Optional
+from typing import Optional
 
 from ...core.util.async_bridge import run_async_sync
 from .base import Source, StatefulEdgeAdapter
@@ -19,7 +19,8 @@ class GatewayRunner:
     platform's outbound adapter as it starts, so replies route back to its live connection.
 
     It runs until the process shuts down, or until :meth:`stop` is called from any thread, such as
-    when an application ends the meeting a room was opened for (``GatewayPool``).
+    when an application ends the meeting a room was opened for. An application that opens a room per meeting
+    keeps one runner per room and hosts each on a thread of its own.
     """
 
     _log = logging.getLogger("ak.integration.gateway_runner")
@@ -115,83 +116,3 @@ class GatewayRunner:
                 await task
             except asyncio.CancelledError:
                 pass
-
-
-class GatewayPool:
-    """One gateway per session, opened when a session needs one and closed when it ends.
-
-    For an application that gives each meeting a room of its own: ``open(meeting_id)`` builds the gateway with
-    ``factory(meeting_id)`` and hosts it on a thread of its own, unless it is already open, and ``close`` stops it.
-    A gateway whose ``start()`` fails is logged and forgotten, so the next ``open`` starts a new one. Like
-    ``GatewayRunner``, it runs in the process of the Response Handler. Thread-safe.
-    """
-
-    _log = logging.getLogger("ak.integration.gateway_pool")
-    STOP_TIMEOUT_SECONDS: float = 10.0
-    """How long ``close`` waits for a gateway to leave by default."""
-
-    def __init__(self, factory: Callable[[str], StatefulEdgeAdapter]):
-        """
-        :param factory: Builds the gateway for a session: a ``StatefulEdgeAdapter`` whose ``session_id`` is that
-            session, such as ``lambda sid: LiveKitEdgeGateway(session_id=sid, agent_name="pm")``.
-        """
-        self._factory = factory
-        self._lock = threading.Lock()
-        self._runners: dict[str, GatewayRunner] = {}
-
-    def open(self, session_id: str) -> StatefulEdgeAdapter:
-        """The session's gateway, started on a thread of its own if it is not open yet.
-
-        :raises ValueError: The factory built a gateway for another session, or one ``GatewayRunner`` cannot host.
-        :raises Exception: Whatever the factory raised, such as missing settings; nothing is opened then.
-        """
-        with self._lock:
-            runner = self._runners.get(session_id)
-            if runner is not None:
-                return runner.adapter
-            adapter = self._factory(session_id)
-            if getattr(adapter, "session_id", None) != session_id:
-                raise ValueError(f"The gateway factory built a gateway for session {getattr(adapter, 'session_id', None)!r}, not {session_id!r}")
-            runner = GatewayRunner(adapter)
-            self._runners[session_id] = runner
-        threading.Thread(target=self._host, args=(session_id, runner), name=f"gateway-{session_id}", daemon=True).start()
-        return adapter
-
-    def get(self, session_id: str) -> Optional[StatefulEdgeAdapter]:
-        """The session's open gateway, or ``None``."""
-        with self._lock:
-            runner = self._runners.get(session_id)
-        return runner.adapter if runner is not None else None
-
-    def is_open(self, session_id: str) -> bool:
-        """Whether the session has a gateway open."""
-        with self._lock:
-            return session_id in self._runners
-
-    def close(self, session_id: str, timeout: float = STOP_TIMEOUT_SECONDS) -> bool:
-        """Stop the session's gateway; returns whether it had one. Waits up to ``timeout`` for it to leave."""
-        with self._lock:
-            runner = self._runners.pop(session_id, None)
-        if runner is None:
-            return False
-        if not runner.stop(timeout):
-            self._log.warning(f"The gateway of session {session_id} did not stop within {timeout}s")
-        return True
-
-    def close_all(self, timeout: float = STOP_TIMEOUT_SECONDS) -> None:
-        """Stop every open gateway."""
-        with self._lock:
-            session_ids = list(self._runners)
-        for session_id in session_ids:
-            self.close(session_id, timeout)
-
-    def _host(self, session_id: str, runner: GatewayRunner) -> None:
-        """Run one gateway until it stops; a gateway that fails is forgotten, so the next ``open`` starts a new one."""
-        try:
-            runner.start()
-        except Exception:
-            self._log.exception(f"The gateway of session {session_id} failed")
-        finally:
-            with self._lock:
-                if self._runners.get(session_id) is runner:
-                    del self._runners[session_id]

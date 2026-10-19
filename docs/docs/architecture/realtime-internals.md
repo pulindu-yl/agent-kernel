@@ -290,7 +290,7 @@ The replay is the same as a transfer's: text, not the original audio. Gemini's o
 | `RealtimeConnectionPool`, `RealtimeConnection` | `agentkernel.pipeline.realtime_pool` | Connections per session, ordering, pacing, tool calls and their cancellation |
 | `RealtimeCall`, `RealtimeOutbox` | `agentkernel.pipeline` (`realtime_pool`) | Talking into a call at a quiet moment, and what the call is doing, for application code |
 | `RealtimeHook`, `RealtimeEvent` | `agentkernel.core.hooks` | Observing a call: connection, transcripts, speaker changes, quiet stretches (`idle`) |
-| `GatewayRunner`, `GatewayPool` | `agentkernel.integration.adapter` | Hosting a gateway until shutdown or `stop()`; one gateway per session |
+| `GatewayRunner` | `agentkernel.integration.adapter` | Hosting one gateway until shutdown or `stop()`; an application with a room per meeting keeps one runner per room |
 | `OpenAIRealtimeRunner` | `agentkernel.framework.openai` | OpenAI socket, handoffs by `session.update` |
 | `GoogleADKRealtimeRunner` | `agentkernel.framework.adk` | Gemini socket, transfers by reconnect + history |
 | `LiveKitEdgeGateway` | `agentkernel.integration.livekit` | Room, one participant per agent, who is heard and unmuted |

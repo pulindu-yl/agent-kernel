@@ -100,24 +100,49 @@ LiveKit requires the Agent Kernel execution mode to be set to `realtime`. Standa
 
 ### A room per session
 
-To give each meeting a room of its own, opened when someone joins and closed when the meeting ends, host the gateways
-with `GatewayPool` instead of a fixed list. It runs in the process of the Response Handler, as `IOHandler.run(gateways=...)`
-does:
+To give each meeting a room of its own, opened when someone joins and closed when the meeting ends, host one
+`GatewayRunner` per meeting and keep them by meeting in your application. A runner hosts one gateway in the process of the
+Response Handler, as `IOHandler.run(gateways=[GatewayRunner(gateway)])` does for a fixed list, and `stop()` ends it from
+any thread, even before it has started:
 
 ```python
-from agentkernel.integration.adapter import GatewayPool
+import threading
+
+from agentkernel.integration.adapter import GatewayRunner
 from agentkernel.livekit import LiveKitEdgeGateway
 
-rooms = GatewayPool(lambda meeting_id: LiveKitEdgeGateway(session_id=meeting_id, agent_name="pm"))
+runners: dict[str, GatewayRunner] = {}
+lock = threading.Lock()
 
-gateway = rooms.open(meeting.id)          # joins the room on a thread of its own, unless it is open already
-token = gateway.participant_token(user_id, name=user_name)
-...
-rooms.close(meeting.id)                   # the team leaves the room
+
+def open_room(meeting_id: str) -> LiveKitEdgeGateway:
+    with lock:
+        if meeting_id in runners:
+            return runners[meeting_id].adapter
+        runner = GatewayRunner(LiveKitEdgeGateway(session_id=meeting_id, agent_name="pm"))
+        runners[meeting_id] = runner
+
+    def host():
+        try:
+            runner.start()                    # blocks until the room is left
+        finally:
+            with lock:                        # forget it, unless a newer room has taken its place
+                if runners.get(meeting_id) is runner:
+                    del runners[meeting_id]
+
+    threading.Thread(target=host, daemon=True).start()
+    return runner.adapter
+
+
+def close_room(meeting_id: str) -> None:
+    with lock:
+        runner = runners.pop(meeting_id, None)
+    if runner:
+        runner.stop(timeout=10)               # outside the lock: it waits for the team to leave
 ```
 
-A gateway whose `start()` fails (the room could not be joined) is logged and forgotten, so the next `open` tries
-again. `GatewayRunner.stop()` stops one gateway from any thread, even before it has started.
+A room that could not be joined makes `start()` raise; the thread above forgets it, so the next join tries again. A
+runner still hosting a room when the server shuts down leaves with it.
 
 ### Tokens for your users
 
@@ -403,7 +428,7 @@ Complete working examples (with In-Memory, Kafka, NATS, and AWS SQS architecture
 
 - **No guardrails or pre/post hooks on realtime turns**: voice and chat turns go to the model socket directly, not through `Runtime.run()`, so input/output guardrails, pre/post hooks and the multimodal pre-hook do not run. [Realtime hooks](#watching-a-live-call) do: they observe the call, and cannot change what is said.
 - **Tool limits**: OpenAI tools that need approval or have tool guardrails are not offered in realtime mode (a warning is logged), and ADK toolsets such as MCP are not supported. Plain function tools work on both frameworks.
-- **One room per gateway**: each `LiveKitEdgeGateway` joins one room, and all audio in that room goes to one session; `GatewayPool` opens one per session.
+- **One room per gateway**: each `LiveKitEdgeGateway` joins one room, and all audio in that room goes to one session; an application that gives each meeting a room hosts one runner per room.
 - **History is held by the model connection**: the conversation lives in the model's own session (for a Google ADK transfer, Agent Kernel replays it into the new agent's socket).
   - **Google ADK**: a Gemini socket that drops, stalls or reaches the Live API's connection time limit (about 10 minutes) is replaced with the same agent, seeded with the conversation and a short note that the line dropped (see [Connection recovery](../architecture/realtime-internals.md#connection-recovery-google-adk)); what the caller says meanwhile is held and passed on. Only when every attempt fails, or the new sockets keep dropping, is the call failed.
   - **OpenAI**, and any adapter after a failed call: the next connection starts with no earlier turns, at the entry agent. So does a call evicted after five idle minutes.
