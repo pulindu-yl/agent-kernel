@@ -53,13 +53,7 @@ _LOOP_LAG_WARNING_SECONDS = 1.0
 
 
 class RealtimeConnection:
-    """A persistent realtime WebSocket connection for one session.
-
-    Wraps a framework-specific realtime runner (e.g. ``OpenAIRealtimeRunner``) and handles
-    queue emission for output events (audio deltas, tool calls, etc.).  Lives in the pipeline
-    layer so the framework adapter never imports pipeline types — the adapter talks to the
-    model socket and calls a callback; this class stamps queue attributes and emits.
-    """
+    """A persistent realtime model connection for one session that emits the framework adapter's output to the queue."""
 
     def __init__(self, session_id: str, agent: BaseAgent, runtime: Runtime, session: Session, loop: asyncio.AbstractEventLoop):
         self.session_id = session_id
@@ -140,19 +134,7 @@ class RealtimeConnection:
 
     @property
     def is_responding(self) -> bool:
-        """Whether the model is mid-response: a response it has started and not ended, output not yet
-        emitted to the edge, or a tool call still running.
-
-        A response is open from its first audio or transcript until the adapter reports its ``done``
-        (or the caller barges in), so a pause in the middle of an answer, with the paced audio run
-        out, is not taken for its end; one whose ``done`` never comes stops counting once the model
-        has generated nothing for ``_UNFINISHED_RESPONSE_SECONDS``. A tool call counts until its
-        result is sent, which for a handoff on ADK includes opening the next agent's socket. The
-        model generating before its first output is not visible here, so code deciding the call is
-        quiet also checks that the model has answered whatever it was last given
-        (``last_caller_speech_at``, ``last_edge_text_at``, ``last_tool_result_at``, compared with
-        ``last_model_generated_at``). Safe to read from any thread.
-        """
+        """Whether the model is mid-response, has output not yet emitted to the edge, or has a tool call still running; safe from any thread."""
         return self._audio_queue.qsize() > 0 or self._tools_in_flight > 0 or self._response_unfinished()
 
     def _response_unfinished(self) -> bool:
@@ -161,74 +143,37 @@ class RealtimeConnection:
 
     @property
     def last_model_output_at(self) -> Optional[float]:
-        """Epoch seconds when the model's audio or transcript last left for the edge; ``None`` before that.
-
-        Only output counts. Control events do not (an ``interrupt`` is the caller's doing, and a
-        ``done`` or ``agent_changed`` follows output that already counted), and neither does a
-        finished tool call: its result is input the model has still to answer, see
-        :attr:`last_tool_result_at`.
-        """
+        """Epoch seconds when the model's audio or transcript last left for the edge, or ``None`` before that."""
         return self._last_model_output_at
 
     @property
     def last_model_generated_at(self) -> Optional[float]:
-        """Epoch seconds when the adapter last reported model audio or transcript; ``None`` before that.
-
-        The model's own time, not the caller's: output is generated faster than it is spoken and
-        paced to the edge, so this runs ahead of :attr:`last_model_output_at`. Compared with
-        :attr:`last_agent_change_at` it tells whether the agent now answering has said anything
-        yet, at the moment it calls a tool (a handoff, say), while its words may still be queued.
-        """
+        """Epoch seconds when the adapter last reported model audio or transcript, or ``None`` before that."""
         return self._last_model_generated_at
 
     @property
     def last_agent_change_at(self) -> Optional[float]:
-        """Epoch seconds when the adapter last reported a handoff to another agent (``agent_changed``); ``None`` before that.
-
-        In the model's own time, like :attr:`last_model_generated_at`: what is generated after it
-        is the new agent's.
-        """
+        """Epoch seconds when the adapter last reported a handoff (``agent_changed``), or ``None`` before that."""
         return self._last_agent_change_at
 
     @property
     def last_tool_result_at(self) -> Optional[float]:
-        """Epoch seconds when a tool call's result was last sent to the model; ``None`` before that.
-
-        A result makes the model respond, so until ``last_model_output_at`` is later than this, a
-        reply is still owed. For a handoff on ADK the result seeds the next agent's socket, so this
-        marks the new agent's turn to speak.
-        """
+        """Epoch seconds when a tool call's result was last sent to the model, or ``None`` before that."""
         return self._last_tool_result_at
 
     @property
     def last_edge_text_at(self) -> Optional[float]:
-        """Epoch seconds when text from the edge last reached the model; ``None`` before that.
-
-        Text the caller typed, or a prompt the edge sends on their behalf (such as the LiveKit
-        gateway's greeting when a microphone connects); not text an application sends itself with
-        :meth:`send_text`. Like the caller's speech, it is input the model has still to answer
-        until ``last_model_output_at`` is later.
-        """
+        """Epoch seconds when text from the edge last reached the model, or ``None`` before that."""
         return self._last_edge_text_at
 
     @property
     def last_caller_speech_at(self) -> Optional[float]:
-        """Epoch seconds when the caller was last heard speaking; ``None`` before that.
-
-        It moves when the caller starts speaking (``speech_started`` or ``interrupt``), each time the
-        adapter hears them still speaking (``speech_heard``), and when they stop (``speech_stopped``),
-        so a long answer keeps it current on an adapter that reports any of the last two.
-        """
+        """Epoch seconds when the caller was last heard speaking, or ``None`` before that."""
         return self._last_caller_speech_at
 
     @property
     def is_caller_speaking(self) -> bool:
-        """Whether the caller is speaking now, from the start of their speech until the adapter reports it stopped.
-
-        Known only on an adapter that reports the end of speech (``reports_speech_stopped``, such as
-        OpenAI's server voice activity detection); always ``False`` on one that cannot (Gemini Live),
-        where ``last_caller_speech_at`` moving shows the caller still talking. Safe to read from any thread.
-        """
+        """Whether the caller is speaking now; known only on an adapter that reports ``speech_stopped``, always ``False`` otherwise."""
         return self._caller_speaking
 
     def update_delivery_context(self, request_id: Optional[str], user_id: Optional[str], integration: Optional[str], reply_context: dict) -> None:
@@ -239,15 +184,7 @@ class RealtimeConnection:
         self.reply_context = reply_context
 
     async def connect(self) -> None:
-        """Connect the framework adapter, bind its callback, and start pacing its output.
-
-        The agent the conversation starts with is queued ahead of everything else, with the adapter's
-        team (every agent it can hand off to), so an edge knows who is speaking before the first
-        output and can show the whole team; it is told again after a reconnect, which starts the
-        native conversation over at this agent.
-
-        The agent's realtime hooks are told the call is ``connected`` before any other event of it.
-        """
+        """Connect the framework adapter, bind its callback, start pacing its output and queue the starting agent with its team."""
         await self._audio_queue.put(("agent_changed", {"agent": self.agent.name, "agents": self.adapter.team(self.agent)}))
         await self.adapter.connect(self.session, self.agent, self.handle_framework_event)
         if getattr(self.agent, "realtime_hooks", None):
@@ -258,24 +195,7 @@ class RealtimeConnection:
         self._pacing_task = asyncio.create_task(self._pacing_loop())
 
     async def handle_framework_event(self, event_type: str, data: dict) -> None:
-        """Queue one adapter event for emission.
-
-        Audio, its transcript and the control events (``done``, ``interrupt``, ``agent_changed``)
-        go through ``_audio_queue`` so the pacing loop emits them in the order the model produced
-        them, at playback rate. The transcript rides with its audio rather than ahead of it: after
-        a handoff the new agent's words would otherwise reach the edge while the previous agent's
-        audio is still playing, and be attributed to that agent. A tool call runs on the loop. The
-        adapters only report events in order — pacing is shared here for every framework.
-
-        ``interrupt`` is a barge-in the adapter saw while the model was responding. ``speech_started``
-        is the user starting to speak outside a response: the model has finished generating, but
-        paced audio may still be queued here, so it is a barge-in only while that audio remains;
-        otherwise it is the ordinary start of the user's turn. Either way it, and ``interrupt``, mark
-        when the caller last spoke, as do ``speech_heard`` (still speaking) and ``speech_stopped``.
-        Audio and transcript mark when the model last generated output, and ``agent_changed`` when
-        the conversation last moved to another agent, both as the adapter reports them.
-        ``caller_transcript`` goes straight to the agent's realtime hooks, as ``caller_said``.
-        """
+        """Queue one adapter event, sending audio and control events through the paced queue in the order the model produced them."""
         self.last_activity_at = time.time()
         if event_type in ("interrupt", "speech_started", "speech_heard", "speech_stopped"):
             self._last_caller_speech_at = self.last_activity_at
@@ -323,16 +243,7 @@ class RealtimeConnection:
             await self._fail(data.get("message") or "realtime model socket error")
 
     async def _interrupt(self, data: dict) -> None:
-        """Drop the output not yet emitted and queue the interrupt ahead of the kept control events.
-
-        Audio and its transcript are dropped: the user will not hear them. The control events are
-        kept: a queued ``done`` still has to reach the edge, which resets its interrupted state on
-        it — dropping one would leave that state set into the next turn and swallow that turn's
-        transcript — and an ``agent_changed`` still holds, since a handoff is not undone by talking
-        over the agent that announced it. The interrupt goes before the kept events so the edge
-        sees it before the ``done`` of the turn it cuts off, and it cannot overtake audio already
-        emitted.
-        """
+        """Drop the output not yet emitted and queue the interrupt ahead of the kept control events."""
         kept = []
         while True:
             try:
@@ -347,12 +258,7 @@ class RealtimeConnection:
             await self._audio_queue.put(item)
 
     async def _fail(self, message: str) -> None:
-        """Report a dead model socket to the edge, then mark the connection for eviction.
-
-        A dropped socket would otherwise be written to forever with every later chunk silently
-        lost, so it is surfaced as a terminal error chunk (the edge can tell the user) and
-        ``closed`` is set, which makes the pool drop it and reconnect on the next message.
-        """
+        """Report a dead model socket to the edge as a terminal error chunk, then mark the connection for eviction."""
         _log.error(f"Realtime session {self.session_id} failed: {message}")
         self.closed = True
         if self._pacing_task:
@@ -362,17 +268,7 @@ class RealtimeConnection:
         self._report_closed()
 
     async def _pacing_loop(self) -> None:
-        """Emit model audio at playback rate, with control events behind their own audio.
-
-        The model generates audio faster than it is spoken, so emitting every delta immediately
-        would grow the edge's playback queue without bound. This drains ``_audio_queue`` on a
-        real-time schedule; the transcript and ``done``/``interrupt``/``agent_changed`` ride the
-        same queue so they cannot overtake the audio they belong to (the output queue is FIFO per
-        session).
-
-        The words emitted are what the caller heard, so they are what the realtime hooks are told an
-        agent said (``agent_said``), when its turn ends, it is talked over, or the call moves on.
-        """
+        """Emit model audio at playback rate, keeping the transcript and control events behind the audio they belong to."""
         item_start_time = 0.0
         audio_played_ms = 0.0
         while True:
@@ -428,21 +324,7 @@ class RealtimeConnection:
                 _log.error(f"Error in realtime pacing loop: {e}")
 
     async def _execute_tool_and_reply(self, call_id: str, name: str, arguments: str) -> None:
-        """Execute a tool through the adapter and send the result back to the model.
-
-        The adapter owns invocation (framework-native tool objects differ); this class owns the
-        ``ToolContext`` lifecycle, so a tool function can read ``ToolContext.get()`` while it
-        runs. System tools (sandbox, knowledge base, schedule, ...) are attached to the native
-        agent at wrap time, so they resolve here alongside user-defined tools.
-
-        The call counts toward ``is_responding`` until its result is sent, which then marks
-        ``last_tool_result_at``: the model owes a reply to it.
-
-        The call is a task of this connection's (``_tool_tasks``), which :meth:`close` cancels: a
-        tool may await long work, such as another agent's run, and the call may end meanwhile. A
-        result that comes once the connection is closed (or its socket failed) is not sent: that
-        socket is gone, and the session's next call is another conversation.
-        """
+        """Execute a tool through the adapter in a ``ToolContext``, as a cancellable task of this connection, and send the result to the model."""
         _log.info(f"Executing tool {name} for session {self.session_id}")
         self._tools_in_flight += 1
         sent = False
@@ -497,13 +379,7 @@ class RealtimeConnection:
         self._dispatch_send(self.adapter.append_audio(converted), "append_audio")
 
     def send_text(self, text: str, *, from_edge: bool = False) -> None:
-        """Thread-safe: schedule text send on the pool's event loop.
-
-        :param text: The text to put into the conversation; the model responds to it.
-        :param from_edge: The text came from the edge (the caller typed it, or the edge sent it for
-            them); it then marks :attr:`last_edge_text_at`. Leave it unset for text the application
-            sends itself, such as an update posted into the call.
-        """
+        """Thread-safe: schedule a text send on the pool's event loop, marking ``last_edge_text_at`` when the text came from the edge."""
         self.last_activity_at = time.time()
         if from_edge:
             self._last_edge_text_at = self.last_activity_at
@@ -511,14 +387,7 @@ class RealtimeConnection:
         self._dispatch_send(self.adapter.send_text(text), "send_text")
 
     def _dispatch_send(self, coro, action: str) -> None:
-        """Run a model-send coroutine on the pool loop and observe its result.
-
-        Called from a consumer thread, this blocks until the send finishes (bounded), so the input
-        message is not acked before the audio/text reached the model and a failed socket is
-        reported here rather than vanishing as an unobserved future exception. When already on the
-        pool loop (a direct or test call) it cannot block on itself, so the send is scheduled and
-        any failure is logged by a done-callback.
-        """
+        """Run a model-send coroutine on the pool loop, blocking a consumer thread until it finishes and observing its failure."""
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
@@ -540,13 +409,7 @@ class RealtimeConnection:
             _log.error(f"Realtime session {self.session_id}: failed to {action}: {task.exception()}")
 
     async def close(self) -> None:
-        """Stop pacing, cancel the tool calls still running, and disconnect the adapter; a second call returns at once.
-
-        A cancelled tool call sends no result, and is given a moment (``_TOOL_CANCEL_SECONDS``) to
-        unwind before the adapter disconnects. The realtime hooks are told the call is
-        ``disconnected``, and given a moment (``_HOOK_DRAIN_SECONDS``) to finish the events still
-        waiting for them.
-        """
+        """Stop pacing, cancel running tool calls, disconnect the adapter and tell the hooks ``disconnected``; a second call returns at once."""
         self.closed = True
         if self._disconnecting:
             return
@@ -599,14 +462,7 @@ class RealtimeConnection:
         return self._hook_events is not None and any(getattr(hook, "idle_after_seconds", None) is not None for hook in hooks)
 
     def notice_quiet(self, since: float, now: float, outbox: "RealtimeOutbox") -> None:
-        """Tell each hook that asks for it that the call is ``idle``, each time it has been quiet long enough. Call on the pool loop.
-
-        ``since`` is when the call last stopped being quiet, which names the quiet stretch. A hook with
-        ``idle_after_seconds`` of ``n`` is told once the stretch is ``n`` seconds old, then again at ``2n``, ``3n``
-        and so on while it lasts; anything that ends the stretch (a new ``since``) starts the count over. The event
-        goes to that hook alone, through the hooks' queue, so it is in order with the call's other events and never
-        overlaps them; one whose stretch has ended by the time the hook's turn comes is dropped (``_serve_hooks``).
-        """
+        """Tell each hook with ``idle_after_seconds`` the call is ``idle``, at each multiple of it while the quiet lasts; call on the pool loop."""
         if self._hook_events is None:
             return
         self._quiet_outbox = outbox
@@ -625,15 +481,12 @@ class RealtimeConnection:
 
     @property
     def is_ready(self) -> bool:
-        """Whether the model socket has connected, is not closed and is not being recovered: text sent now
-        reaches the model at once."""
+        """Whether the model socket has connected, is not closed and is not being recovered, so text sent now reaches the model at once."""
         return self._connected_at is not None and not self.closed and not self._recovering
 
     @property
     def last_reconnect_at(self) -> Optional[float]:
-        """Epoch seconds when the adapter last replaced a lost model socket by replaying the conversation into a
-        new one (``reconnected`` with ``seeded``); ``None`` before that. The model owes a reply to that seed, as
-        it does to a tool result, until ``last_model_output_at`` is later."""
+        """Epoch seconds when the adapter last replaced a lost model socket by replaying the conversation into it, or ``None`` before that."""
         return self._last_reconnect_at
 
     @property
@@ -643,11 +496,7 @@ class RealtimeConnection:
 
     @property
     def agent_has_spoken(self) -> bool:
-        """Whether the agent the call is with has said anything since the call moved to it (or began).
-
-        In the model's own time (:attr:`last_model_generated_at` against :attr:`last_agent_change_at`), so
-        it is known when the agent calls a tool, a handoff say, while its words are still being paced out.
-        """
+        """Whether the agent the call is with has said anything since the call moved to it (or began), in the model's own time."""
         generated, changed = self._last_model_generated_at, self._last_agent_change_at
         return generated is not None and (changed is None or generated > changed)
 
@@ -713,22 +562,7 @@ class _Post:
 
 
 class RealtimeOutbox:
-    """What application code has asked to say into one session's call, said at the call's next quiet moment.
-
-    Text sent into a call starts a model response, and on Gemini Live cuts off one being generated, so
-    a post waits until nobody is talking: the model is not mid-response, the caller is not speaking,
-    the model has answered what it was last given (the caller's words, text from the edge, a tool
-    result, a conversation replayed into a recovered socket, the last post), and nothing has happened
-    for ``QUIET_SECONDS``. An input the model never
-    answers (noise, a silent turn) stops holding the call after ``REPLY_TIMEOUT_SECONDS``.
-
-    The pool keeps one per session, not per connection, so a post made while the model socket
-    reconnects, or before the caller joins, is said once a connection is quiet. A post with a ``key``
-    replaces a waiting post with the same key, and ``withdraw`` drops one; a post not said within its
-    ``expires_after`` is dropped. A ``while_quiet`` post is for the quiet stretch it was made in: refused when the call
-    is not quiet, and dropped once the stretch ends (anything happens, or a new connection replaces the old) before
-    it is said. Thread-safe; posts are said by the pool's loop.
-    """
+    """What application code has asked to say into one session's call, said at the call's next quiet moment."""
 
     QUIET_SECONDS = 1.5
     REPLY_TIMEOUT_SECONDS = 15.0
@@ -857,11 +691,7 @@ class RealtimeOutbox:
             self._last_post_at = None
 
     def _owes_reply(self, connection: RealtimeConnection, now: float) -> bool:
-        """Whether the model has still to answer something it was given, and is still being waited for.
-
-        Answered by what the model generated after it, not by what was played after it: words generated before a
-        handoff or a tool result can still be playing out after it, and are no answer to it.
-        """
+        """Whether the model has still to answer something it was given, judged by what it generated after it rather than what was played."""
         output = connection.last_model_generated_at
         given = (
             connection.last_caller_speech_at,
@@ -874,15 +704,7 @@ class RealtimeOutbox:
 
 
 class RealtimeConnectionPool:
-    """Process-wide registry of persistent realtime WebSocket connections.
-
-    One connection per session_id.  Any ConsumerLoop thread can look up a connection
-    by session_id and send audio to it.  The pool runs a single shared asyncio event
-    loop on the ThreadRunner thread it is assigned to, so all WebSocket I/O is
-    multiplexed onto that loop regardless of how many consumer threads feed it.
-
-    Follows the ConversationThreadManager singleton pattern.
-    """
+    """Process-wide registry of persistent realtime connections, one per session, multiplexed onto one shared asyncio event loop."""
 
     _instance: Optional["RealtimeConnectionPool"] = None
     _lock = threading.Lock()
@@ -930,12 +752,7 @@ class RealtimeConnectionPool:
         )
 
     def start(self) -> None:
-        """Blocking entry point: runs the shared asyncio event loop until shutdown.
-
-        Called as a ``ThreadRunner.Task`` execution_function, so this method blocks on
-        the ThreadRunner thread for the lifetime of the pool — the same lifecycle shape
-        as ``AgentRunner.start()`` and ``ResponseHandler.start()``.
-        """
+        """Blocking entry point that runs the shared asyncio event loop on the ThreadRunner thread until shutdown."""
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._loop_ready.set()
@@ -949,11 +766,7 @@ class RealtimeConnectionPool:
             self._loop.close()
 
     def _evict_stale(self, now: float) -> list[tuple[str, "RealtimeConnection", str]]:
-        """Remove the idle connections, and those whose model socket failed; returns them, to be closed.
-
-        Removed under the lock they were inspected under: a consumer may replace a failed connection as soon as the
-        lock is released, and that replacement must not be the one closed.
-        """
+        """Remove the idle connections and those whose model socket failed, under the lock they were inspected under, and return them to be closed."""
         evicted = []
         with self._conn_lock:
             for session_id, conn in list(self._connections.items()):
@@ -998,17 +811,7 @@ class RealtimeConnectionPool:
     def post_when_idle(
         self, session_id: str, text: str, *, key: Optional[str] = None, expires_after: float = 600.0, while_quiet: bool = False
     ) -> bool:
-        """Say ``text`` into the session's live call at its next quiet moment (``RealtimeOutbox``). Thread-safe.
-
-        :param session_id: The call's session.
-        :param text: What to say; the model answers it as it would the caller's words.
-        :param key: A post with the same key still waiting is replaced by this one.
-        :param expires_after: Seconds the post may wait for a quiet moment before it is dropped.
-        :param while_quiet: The post is for the call's current quiet stretch: not queued unless the call is quiet now,
-            and dropped if the stretch ends before it is said.
-        :return: Whether a call is connected now and the post queued. An ordinary post waits either way, for a call
-            to connect.
-        """
+        """Say ``text`` into the session's live call at its next quiet moment (``RealtimeOutbox``); thread-safe."""
         connection = self._live(session_id) if while_quiet else None
         with self._outbox_lock:
             outbox = self._outboxes.setdefault(session_id, RealtimeOutbox(session_id))
@@ -1022,11 +825,7 @@ class RealtimeConnectionPool:
             return outbox.withdraw(key) if outbox is not None else False
 
     def close(self, session_id: str) -> bool:
-        """End the session's call now: close its model connection and drop the posts still waiting for it.
-
-        Thread-safe. The hooks are told ``disconnected``, as for an idle eviction. The session's next input
-        starts a new call. Returns whether the session had a connection.
-        """
+        """End the session's call now, closing its model connection and dropping its waiting posts; thread-safe, returns whether it was open."""
         with self._conn_lock:
             conn = self._connections.pop(session_id, None)
         with self._outbox_lock:
@@ -1044,8 +843,7 @@ class RealtimeConnectionPool:
         return self._live(session_id) is not None
 
     def quiet_for(self, session_id: str) -> Optional[float]:
-        """Seconds since anything happened in the session's call, while nobody is talking and nothing is owed a
-        reply; ``None`` while the call is busy, or when there is no live call."""
+        """Seconds since anything happened in the session's call while it is quiet; ``None`` while it is busy or there is no live call."""
         conn = self._live(session_id)
         if conn is None:
             return None
@@ -1127,12 +925,7 @@ class RealtimeConnectionPool:
                 _log.exception(f"Failed to close connection for session {session_id}")
 
     async def _finish_remaining_tasks(self) -> None:
-        """Let work still on the loop finish briefly, then cancel it, before the loop closes.
-
-        Closing the loop with tasks pending destroys them mid-flight (an SDK client's own close, a
-        tool call), and a consumer thread waiting on a connect that never ran would block until its
-        timeout. Cancelling hands that waiter an immediate error instead.
-        """
+        """Let work still on the loop finish briefly, then cancel it, before the loop closes."""
         current = asyncio.current_task()
         tasks = [task for task in asyncio.all_tasks() if task is not current]
         if not tasks:
@@ -1143,14 +936,7 @@ class RealtimeConnectionPool:
         await asyncio.gather(*pending, return_exceptions=True)
 
     def get_connection(self, session_id: str) -> Optional["RealtimeConnection"]:
-        """Return the session's existing connection, or None.
-
-        Thread-safe fast path for the hot audio path: a caller resolves the agent/session (and
-        the logging that comes with it) only when this returns None and it must create one.
-
-        A connection whose model socket has failed (``closed``) is evicted here, so returning None
-        makes the caller reconnect on this message rather than write to a dead socket.
-        """
+        """Return the session's existing connection or None, evicting one whose model socket failed; thread-safe fast path for the audio path."""
         stale = None
         with self._conn_lock:
             conn = self._connections.get(session_id)
@@ -1175,26 +961,7 @@ class RealtimeConnectionPool:
         integration: Optional[str] = None,
         reply_context: Optional[dict] = None,
     ) -> RealtimeConnection:
-        """Get or create a persistent realtime connection for a session.
-
-        Thread-safe.  Called from any ConsumerLoop thread.  The global lock is held only
-        while checking/inserting the registry entry — the actual WebSocket connect runs
-        outside the lock so one slow session cannot block every other session.
-
-        On SQS FIFO queues, messages with the same group_id (session_id) are delivered
-        to one consumer thread at a time, so concurrent creates for the same session are
-        structurally prevented by the transport.
-
-        A new connection gets its delivery context before it connects: it emits output (the agent
-        it starts with, anything the adapter reports while connecting) as soon as it is connected,
-        and output emitted with no context has no edge to route back to.
-
-        :param request_id: The delivery context, as :meth:`RealtimeConnection.update_delivery_context`
-            takes it; applied only to a connection created here.
-        :param user_id: See ``request_id``.
-        :param integration: See ``request_id``.
-        :param reply_context: See ``request_id``.
-        """
+        """Get or create the session's realtime connection, giving a new one its delivery context before it connects; thread-safe."""
         if not self._loop_ready.wait(timeout=10):
             raise RuntimeError("RealtimeConnectionPool event loop not ready")
         if self._stopping.is_set() or ThreadRunner.shutdown_event.is_set():
@@ -1224,21 +991,7 @@ class RealtimeConnectionPool:
     def dispatch(
         self, body: "BaseRunRequest", request_id: str, user_id: Optional[str], attributes: Mapping[str, Any], chat_service: "ChatService"
     ) -> None:
-        """Forward one realtime input message's requests to its session's model connection.
-
-        The single path every realtime runner (the pipeline's and ECS's) takes, so they cannot drift.
-        During shutdown the input is dropped: the sockets are closing, and replaying it to a new
-        connection after a restart would feed the model stale audio. Otherwise the session's
-        connection is reused, or created on its first message (resolving the agent and session only
-        then, not per audio chunk); its delivery context is refreshed so the output routes back to
-        the edge that sent this input; and each voice or text request is sent to the model.
-
-        :param body: The input message's run request.
-        :param request_id: The resolved request id, stamped on the output.
-        :param user_id: The input's user id, if any.
-        :param attributes: The input message's attributes, carrying the integration return address.
-        :param chat_service: Resolves the agent and session when the connection is created.
-        """
+        """Forward one realtime input message's requests to its session's model connection, creating the connection on first use."""
         if ThreadRunner.shutdown_event.is_set():
             _log.debug(f"Shutting down: dropping realtime input for session {body.session_id}")
             return
@@ -1265,20 +1018,7 @@ class RealtimeConnectionPool:
     def send_permanent_failure(
         transport: QueueTransport, source_attributes: Mapping[str, Any], group_id: Optional[str], dedup_id: Optional[str], error: str
     ) -> None:
-        """Send a terminal error chunk for a realtime input message that exhausted its retries.
-
-        A runner's generic failure reply carries no ``ATTR_REALTIME``, so the Response Handler would
-        route it to a webhook outbound adapter, which a stateful edge does not have. Emitting the
-        same marked ``StreamChunk`` shape the connections emit sends it to the live edge's
-        ``deliver_chunk`` error path instead, so the room is told rather than left silent.
-
-        :param transport: The transport to send the output message on.
-        :param source_attributes: The failed input message's attributes; its user id and integration
-            return address are forwarded.
-        :param group_id: The session id, which is the output queue group.
-        :param dedup_id: Unique id for this output message.
-        :param error: The user-facing error text.
-        """
+        """Send a terminal error chunk to the live edge for a realtime input message that exhausted its retries."""
         attributes = {ATTR_REALTIME: "true", ATTR_REQUEST_ID: source_attributes.get(ATTR_REQUEST_ID) or "unknown"}
         for key, value in source_attributes.items():
             if key == ATTR_USER_ID or IntegrationDelivery.is_routing_attribute(key):
@@ -1292,21 +1032,10 @@ class RealtimeConnectionPool:
 
 
 class RealtimeCall:
-    """A session's live realtime call, as application code outside it sees it: a realtime hook, a webhook, a
-    timer.
-
-    ``post_when_idle`` says something into the call at its next quiet moment, without cutting anyone off;
-    ``quiet_for``, ``connected`` and ``agent_has_spoken`` tell what the call is doing, and ``last_caller_input_at``,
-    ``last_agent_change_at`` and ``last_tool_result_at`` when it last did each. What the caller and the
-    agents say is observed with a ``RealtimeHook`` (``Module.realtime_hook``). It all works in the process that
-    runs the realtime pool (the Agent Runner, which is every process of the single-process topology); in any
-    other process there is no call to reach, and a post is dropped with a warning.
-    """
+    """A session's live realtime call as application code outside it sees it: post into it, inspect it and end it."""
 
     def __init__(self, session_id: str):
-        """
-        :param session_id: The call's session: the session id the edge serves the call under.
-        """
+        """Bind the call to the session id the edge serves it under."""
         self.session_id = session_id
 
     @property
@@ -1316,23 +1045,19 @@ class RealtimeCall:
         return pool is not None and pool.is_connected(self.session_id)
 
     def quiet_for(self) -> Optional[float]:
-        """Seconds since anything happened in the call, while nobody is talking and the model owes no reply; ``None``
-        while the call is busy, or when it is not connected."""
+        """Seconds since anything happened in the call while it is quiet; ``None`` while it is busy or not connected."""
         pool = RealtimeConnectionPool.get()
         return pool.quiet_for(self.session_id) if pool is not None else None
 
     @property
     def agent_has_spoken(self) -> Optional[bool]:
-        """Whether the agent the call is with has said anything since it got the call (or since the call began);
-        ``None`` when the call is not connected. Known as soon as the model generates the words, before they are
-        heard, so a handoff policy can refuse an agent that hands the call on without a word."""
+        """Whether the agent the call is with has said anything since it got the call; ``None`` when the call is not connected."""
         pool = RealtimeConnectionPool.get()
         return pool.agent_has_spoken(self.session_id) if pool is not None else None
 
     @property
     def last_caller_input_at(self) -> Optional[float]:
-        """Epoch seconds when the caller last spoke, or text from the edge (typed by the caller, or sent for them) last
-        arrived; ``None`` before that, or without a call."""
+        """Epoch seconds when the caller last spoke or text from the edge last arrived; ``None`` before that or without a call."""
         pool = RealtimeConnectionPool.get()
         return pool.last_caller_input_at(self.session_id) if pool is not None else None
 
@@ -1344,28 +1069,12 @@ class RealtimeCall:
 
     @property
     def last_tool_result_at(self) -> Optional[float]:
-        """Epoch seconds when a tool's result was last given to the model (it answers it next); ``None`` before that,
-        or without a call."""
+        """Epoch seconds when a tool's result was last given to the model; ``None`` before that or without a call."""
         pool = RealtimeConnectionPool.get()
         return pool.last_tool_result_at(self.session_id) if pool is not None else None
 
     def post_when_idle(self, text: str, *, key: Optional[str] = None, expires_after: float = 600.0, while_quiet: bool = False) -> bool:
-        """Say ``text`` into the call at its next quiet moment. Thread-safe.
-
-        Nothing is cut off: the text waits until the model is not responding, the caller is not speaking, the
-        model has answered what it was last given, and the call has been quiet for a moment. It waits through a
-        reconnect, and for a call that is not connected yet.
-
-        :param text: What to say; the model answers it as it would the caller's words, so say whose it is
-            (for example "[Team update] ...").
-        :param key: A post with the same key still waiting is replaced: a newer progress update supersedes an older one.
-        :param expires_after: Seconds the post may wait before it is dropped as out of date.
-        :param while_quiet: The post is for the quiet moment it is made in, such as a hook's answer to ``idle``: it
-            is not queued unless the call is quiet now, and it is dropped if that quiet ends before it is said (the
-            caller speaks or types, the model says something, the call moves to another agent, a tool's result or
-            another post goes in, or a new connection takes over).
-        :return: Whether the call is connected now and the post queued.
-        """
+        """Say ``text`` into the call at its next quiet moment without cutting anyone off; thread-safe, returns whether it was queued."""
         pool = RealtimeConnectionPool.get()
         if pool is None:
             _log.warning(f"No realtime pool in this process: nothing posted into session {self.session_id}")
@@ -1373,15 +1082,11 @@ class RealtimeCall:
         return pool.post_when_idle(self.session_id, text, key=key, expires_after=expires_after, while_quiet=while_quiet)
 
     def withdraw(self, key: str) -> bool:
-        """Drop the post with ``key`` if it is still waiting, such as a question that no longer applies; returns
-        whether one was dropped."""
+        """Drop the post with ``key`` if it is still waiting, returning whether one was dropped."""
         pool = RealtimeConnectionPool.get()
         return pool.withdraw(self.session_id, key) if pool is not None else False
 
     def close(self) -> bool:
-        """End the call now, such as when the application ends a meeting: its model connection is closed and the
-        posts still waiting for it are dropped. A tool call still running (one awaiting another agent's run, say) is
-        cancelled, and its result is not sent. The session's next input starts a new call. Returns whether the call
-        was open."""
+        """End the call now, closing its model connection, dropping waiting posts and cancelling running tool calls; returns whether it was open."""
         pool = RealtimeConnectionPool.get()
         return pool.close(self.session_id) if pool is not None else False

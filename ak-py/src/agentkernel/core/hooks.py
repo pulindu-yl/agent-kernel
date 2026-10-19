@@ -136,25 +136,7 @@ class PostHook(ABC):
 
 
 class RealtimeEvent(BaseModel):
-    """
-    Something that happened in a live realtime call (``execution.mode: realtime``), as a `RealtimeHook` sees it.
-
-    - ``connected``: the session's model connection opened, on the caller's first input.
-    - ``caller_said``: the caller's words in one turn, as the model transcribed them. Only from an adapter that
-      transcribes the caller, which today is Gemini Live (the OpenAI adapter does not enable input transcription).
-    - ``edge_text``: text the edge sent into the call: what the caller typed, or a prompt the edge sends on their
-      behalf (such as the LiveKit gateway's greeting when a microphone connects). Not text an application posts.
-    - ``agent_said``: an agent's words in one turn, as they reached the edge. ``interrupted`` when the caller
-      talked over the agent; ``text`` is then only what was played before they did.
-    - ``agent_changed``: the call moved to ``agent``. Also sent for the agent the call starts with.
-    - ``reconnected``: the model connection dropped or stalled and was replaced, with ``agent`` still on the call.
-      What the caller said while it was down may be lost (an adapter that recovers this way tells the agent).
-    - ``disconnected``: the session's model connection closed: idle, failed, or shut down.
-    - ``idle``: the call has been quiet for ``quiet_for`` seconds: nobody talking, nothing owed a reply, as
-      ``RealtimeCall.quiet_for()`` judges it. Only to a hook that sets ``idle_after_seconds``, each time another
-      ``idle_after_seconds`` of the same quiet stretch has passed; ``agent`` is the agent whose words were heard last.
-      Whether the quiet means anything is the hook's to decide.
-    """
+    """Something that happened in a live realtime call (``execution.mode: realtime``), as a ``RealtimeHook`` sees it."""
 
     type: Literal["connected", "caller_said", "edge_text", "agent_said", "agent_changed", "reconnected", "disconnected", "idle"]
     session_id: str
@@ -167,39 +149,17 @@ class RealtimeEvent(BaseModel):
 
 
 class RealtimeHook(ABC):
-    """
-    Observes the live realtime calls an agent serves: what the caller and the agents said, and when the call's
-    model connection opened and closed. Attached with `Module.realtime_hook(agent, hooks)` to the agent a call
-    starts with; the agents it hands off to are reported to the same hooks, named in `RealtimeEvent.agent`.
-
-    A hook observes; it cannot change what is said. Hooks run in order, one event at a time, on the realtime
-    pool's event loop but off the audio path, so a slow hook delays only the events behind it: keep `on_event`
-    short, and hand long work to another thread. An exception is logged and the next hook still runs.
-
-    A hook that sets ``idle_after_seconds`` is also told when the call has been quiet that long (``idle``), and again
-    each time as long again has passed while the call stays quiet; anything that ends the quiet (the caller, the
-    model, a handoff, a tool result, a post) starts the count over.
-    That is how an application notices a stalled call without a thread of its own; it decides whether to act,
-    typically with ``RealtimeCall.post_when_idle(..., while_quiet=True)``.
-    """
+    """Observes the live realtime calls an agent serves, attached with ``Module.realtime_hook`` to the agent a call starts with."""
 
     # Seconds of quiet after which this hook is told ``idle``; ``None`` (the default) for no ``idle`` events.
     idle_after_seconds: Optional[float] = None
 
     @abstractmethod
     async def on_event(self, session: "Session", agent: "Agent", event: RealtimeEvent) -> None:
-        """
-        Called for every event of a live call the agent serves.
-
-        :param session: The call's session.
-        :param agent: The agent the call started with, the one the hook is attached to.
-        :param event: What happened.
-        """
+        """Called for every event of a live call served by the agent the hook is attached to."""
         raise NotImplementedError
 
     @abstractmethod
     def name(self) -> str:
-        """
-        :return: the name of the realtime hook.
-        """
+        """Returns the name of the realtime hook."""
         raise NotImplementedError

@@ -559,9 +559,7 @@ class Agent(ABC):
 
     @property
     def realtime_runner_cls(self) -> "Type[RealtimeRunner] | None":
-        """
-        Returns the realtime runner class associated with the agent, if any.
-        """
+        """Returns the realtime runner class associated with the agent, if any."""
         return self._realtime_runner_cls
 
     @property
@@ -580,9 +578,7 @@ class Agent(ABC):
 
     @property
     def realtime_hooks(self) -> list[RealtimeHook]:
-        """
-        Returns the list of realtime hooks registered for the agent: they observe the live calls it serves.
-        """
+        """Returns the list of realtime hooks registered for the agent, which observe the live calls it serves."""
         return self._realtime_hooks
 
     @property

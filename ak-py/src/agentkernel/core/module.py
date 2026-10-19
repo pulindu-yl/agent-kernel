@@ -99,14 +99,7 @@ class Module(ABC):
         return self
 
     def realtime_hook(self, agent: Any, hooks: list[RealtimeHook]) -> Self:
-        """
-        Attaches realtime hooks to the agent: they observe every live call it serves (``execution.mode: realtime``),
-        including the turns of the agents it hands off to. Chained like `pre_hook` / `post_hook`.
-        :param agent: The native framework agent a call starts with.
-        :param hooks: List of realtime hooks to attach.
-        :return: This module, for chaining.
-        :raises ValueError: If the agent is not loaded in this module.
-        """
+        """Attaches realtime hooks that observe every live call the agent serves, including the agents it hands off to; chained like ``pre_hook``."""
         self._wrapped(agent).realtime_hooks.extend(hooks)
         return self
 

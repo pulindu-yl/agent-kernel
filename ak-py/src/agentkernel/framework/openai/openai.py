@@ -625,18 +625,7 @@ class OpenAIRunner(BaseRunner):
 
 
 class OpenAIRealtimeRunner(BaseRealtimeRunner):
-    """
-    OpenAIRealtimeRunner implements RealtimeRunner for the OpenAI Realtime WebSocket API.
-
-    The agent's native handoffs work over the one socket, as the SDK's own realtime session runs
-    them: each enabled handoff is offered as a function and, like a tool call, a handoff call runs
-    through the pool's tool path, so the SDK invokes it (and its ``on_handoff``) inside Agent
-    Kernel's execution scopes. When its result is sent, the session is pointed at the agent the
-    handoff returned (that agent's instructions and tools, by ``session.update``) and
-    ``agent_changed`` is reported. The conversation stays on OpenAI's side, so the new agent sees
-    all of it. The socket's model and voice cannot change, so every agent speaks with the connected
-    agent's model and voice.
-    """
+    """Implements RealtimeRunner for the OpenAI Realtime WebSocket API, running agent handoffs over the one socket with ``session.update``."""
 
     # Server voice activity detection signals the end of the user's speech (``speech_stopped``).
     reports_speech_stopped = True
@@ -680,11 +669,7 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
 
     @staticmethod
     def _realtime_model(agent: BaseAgent) -> str:
-        """The realtime model named by the agent definition.
-
-        Deliberately no adapter-level default: the model is the agent's choice, and a silent
-        fallback would run a different model than the one the caller declared.
-        """
+        """The realtime model named by the agent definition, with no adapter-level default."""
         model = getattr(getattr(agent, "agent", None), "model", None)
         if not isinstance(model, str) or not model:
             raise ValueError(f"Agent '{getattr(agent, 'name', '?')}' must define a realtime model to run in REALTIME mode")
@@ -727,13 +712,7 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
 
     @staticmethod
     def _reachable(root: Agent) -> list[Agent]:
-        """Every agent reachable from ``root`` through handoffs, ``root`` first, nearest first.
-
-        A ``Handoff`` made by ``handoff()`` is followed to its agent; a hand-built one names its agent
-        only when invoked, so the agents beyond it are not reached. A handoff with ``is_enabled=False``
-        is never offered, so its agent is not reached through it; one with an ``is_enabled`` callable
-        is followed, since whether it is enabled is only known at run time.
-        """
+        """Every agent reachable from ``root`` through handoffs, ``root`` first, nearest first, skipping ``is_enabled=False`` ones."""
         reached: list[Agent] = [root]
         seen = {id(root)}
         for agent in reached:
@@ -750,13 +729,7 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
         return reached
 
     def _validate_handoffs(self, root: Agent) -> None:
-        """Check, before connecting, that every handoff the conversation can take can be honoured.
-
-        Raised here rather than when the handoff is reached, so a call never fails half-way. The
-        handoffs of an agent reached only through a hand-built ``Handoff`` are checked when that
-        agent becomes active. A reachable agent that declares a model other than the socket's is
-        warned about: the socket's model cannot change.
-        """
+        """Check before connecting that every handoff the conversation can take can be honoured, warning on a model other than the socket's."""
         for agent in self._reachable(root):
             if agent is not root and isinstance(agent.model, str) and agent.model != self._model:
                 _log.warning(f"Agent '{agent.name}' declares model {agent.model}; REALTIME mode keeps the connection's model {self._model}")
@@ -765,28 +738,14 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
 
     @staticmethod
     def _check_handoff(item: Any) -> None:
-        """Raise for a handoff REALTIME mode cannot honour.
-
-        One that filters or nests the history the next agent sees cannot be applied: the history
-        lives on OpenAI's side of the socket.
-        """
+        """Raise for a handoff REALTIME mode cannot honour, one that filters or nests the history the next agent sees."""
         if not isinstance(item, (Agent, Handoff)):
             raise ValueError(f"Handoff {item!r} is neither an Agent nor a Handoff")
         if isinstance(item, Handoff) and (item.input_filter is not None or item.nest_handoff_history):
             raise ValueError(f"Handoff {item.tool_name} filters or nests the history the next agent sees, which REALTIME mode cannot apply")
 
     async def _activate(self, sdk_agent: Agent) -> dict:
-        """Make ``sdk_agent`` the agent answering, and return the session settings that point the model at it.
-
-        The model may call the agent's offered tools and its enabled handoffs. Its instructions are
-        resolved the way the SDK resolves them for a run (a string, or a callable over the run
-        context); an agent with none leaves them out, so the caller decides what replaces them.
-        Everything is resolved before anything changes, so an agent whose instructions, tools or
-        handoffs cannot be resolved leaves the active agent as it was.
-
-        :param sdk_agent: The SDK agent to activate.
-        :return: The ``session`` payload of a ``session.update``.
-        """
+        """Make ``sdk_agent`` the agent answering and return the ``session`` settings of the ``session.update`` that points the model at it."""
         tools = await self._offered_tools(sdk_agent, self._run_context)
         handoffs = await self._offered_handoffs(sdk_agent, self._run_context)
         instructions = await sdk_agent.get_system_prompt(self._run_context)
@@ -806,12 +765,7 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
         return settings
 
     async def _offered_handoffs(self, sdk_agent: Agent, run_context: RunContextWrapper) -> dict[str, Handoff]:
-        """The agent's handoffs the Realtime session may call, by tool name.
-
-        Collected as the SDK's runner collects them: a ``Handoff`` as declared, an ``Agent`` wrapped
-        by ``handoff()``, and a disabled one (``is_enabled``) left out. Each is checked as
-        :meth:`_validate_handoffs` checks it, for the ones it could not reach before connecting.
-        """
+        """The agent's handoffs the Realtime session may call by tool name, as the SDK's runner collects them, leaving out disabled ones."""
         handoffs = {}
         for item in getattr(sdk_agent, "handoffs", None) or []:
             self._check_handoff(item)
@@ -822,15 +776,7 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
         return handoffs
 
     async def _offered_tools(self, sdk_agent: Agent, run_context: RunContextWrapper) -> dict[str, FunctionTool]:
-        """The agent's tools the Realtime session may call, by name.
-
-        The Realtime API calls only function tools; any other tool type (hosted tools such as web
-        search) cannot run over the socket. A tool that needs approval or carries tool guardrails
-        is not offered either: the SDK's runner applies those around a call, and this runner calls
-        the tool directly, so offering it would skip a check its author asked for. Both are skipped
-        with a warning rather than silently. A disabled tool (``is_enabled``) is left out, as the
-        SDK's own runner leaves it out.
-        """
+        """The agent's tools the Realtime session may call by name: function tools only, skipping any needing approval or with tool guardrails."""
         tools = {}
         for tool in getattr(sdk_agent, "tools", None) or []:
             name = getattr(tool, "name", type(tool).__name__)
@@ -911,12 +857,7 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
             _log.error(f"OpenAI Realtime socket error: {getattr(event, 'error', 'unknown')}")
 
     async def _switch_to(self, chosen: Handoff, target: Agent) -> None:
-        """Point the session at the agent a handoff returned, and report the change.
-
-        Called before the handoff call's output is added, so the follow-up response (requested once
-        every call of the response is answered) is the new agent's and is announced ahead of its
-        audio.
-        """
+        """Point the session at the agent a handoff returned and report the change, before the handoff call's output is added."""
         previous = self._active
         session_config = await self._activate(target)
         # Unlike at connect, an agent with no instructions must not keep the previous agent's.
@@ -937,12 +878,7 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
             await self._connection.send({"type": "response.create"})
 
     async def send_tool_result(self, call_id: str, result: str) -> None:
-        """Add one function call's output; request the follow-up response once every call is answered.
-
-        A response may carry several function calls. Requesting a response per output would start
-        one before the rest are answered, so ``response.create`` is sent once, after the last. The
-        output of a performed handoff is added once the session has moved to its agent.
-        """
+        """Add one function call's output, requesting the follow-up response once every call of the response is answered."""
         if self._connection:
             transfer = self._transfers.pop(call_id, None)
             if transfer is not None:
@@ -962,27 +898,7 @@ class OpenAIRealtimeRunner(BaseRealtimeRunner):
                 await self._connection.send({"type": "response.create"})
 
     async def execute_tool(self, name: str, arguments: str, context: ToolContext, call_id: str) -> str:
-        """Invoke a tool on the OpenAI SDK agent and return its result.
-
-        The SDK's ``on_invoke_tool`` wants its own ``ToolContext`` (built around the run
-        context), not the Agent Kernel one, so it is constructed here. Its run context is the
-        session's ``framework_context``, as on the unary path, so a tool reading
-        ``wrapper.context`` sees the same object in both modes. The Agent Kernel context is set as
-        the active contextvar for the call, which is what a tool function's ``ToolContext.get()``
-        reads.
-
-        Unlike a unary run, a realtime tool call never writes ``framework_context`` back: changes a
-        tool makes to ``wrapper.context`` do not persist.
-
-        Only a tool offered to the agent that made the call runs, even when a handoff has made
-        another agent active since, and it runs through the SDK's ``invoke_function_tool``, which
-        applies the tool's ``timeout_seconds``.
-
-        A handoff call runs here too, as the SDK's own realtime session runs it beside tools: the
-        SDK invokes the handoff (and its ``on_handoff``) and the agent it returns takes over when the
-        call's result is sent. A handoff that raises leaves the agent as it is. A response's second
-        handoff is not invoked; its answer says so.
-        """
+        """Invoke a tool or handoff of the agent that made the call through the SDK, in a ``ToolContext`` over ``framework_context``."""
         from agents.tool import invoke_function_tool
         from agents.tool_context import ToolContext as SDKToolContext
         from agents.usage import Usage

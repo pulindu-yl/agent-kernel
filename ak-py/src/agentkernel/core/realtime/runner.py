@@ -15,22 +15,7 @@ if TYPE_CHECKING:  # typing only; ..tool imports ..base, so this avoids a cycle
 
 
 class RealtimeRunner(Runner):
-    """Base class for framework adapters handling realtime streaming via persistent
-    WebSocket/WebRTC connections (e.g. OpenAI Realtime API).
-
-    ``input_sample_rate`` and ``output_sample_rate`` are the PCM16 mono rates the model wants. The
-    pipeline converts between these and :data:`~agentkernel.core.realtime.pcm.EDGE_SAMPLE_RATE`, so
-    an adapter never resamples and no adapter hardcodes the edge's rate.
-
-    The realtime pool creates one instance per session connection, so an instance may keep that
-    connection's socket and state on ``self``. The pool owns everything around the model socket
-    (audio pacing, barge-in decisions, tool execution scopes, queue emission); an adapter only
-    talks to the model and reports what it does through the ``callback`` given to :meth:`connect`,
-    which is why an adapter never imports pipeline types.
-
-    Bring your own adapter by passing its class as ``realtime_runner_cls`` to the framework's
-    ``Module``.
-    """
+    """Base class for framework adapters that handle realtime streaming over a persistent model socket (e.g. the OpenAI Realtime API)."""
 
     input_sample_rate: int = EDGE_SAMPLE_RATE
     output_sample_rate: int = EDGE_SAMPLE_RATE
@@ -45,26 +30,14 @@ class RealtimeRunner(Runner):
 
     @staticmethod
     async def _cancel_and_wait(task: asyncio.Task | None) -> None:
-        """Cancel a background task of the adapter (its socket listener) and wait for it to end.
-
-        Waiting means nothing the task was doing outlives the call that stopped it. A no-op for
-        None, and for the calling task itself, which cannot wait for its own end.
-        """
+        """Cancel a background task of the adapter and wait for it to end; a no-op for None and for the calling task itself."""
         if task is None or task is asyncio.current_task():
             return
         task.cancel()
         await asyncio.wait({task})
 
     def team(self, agent: "Agent") -> list[str]:
-        """The names of every agent a conversation with ``agent`` can hand off to, ``agent`` first.
-
-        Read before connecting and announced with the starting agent, so an edge can show the whole
-        team before any of it speaks. An adapter with framework-native handoffs walks its agent graph;
-        this default, for one without, is the agent alone. It must not raise: a graph that cannot run
-        is reported by :meth:`connect`.
-
-        :param agent: The agent the conversation starts with.
-        """
+        """The names of every agent a conversation with ``agent`` can hand off to, ``agent`` first; it must not raise."""
         return [agent.name]
 
     async def stream(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AsyncGenerator[StreamEvent, None]:
@@ -74,53 +47,7 @@ class RealtimeRunner(Runner):
 
     @abstractmethod
     async def connect(self, session: Session, agent: "Agent", callback: Callable) -> None:
-        """
-        Establishes a persistent socket connection to the framework's Realtime API backend.
-
-        The pool relies on these rules:
-
-        - Report model events through ``callback`` **in the order the model sent them**: the pool
-          paces audio and orders ``done`` / ``interrupt`` behind it on that basis.
-        - ``callback`` is a coroutine function; await every call.
-        - If connecting fails, close anything already opened before raising: the pool drops a
-          connection that failed to connect without calling :meth:`disconnect`.
-        - Report a socket that fails while connected as ``error``, but not a close caused by
-          :meth:`disconnect`.
-
-        :param session: The session to bind this connection to.
-        :param agent: The agent instance.
-        :param callback: The event callback from the pool, awaited as ``callback(event_type, data)``:
-
-            - ``audio_delta``: ``{"delta": <base64 PCM16 at output_sample_rate>, "message_id": str}``
-            - ``transcript_delta``: ``{"delta": <text>, "message_id": str}``
-            - ``tool_call``: ``{"call_id": str, "name": str, "arguments": <JSON string>}``; the pool
-              then calls :meth:`execute_tool` and :meth:`send_tool_result`
-            - ``done``: ``{"status": ...}``, the end of a model turn; status ``reconnecting`` when the
-              turn ended because the adapter lost its socket and is replacing it, after which the
-              pool posts nothing into the call until ``reconnected`` or ``error``
-            - ``reconnected``: ``{"agent": str, "seconds": int, "seeded": bool}``, optional, for an
-              adapter that recovers a lost socket itself: the socket was replaced and ``agent`` still
-              has the call; ``seeded`` when the new socket was given the conversation to answer. The
-              pool passes it to the agent's realtime hooks
-            - ``error``: ``{"message": str}``, the socket failed; the pool tells the user and
-              replaces the connection
-            - ``interrupt``: ``{}``, the user spoke while the model was responding
-            - ``speech_started``: ``{}``, the user spoke outside a response; the pool treats it as a
-              barge-in only while it still holds audio the user has not heard
-            - ``speech_heard``: ``{}``, the user is still speaking (for example, more of their words
-              were transcribed); report it as often as the model says so, so the pool knows a long
-              answer is still going on
-            - ``speech_stopped``: ``{}``, the user stopped speaking; report it only with
-              :attr:`reports_speech_stopped` set
-            - ``caller_transcript``: ``{"text": str}``, the user's words in a turn, once the model has
-              transcribed the whole turn; optional, for an adapter whose model transcribes the user.
-              The pool passes it to the agent's realtime hooks as ``caller_said``
-            - ``agent_changed``: ``{"agent": str, "previous_agent": str}``, a framework-native
-              handoff moved the conversation to another agent; report it after the previous
-              agent's last output and before the new agent's first. The pool announces the agent
-              a connection starts with (and its :meth:`team`) itself, so an adapter reports only
-              the changes
-        """
+        """Establishes the persistent model socket and reports model events through ``callback`` in the order the model sent them."""
         raise NotImplementedError()
 
     @abstractmethod
@@ -140,28 +67,10 @@ class RealtimeRunner(Runner):
 
     @abstractmethod
     async def execute_tool(self, name: str, arguments: str, context: "ToolContext", call_id: str) -> str:
-        """Executes the named tool with JSON ``arguments`` and returns its string result.
-
-        Owned by the adapter because both the tool object and the context it needs are
-        framework-native: the OpenAI SDK expects its own ``ToolContext`` built around the run
-        context, and ADK injects a ``ToolContext`` (session state, actions) into tools that
-        declare one. The adapter activates ``context`` the way its framework expects; the
-        caller only constructs it.
-
-        :param name: Tool name, matching the model's function call.
-        :param arguments: Raw JSON argument string the model emitted.
-        :param context: The Agent Kernel tool context for this call.
-        :param call_id: The model's function-call id (frameworks correlate the response by it).
-        :return: The tool result as a string.
-        """
+        """Executes the named tool with JSON ``arguments`` in the framework's own tool context and returns its string result."""
         raise NotImplementedError()
 
     @abstractmethod
     async def disconnect(self) -> None:
-        """
-        Closes the active persistent socket connection.
-
-        Must be safe to call more than once, and after a :meth:`connect` that failed or never ran:
-        the pool calls it on idle eviction, on a failed socket, and at shutdown.
-        """
+        """Closes the active model socket; safe to call more than once and after a :meth:`connect` that failed or never ran."""
         raise NotImplementedError()
