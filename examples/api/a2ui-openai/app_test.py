@@ -54,6 +54,25 @@ async def http_client():
         proc.wait()
 
 
+GREETINGS = ("hi", "thanks", "good morning")
+
+
+async def an_unlabelled_turn(client):
+    """Send greetings until one comes back without a label, and return its (session_id, body).
+
+    The agent chooses between prose and a surface, and a greeting sometimes comes back as a Card
+    of Text — the prompt in app.py argues against it but cannot forbid it. Selecting the turn here
+    keeps the assertions below exact instead of widening them to accept either shape: what they
+    pin is the recording path, not the model's taste.
+    """
+    for greeting in GREETINGS:
+        session_id = str(uuid.uuid4())
+        body = await client.send(greeting, session_id=session_id)
+        if "media_type" not in body:
+            return session_id, body
+    pytest.fail(f"every greeting in {GREETINGS} came back as a surface — check the prose rule in app.py's CATALOG")
+
+
 @pytest.mark.asyncio
 async def test_a_ui_turn_arrives_as_an_object(http_client):
     """`result` is the A2UI document itself — no second json.loads, and the label says what it is."""
@@ -68,10 +87,9 @@ async def test_a_ui_turn_arrives_as_an_object(http_client):
 
 @pytest.mark.asyncio
 async def test_a_prose_turn_is_untouched(http_client):
-    """Most turns look like this. Prose does not parse as JSON, so it is never labelled."""
-    body = await http_client.send("hi")
+    """Most turns look like this. Prose does not parse as JSON, so an unlabelled reply stays a string."""
+    _, body = await an_unlabelled_turn(http_client)
 
-    assert "media_type" not in body
     assert isinstance(body["result"], str)
 
 
@@ -101,11 +119,11 @@ async def test_a_prose_turn_replays_as_a_plain_string(http_client):
     This is what an application that never turned A2UI on reads back, and it has to be exactly
     what it read back before the feature existed.
     """
-    session_id = str(uuid.uuid4())
-    await http_client.send("hi", session_id=session_id)
+    session_id, live = await an_unlabelled_turn(http_client)
 
     messages = (await http_client.thread(session_id))["messages"]
     recorded = [m for m in messages if m["role"] == "assistant"][-1]
 
     assert isinstance(recorded["content"], str)
+    assert recorded["content"] == live["result"]
     assert "media_type" not in recorded

@@ -61,7 +61,8 @@ One component MUST have "id": "root". The components this client can draw, and n
   Button      {"label": "..."}
 
 For anything that does not need an interface — a greeting, a question, an explanation — reply with
-ordinary prose. Most turns are prose.
+ordinary prose. Most turns are prose. A surface built only from Card, Heading and Text carries
+nothing a sentence does not: send the sentence instead.
 
 When the user's message is a list of "field: value" pairs, that is a form you already showed coming
 back submitted. Never show the editable form again — that reads as if the submission was lost.
