@@ -233,6 +233,14 @@ teams:
   app_password: ""  # Azure Bot / Entra ID application client secret
   tenant_id: ""  # Bot app registration's own tenant; empty for a multi-tenant bot
 
+# A2UI labelling (optional - off unless `enabled` is true)
+# Labels a JSON reply as A2UI so a client receives the document as an object with its format
+# named, instead of a JSON string. See /docs/advanced/a2ui
+a2ui:
+  enabled: true
+  agents:
+    - expenses  # omit for every agent
+
 # Guardrails configuration
 guardrail:
   input:
@@ -608,6 +616,14 @@ export LANGFUSE_HOST=https://cloud.langfuse.com  # Langfuse host (or self-hosted
 # OpenLLMetry (Traceloop) configuration (required when using OpenLLMetry)
 export TRACELOOP_API_KEY=your-api-key  # Your Traceloop API key
 export TRACELOOP_BASE_URL=https://api.traceloop.com  # Optional: Traceloop base URL (for self-hosted)
+```
+
+### A2UI
+
+```bash
+# Enable A2UI labelling
+export AK_A2UI__ENABLED=true  # default: false
+export AK_A2UI__AGENTS="expenses,support"  # Comma-separated list (default: every agent)
 ```
 
 ### Guardrails Configuration

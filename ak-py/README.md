@@ -20,6 +20,7 @@ Agent Kernel is a lightweight **AI agent runtime** and adapter layer for buildin
 - **MCP Server**: Built-in Model Context Protocol server for exposing agents as MCP tools and exposing any custom tool
 - **A2A Server**: Built-in Agent-to-Agent communication server for exposing agents with a simple configuration change
 - **AG-UI Server**: Built-in [AG-UI protocol](https://github.com/ag-ui-protocol/ag-ui) handler for driving any streaming-capable agent from an AG-UI frontend, with opt-in shared state and client-context tools
+- **A2UI**: Label a JSON reply as [A2UI](https://a2ui.org/) from two config keys, so a client receives a generative-UI document as an object with its format named rather than a string to parse twice
 - **REST API**: Built-in REST API server for agent interaction
 - **Test Automation**: Built-in test suite for testing agents
 
@@ -1088,6 +1089,27 @@ Pydantic AI — not CrewAI or Smolagents). See `examples/api/agui`.
   - **Field**: `agui.client_context.agents`
   - **Default**: unset (every agent gets the tools)
   - **Environment Variable**: `AK_AGUI__CLIENT_CONTEXT__AGENTS` (comma-separated)
+
+#### A2UI Configuration
+
+Labels a JSON reply as [A2UI](https://a2ui.org/) so a client receives the document as an object with
+its format named, instead of a JSON string it has to parse a second time. Agent Kernel supplies the
+media type and nothing else — the component catalog belongs in your agent's instructions, because it
+has to match the components your frontend implements. The block does not reach a streamed run
+(`execution.mode: stream`) or an agent configured with a framework `output_type`; both are told to
+write their own post-hook. See `examples/api/a2ui-openai`.
+
+- **Enabled**
+  - **Field**: `a2ui.enabled`
+  - **Default**: `false`
+  - **Description**: Master switch. When off, no hook runs and no reply is labelled
+  - **Environment Variable**: `AK_A2UI__ENABLED`
+
+- **Agents**
+  - **Field**: `a2ui.agents`
+  - **Default**: unset (every agent's JSON replies are labelled)
+  - **Description**: Agent names whose JSON replies are labelled `application/a2ui+json`. Naming an agent is the declaration that it emits A2UI; a reply from it that does not parse as JSON is left alone
+  - **Environment Variable**: `AK_A2UI__AGENTS` (comma-separated)
 
 #### Trace (Observability) Configuration
 
