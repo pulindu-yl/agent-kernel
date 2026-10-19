@@ -71,12 +71,18 @@ curl -s localhost:8000/api/v1/chat \
   -d '{"prompt": "I need to file an expense", "session_id": "s1", "user_id": "demo-user", "agent": "expenses"}'
 
 # the same turn, read back out of thread history
-curl -s localhost:8000/api/v1/threads/s1
+curl -s localhost:8000/api/v1/threads/s1 -H 'authorization: Bearer demo-token'
 ```
 
-`user_id` is **required** here and was not before: the thread handler owns these chat routes now,
-and a thread belongs to someone. A real app resolves it from a token with an `Authoriser` rather
-than trusting the body.
+Two things about identity, and they are not the same thing. `user_id` is **required** on chat and
+was not before: the thread handler owns these routes now, and a thread belongs to someone — but it
+is still taken from the body, on trust. The **read** routes are different: `app.py` passes a
+`DemoAuthoriser`, so they resolve the caller from a Bearer token, scope the listing to that user,
+and reject reading somebody else's thread. Drop the header and you get a 401.
+
+`demo-token` is a static map entry standing in for a real provider. A real deployment validates a
+token it issued — and authenticates the chat route too, rather than believing the `user_id` it is
+handed.
 
 **Terminal 2 — the UI** (optional; the agent works without it):
 
@@ -140,7 +146,9 @@ job, and it is mostly a prompting job.
 Turning on history is two things: the `thread` block in [`config.yaml`](config.yaml) picks the
 store, and mounting `AgentThreadRequestHandler` is what actually enables recording. The handler
 serves the same chat routes with recording wrapped around them, plus `GET /api/v1/threads` and
-`GET /api/v1/threads/{session_id}` — the two routes the **History** rail in the UI reads.
+`GET /api/v1/threads/{session_id}` — the two routes the **History** rail in the UI reads. Those two
+are behind the `Authoriser`, so `fetchAll` in [`App.tsx`](frontend/src/App.tsx) sends the demo
+token; the chat POST beside it does not.
 
 To see the point: file an expense, then click the conversation again in **History**. The form comes
 back as a form.

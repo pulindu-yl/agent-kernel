@@ -15,10 +15,17 @@ Three things make this work, and only the first is A2UI-specific:
 Mounting is what enables threads; the ``thread`` block only picks the store. Note the one cost:
 ``user_id`` becomes **required** on this handler's chat routes, since a thread belongs to someone.
 
+The handler's ``authoriser`` guards the **read** routes only: a thread is somebody's, so reading
+one takes a token. The chat routes still take ``user_id`` from the body, which is why the frontend
+sends both.
+
 There is no post-hook here. That is the point: handling what comes back is two config keys.
 """
 
+from typing import Optional
+
 from agentkernel.api import RESTAPI
+from agentkernel.auth import Authoriser
 from agentkernel.openai import OpenAIModule
 from agentkernel.thread import AgentThreadRequestHandler
 from agents import Agent
@@ -69,6 +76,26 @@ payload, so the values are part of what gets stored and come back on reload; a s
 reads the same today and is just a sentence tomorrow.
 """
 
+
+class DemoAuthoriser(Authoriser):
+    """
+    Demo Authoriser protecting the thread read endpoints (GET /api/v1/threads*).
+
+    A real subclass would validate the Bearer token against your own authentication
+    provider (e.g. verify a JWT signature) and return the subject's user_id, or None
+    to reject the request. Here a static token map stands in for that provider — one
+    entry, since this example has one user and the sibling thread-openai example is
+    where ownership scoping across users is demonstrated.
+    """
+
+    _TOKENS = {
+        "demo-token": "demo-user",
+    }
+
+    def authorise(self, token: str) -> Optional[str]:
+        return self._TOKENS.get(token)
+
+
 expenses_agent = Agent(
     name="expenses",
     instructions=f"You help staff file expense claims.\n\n{CATALOG}",
@@ -78,4 +105,4 @@ expenses_agent = Agent(
 OpenAIModule([expenses_agent])
 
 if __name__ == "__main__":
-    RESTAPI.run(handlers=[AgentThreadRequestHandler()])
+    RESTAPI.run(handlers=[AgentThreadRequestHandler(authoriser=DemoAuthoriser())])

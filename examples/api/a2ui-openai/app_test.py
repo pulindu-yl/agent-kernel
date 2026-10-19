@@ -15,6 +15,7 @@ class APITestClient:
         self.url = url
         self.session_id = str(uuid.uuid4())
         self.user_id = "demo-user"
+        self.token = "demo-token"  # the thread read routes are behind app.py's DemoAuthoriser
 
     async def send(self, prompt, session_id=None):
         payload = {
@@ -30,7 +31,10 @@ class APITestClient:
 
     async def thread(self, session_id):
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(f"{self.url}/api/v1/threads/{session_id}")
+            resp = await client.get(
+                f"{self.url}/api/v1/threads/{session_id}",
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
             resp.raise_for_status()
             return resp.json()
 

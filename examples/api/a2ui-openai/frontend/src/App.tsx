@@ -17,8 +17,15 @@ import { Surface } from "./a2ui/Surface.tsx";
 import { A2UI_MEDIA_TYPE } from "./a2ui/types.ts";
 import type { A2UIMessage, ChatResponse, ThreadListResponse, ThreadMessage, ThreadResponse, ThreadSummary } from "./a2ui/types.ts";
 
-/** Threads are scoped to a user. A real app resolves this from a token with an `Authoriser`. */
+/**
+ * Two halves of one identity, because the server treats them differently: the chat route takes
+ * `user_id` from the body, while the thread read routes resolve the caller from a Bearer token
+ * through the `Authoriser` in `app.py`. A real app issues the token at login and sends only that.
+ *
+ * `TOKEN` is a demo string matched against a static map, not a credential.
+ */
 const USER_ID = "demo-user";
+const TOKEN = "demo-token";
 
 type Turn =
   | { kind: "you"; text: string }
@@ -42,7 +49,7 @@ async function fetchAll<Row, Body extends { next_cursor?: string | null }>(
   let cursor: string | null | undefined;
   do {
     const page = cursor ? `${url}${url.includes("?") ? "&" : "?"}cursor=${encodeURIComponent(cursor)}` : url;
-    const response = await fetch(page);
+    const response = await fetch(page, { headers: { authorization: `Bearer ${TOKEN}` } });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const body: Body = await response.json();
     all.push(...rows(body));
