@@ -15,7 +15,8 @@ metadata:
 
 ## Code Formatting
 
-Agent Kernel uses `black` for formatting and `isort` for import sorting.
+Agent Kernel uses `black` for formatting, `isort` for import sorting, and `ruff` for the typing rules only
+(pyupgrade `UP006`/`UP007`/`UP035`/`UP045`; see Type annotations below).
 
 ### Auto-format
 
@@ -60,7 +61,13 @@ target-version = ["py312"]
 [tool.isort]
 profile = "black"
 line_length = 150
+
+[tool.ruff.lint]
+select = ["UP006", "UP007", "UP035", "UP045"]
 ```
+
+Examples have no ruff config of their own: the root `Makefile` runs `uvx ruff` over `examples/` in
+`--isolated` mode with the same rules (`RUFF_VERSION`/`RUFF_RULES`), so keep those in sync with `ak-py`.
 
 In example projects, line length is 120:
 
@@ -255,7 +262,7 @@ uv run pytest -s
 - `typing` is still the home of `Any`, `ClassVar`, `Literal`, `Annotated`, `TYPE_CHECKING`, `Self`, `TypedDict`, `TypeVar` and `cast`.
 - Type aliases use the `type` statement: `type AgentReply = AgentReplyText | AgentReplyImage | AgentReplyAny`.
 
-The rule isn't enforced by `make lint-check` (black + isort). To migrate a file, run ruff's pyupgrade rules: `uv run ruff check --isolated --target-version py312 --select UP006,UP007,UP035,UP045 --fix <paths>`, then delete the `typing` imports it leaves unused.
+`make lint-check` / `make lint-check-all` enforce these rules with ruff, and `make lint` / `make lint-all` rewrite the annotations. Ruff can't safely delete the `from typing import ...` names it leaves unused, so the check keeps failing on them (`UP035`) until you remove them by hand.
 
 ### Classes, not script-style functions
 
