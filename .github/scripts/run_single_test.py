@@ -682,13 +682,19 @@ def deploy_azure_resources(path: str, deploy_dir: str = 'deploy', vnet_id: str =
     if 'ak-containerized/azurerm' in main_src or 'ak-azure/containerized' in main_src:
         sweep_azure_orphan_container_env(deploy_path, tf_env)
 
-    # Deploy
-    return run_command(
-        ['./deploy.sh', 'local'],
-        cwd=str(deploy_path),
-        description=f"Deploying {path}",
-        env=tf_env
-    )
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        if run_command(
+            ['./deploy.sh', 'local'],
+            cwd=str(deploy_path),
+            description=f"Deploying {path} (attempt {attempt}/{max_attempts})",
+            env=tf_env
+        ):
+            return True
+        if attempt < max_attempts:
+            print(f"Deploy attempt {attempt}/{max_attempts} failed; retrying in 60s...", flush=True)
+            time.sleep(60)
+    return False
 
 def test_azure_deployment(path: str, deploy_dir: str = 'deploy') -> bool:
     """Test an already deployed Azure resource."""
