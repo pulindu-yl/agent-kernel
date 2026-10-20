@@ -47,6 +47,7 @@ Which capability would you like to add?
 12. **Scheduled Tasks** — Deferred and recurring chat execution (a `schedule` block on a chat request, management routes, agent tools)
 13. **Secret Resolution** — Read API keys through `SecretManager` (environment first, then AWS SSM Parameter Store or a custom provider)
 14. **Human in the Loop** — Pause a run for a person's approval or answer and resume from their decision (a gated tool or an interrupt, a `resume` block on the next request)
+15. **A2UI** — Let an agent answer with an interface instead of prose: its JSON reply is labelled so the client receives a document, not a string
 
 ### Step 3: Generate Changes
 
@@ -1446,6 +1447,57 @@ failed — credentials, network, IAM; never masked by `default`), `ValueError` (
 subclasses `agentkernel.secret.SecretProvider`, implements `get_secret(key) -> Optional[str]`
 (return `None` on a miss), and can be checked with the `agentkernel.secret.testing.SecretProviderContract`
 pytest suite. See `examples/cli/openai-secret` (env) and `examples/aws-serverless/openai` (aws_ssm).
+
+#### A2UI
+
+Let an agent answer with an *interface* rather than prose. It replies with an [A2UI](https://a2ui.org/)
+document — JSON naming components your frontend already implements — and Agent Kernel labels it, so
+the reply arrives as an object with `media_type` beside it instead of a string the client has to
+parse a second time.
+
+Two things make it work, and only the second is configuration. **Agent Kernel ships no component
+catalog**: one listing components your frontend cannot draw is worse than none, because the model
+emits them confidently and nothing renders.
+
+1. Update `config.yaml`:
+```yaml
+a2ui:
+  enabled: true
+  agents:
+    - expenses        # omit for every agent
+```
+
+2. Tell the agent the format and give it *your* catalog, in its instructions. Naming the agent above
+   is the declaration that it emits A2UI; a reply from it that does not parse as JSON is left alone,
+   so ordinary prose turns are unaffected:
+```python
+CATALOG = """
+Reply with ONLY a JSON object in the A2UI format when the answer is better shown than described —
+no prose around it, no markdown fence. One component MUST have "id": "root".
+
+{"version": "v1.0", "createSurface": {"surfaceId": "<name>", "components": [...]}}
+
+The components this client can draw, and nothing else:
+  Card {"children": [ids]} | Text {"text"} | TextField {"label", "name"} | Button {"label"}
+
+For anything that does not need an interface, reply with ordinary prose. Most turns are prose.
+"""
+
+expenses_agent = Agent(name="expenses", instructions=f"{YOUR_INSTRUCTIONS}\n\n{CATALOG}")
+```
+
+3. Read it on the client. `media_type` is the switch — present means `result` is the object:
+```json
+{"result": {"version": "v1.0", "createSurface": {...}},
+ "media_type": "application/a2ui+json",
+ "session_id": "user-123"}
+```
+
+4. Two limits worth knowing before you build on this. It does **not** reach a streamed run
+   (`execution.mode: stream`) — the hook runs on `Runtime.run`, and a warning says so on the first
+   request. And it does **not** touch a reply from an agent you gave a framework `output_type`,
+   since that schema is yours and Agent Kernel has never seen it; write your own post-hook there.
+   See `examples/api/a2ui-openai` for a full demo including a small React renderer.
 
 ---
 

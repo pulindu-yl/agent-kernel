@@ -119,12 +119,12 @@ trino = [
 ]
 
 openai = [
-    "openai-agents>=0.20.0",
+    "openai-agents>=0.20.0,<0.21",
     "openinference-instrumentation-openai-agents>=1.4.0",
     "openai-guardrails>=0.2.1",
 ]
 adk = [
-    "google-adk>=1.14.1",
+    "google-adk>=1.24.0",
     "litellm~=1.89.2",
     "openinference-instrumentation-google-adk>=0.1.6",
 ]
