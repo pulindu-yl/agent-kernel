@@ -5,7 +5,6 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 from ..core.base import Agent as BaseAgent
@@ -30,23 +29,26 @@ _log = logging.getLogger("ak.pipeline.realtime_pool")
 
 # Bound on a consumer thread's wait for a model send to complete before the input is acked.
 _SEND_TIMEOUT_SECONDS = 10.0
+# Bound on a consumer thread's wait for a new connection's model socket to connect.
+_CONNECT_TIMEOUT_SECONDS = 15.0
 # Connections idle for this long are evicted and closed by the pool's background thread.
 _IDLE_TIMEOUT_SECONDS = 300.0
 # How often the pool's loop looks for idle and failed connections to evict.
 _SWEEP_SECONDS = 5.0
-# At shutdown, how long work still running on the pool loop (a socket close, a tool call) may
-# finish before it is cancelled.
+# Allow pending work this long to finish before shutdown cancels it.
 _SHUTDOWN_GRACE_SECONDS = 2.0
 # When a connection closes, how long its realtime observers may take over the events still waiting for them.
 _OBSERVER_DRAIN_SECONDS = 2.0
-# When a connection closes, how long its cancelled tool calls may take to unwind (release the session lock, close
-# what they opened) before the adapter is disconnected without them.
+# Allow cancelled tools this long to clean up before disconnecting the adapter.
 _TOOL_CANCEL_SECONDS = 2.0
-# How often the pool's loop looks for a quiet moment to say what applications posted into their calls.
-_POST_POLL_SECONDS = 0.25
-# A response whose ``done`` never arrives stops counting as under way once the model has generated
-# nothing for this long, so a lost ``done`` cannot hold a call busy for good.
+# How often the pool's loop wakes to look for connections to evict and to measure its own lag.
+_TICK_SECONDS = 0.25
+# Stop treating silent output as busy after this timeout; this does not confirm response completion.
 _UNFINISHED_RESPONSE_SECONDS = 15.0
+# Require a brief quiet interval before sending text, since caller speech may only be paused.
+_QUIET_SECONDS = 1.5
+# Stop waiting for an inferred reply after this timeout; this does not confirm that a reply arrived.
+_REPLY_WAIT_SECONDS = 15.0
 # The pool's loop paces every call's audio; a stall this long is logged, since every call waited behind it.
 _LOOP_LAG_WARNING_SECONDS = 1.0
 
@@ -71,41 +73,32 @@ class RealtimeConnection:
         self.runtime = runtime
         self.session = session
         self.loop = loop
-        # Audio kept ahead of playback at the edge; a higher value absorbs the per-chunk latency
-        # and jitter of a store-and-forward broker.
+        # Buffer audio ahead of edge playback to absorb broker latency and jitter.
         self._playback_lead_ms = AKConfig.get().execution.realtime.playback_lead_ms
 
         self.request_id: Optional[str] = None
         self.user_id: Optional[str] = None
         self.integration: Optional[str] = None
         self.reply_context: dict = {}
-        # Set once the model socket has failed or been closed. The pool evicts a closed
-        # connection so the next chunk reconnects instead of writing to a dead socket.
+        # Mark failed or closed sockets for eviction so later input creates a new connection.
         self.closed = False
-        # One transport for the connection's lifetime: a realtime turn emits tens of chunks a
-        # second, and building a transport (and its client) per chunk is pure overhead.
+        # Reuse one transport per connection to avoid rebuilding clients for every audio chunk.
         self._transport = QueueTransportFactory.create()
         # Audio + terminal/control events are paced here, once for every framework adapter.
         self._audio_queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
-        # Audio deltas in ``_audio_queue`` not yet emitted: the agent audio the user has still to
-        # hear, which is what makes a user starting to speak a barge-in.
+        # Count audio not yet emitted so caller speech can interrupt queued playback.
         self._queued_audio = 0
         self._pacing_task: Optional[asyncio.Task] = None
-        # Set by the first close(): a failed socket (``closed``) is closed later by the pool, and
-        # shutdown and eviction may both reach the same connection, so the adapter is disconnected
-        # once.
+        # Disconnect the adapter only once, even if shutdown and eviction both close it.
         self._disconnecting = False
         self.last_activity_at: float = time.time()
-        # The tool calls running for this connection: cancelled when it closes, since their results have no
-        # socket left to go to, and each holds the session lock while it runs.
+        # Track tool tasks so closing the call cancels work holding its session lock.
         self._tool_tasks: set[asyncio.Task] = set()
         # The tasks holding the session lock for tool calls the adapter's framework runs (``open_tool_scope``).
         self._scope_holders: set[asyncio.Task] = set()
-        # Turn state, for code that talks into the call (possibly from another thread) to tell a
-        # quiet call from a busy one; ``last_activity_at`` cannot, as every caller audio frame moves it.
+        # Track busy state separately from last_activity_at, which advances even on silent audio frames.
         self._tools_in_flight = 0
-        # From the model's first audio or transcript of a response until its ``done`` (or a barge-in):
-        # the model may pause mid-answer, and its paced audio can run out before the rest arrives.
+        # Keep the response open until done or interruption, even if paced audio temporarily runs out.
         self._response_open = False
         self._last_model_output_at: Optional[float] = None
         self._last_model_generated_at: Optional[float] = None
@@ -113,25 +106,21 @@ class RealtimeConnection:
         self._last_tool_result_at: Optional[float] = None
         self._last_caller_speech_at: Optional[float] = None
         self._last_edge_text_at: Optional[float] = None
-        # When the adapter last replaced a lost model socket by replaying the conversation into a new one:
-        # the model owes a reply to what it was seeded with.
+        # Track history replay on reconnect as input that may need a model reply.
         self._last_reconnect_at: Optional[float] = None
         self._caller_speaking = False
-        # From the adapter reporting a lost model socket (``done`` with status ``reconnecting``) until it
-        # reports ``reconnected`` (or fails): text sent meanwhile would wait for a socket, then interrupt the
-        # recovered agent, so nothing is posted into the call.
+        # Block application sends during recovery so they do not interrupt the restarted response.
         self._recovering = False
-        # When the model socket finished connecting; ``None`` until then. Nothing is posted into a
-        # connection (``RealtimeOutbox``) before it, as the adapter has no socket to send to yet.
+        # Block application sends until adapter connection setup has returned.
         self._connected_at: Optional[float] = None
-        # The realtime observers see the call's events one at a time, in order, on a task of their own,
-        # off the audio path (``_serve_observers``); no queue when there are none.
+        # When application text was last sent into this connection (``send_if_quiet``): the model owes it a reply.
+        self._last_post_at: Optional[float] = None
+        # Deliver observer events in order on a separate task; allocate no queue without observers.
         self._observers = list(observers)
         self._observer_events: Optional[asyncio.Queue] = None
         self._observer_task: Optional[asyncio.Task] = None
         self._closed_reported = False
-        # The agent whose words are reaching the edge, and those words since its turn began, for the
-        # observers' ``agent_said``.
+        # Collect the delivered speaker and transcript for agent_said events.
         self._speaker = agent.name
         self._said: list[str] = []
 
@@ -305,8 +294,7 @@ class RealtimeConnection:
                         self._report_said()
                         self._speaker = data["agent"]
                         self._observe("agent_changed", agent=data["agent"])
-                    # A turn ended or the speaker changed: the next audio starts a new pacing window,
-                    # so a gap before it (a handoff's reconnect) is not paid back as a burst.
+                    # Reset pacing after turns and handoffs so connection delays do not cause an audio burst.
                     audio_played_ms = 0.0
                     continue
 
@@ -314,8 +302,7 @@ class RealtimeConnection:
                 if audio_played_ms == 0.0:
                     item_start_time = time.time()
 
-                # The model may output a different rate than the edge; convert once, here, so the
-                # edge always receives EDGE_SAMPLE_RATE audio and no adapter resamples.
+                # Resample model audio once here to the edge rate for every adapter.
                 pcm16 = PCM16Resampler.resample(base64.b64decode(data["delta"]), self.adapter.output_sample_rate, EDGE_SAMPLE_RATE)
                 message_id = data.get("message_id") or ""
                 await self._emit(StreamChunk(event=AudioDelta(message_id=message_id, content=base64.b64encode(pcm16).decode("utf-8"))))
@@ -342,9 +329,7 @@ class RealtimeConnection:
             # The adapter activates this context in its framework's own way, around the framework's own tool call.
             ctx = ToolContext(self.runtime, self.agent, self.session, [])
             try:
-                # Enter the same execution scopes a unary run does, so a tool that reads
-                # Session.current()/Agent.current(), the volatile cache, or holds the session lock
-                # sees them exactly as it would on the normal path.
+                # Give tools the session lock and current-agent context used by normal runs.
                 async with self.session:
                     with self.agent._activate():
                         result_str = await self.adapter.execute_tool(name, arguments, ctx, call_id)
@@ -356,8 +341,12 @@ class RealtimeConnection:
                 _log.info(f"Tool {name} finished after session {self.session_id} closed; its result is not sent: {result_str[:200]}")
                 return
             _log.info(f"Tool {name} result: {result_str[:200]}")
+            try:
+                await self.adapter.send_tool_result(call_id, result_str)
+            except Exception:
+                _log.exception(f"Sending the result of tool {name} to session {self.session_id} failed")
+                return
             sent = True
-            await self.adapter.send_tool_result(call_id, result_str)
         except asyncio.CancelledError:
             _log.info(f"Tool {name} of session {self.session_id} was cancelled: the call closed")
             raise
@@ -367,13 +356,7 @@ class RealtimeConnection:
             self._tools_in_flight -= 1
 
     async def open_tool_scope(self) -> ToolContext:
-        """Open the scope ``_execute_tool_and_reply`` gives a tool, for a call the adapter's framework runs itself, until
-        the calling task ends; see ``RealtimeRunner.use_tool_scope``.
-
-        The session lock is held by a task of its own (``_hold_tool_scope``), since a lock and its context token are
-        entered and left in one task, and this one is the framework's. The calling task gets the current session,
-        agent and tool context in its own context, which ends with it.
-        """
+        """Give a native tool task AK context and a separate session-lock holder until the tool task ends."""
         task = asyncio.current_task()
         if task is None:
             raise RuntimeError("A tool scope is opened from the task running the tool call")
@@ -520,6 +503,50 @@ class RealtimeConnection:
         return self._connected_at is not None and not self.closed and not self._recovering
 
     @property
+    def last_post_at(self) -> Optional[float]:
+        """Epoch seconds when application text was last sent into this connection (``send_if_quiet``), or ``None``."""
+        return self._last_post_at
+
+    def awaiting_reply(self, now: float) -> bool:
+        """Infer a pending reply from input/output timestamps, bounded by _REPLY_WAIT_SECONDS."""
+        output = self._last_model_generated_at
+        given = (self._last_caller_speech_at, self._last_edge_text_at, self._last_tool_result_at, self._last_reconnect_at, self._last_post_at)
+        return any(at is not None and (output is None or output < at) and now - at < _REPLY_WAIT_SECONDS for at in given)
+
+    def quiet_since(self, now: float) -> Optional[float]:
+        """Return the quiet stretch start, or None while unavailable, busy, speaking or awaiting an inferred reply."""
+        if not self.is_ready or self.is_responding or self.is_caller_speaking or self.awaiting_reply(now):
+            return None
+        times = (
+            self._connected_at,
+            self._last_model_output_at,
+            self._last_caller_speech_at,
+            self._last_edge_text_at,
+            self._last_tool_result_at,
+            self._last_reconnect_at,
+            self._last_agent_change_at,
+            self._last_post_at,
+        )
+        return max(t for t in times if t is not None)
+
+    async def send_if_quiet(self, text: str, quiet_since: Optional[float] = None) -> bool:
+        """On the pool loop, send only in an eligible quiet stretch; return False if declined and raise on failure."""
+        now = time.time()
+        since = self.quiet_since(now)
+        if since is None or now - since < _QUIET_SECONDS or (quiet_since is not None and since != quiet_since):
+            return False
+        before, self._last_post_at = self._last_post_at, now
+        try:
+            await self.adapter.send_text(text)
+        except BaseException:
+            # Failed or cancelled: the model may not have the text, so it owes it no reply.
+            self._last_post_at = before
+            raise
+        self.last_activity_at = now
+        _log.info(f"Sent into call {self.session_id}: {text[:200]}")
+        return True
+
+    @property
     def last_reconnect_at(self) -> Optional[float]:
         """Epoch seconds when the adapter last replaced a lost model socket by replaying the conversation into it, or ``None`` before that."""
         return self._last_reconnect_at
@@ -576,157 +603,6 @@ class RealtimeConnection:
             await asyncio.wait({task})
 
 
-# Posting into a call at its next quiet moment (optional: used only through RealtimeCall.post_when_idle)
-
-
-@dataclass
-class _Post:
-    text: str
-    key: Optional[str]
-    expires_at: float
-    # For a ``while_quiet`` post (``post_when_idle(..., while_quiet=True)``): the quiet stretch it was made in, named by
-    # when it began (``RealtimeOutbox._quiet_since``); it is dropped once the call is no longer in that stretch.
-    stretch: Optional[float] = None
-
-
-class RealtimeOutbox:
-    """What application code has asked to say into one session's call, said at the call's next quiet moment."""
-
-    QUIET_SECONDS = 1.5
-    REPLY_TIMEOUT_SECONDS = 15.0
-    MAX_PENDING = 20
-
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self._lock = threading.Lock()
-        self._pending: list[_Post] = []
-        self._last_post_at: Optional[float] = None
-        # The connection the last post went into: a new one owes no reply to it.
-        self._connection: Optional[RealtimeConnection] = None
-
-    @property
-    def empty(self) -> bool:
-        with self._lock:
-            return not self._pending
-
-    def add(
-        self,
-        text: str,
-        key: Optional[str],
-        expires_after: float,
-        now: float,
-        while_quiet: bool = False,
-        connection: Optional[RealtimeConnection] = None,
-    ) -> bool:
-        """Queue a post; returns whether it was queued. A ``while_quiet`` one is queued only while ``connection`` is quiet."""
-        post = _Post(text, key, now + expires_after)
-        with self._lock:
-            if while_quiet:
-                post.stretch = self._quiet_since(connection, now) if connection is not None else None
-                if post.stretch is None:
-                    _log.info(
-                        f"A post for session {self.session_id} was not queued: it is for a quiet moment, and the call is not quiet: {text[:80]}"
-                    )
-                    return False
-            if key is not None:
-                for i, waiting in enumerate(self._pending):
-                    if waiting.key == key:
-                        self._pending[i] = post
-                        return True
-            if len(self._pending) >= self.MAX_PENDING:
-                dropped = self._pending.pop(0)
-                _log.warning(f"Too many posts waiting for session {self.session_id}; dropped the oldest: {dropped.text[:80]}")
-            self._pending.append(post)
-        return True
-
-    def withdraw(self, key: str) -> bool:
-        """Drop the waiting post with ``key``; returns whether there was one."""
-        with self._lock:
-            kept = [post for post in self._pending if post.key != key]
-            withdrawn = len(kept) < len(self._pending)
-            self._pending = kept
-        return withdrawn
-
-    def expire(self, now: float) -> None:
-        with self._lock:
-            for post in self._pending:
-                if post.expires_at <= now:
-                    _log.info(f"A post for session {self.session_id} expired before the call was quiet: {post.text[:80]}")
-            self._pending = [post for post in self._pending if post.expires_at > now]
-
-    def quiet_for(self, connection: RealtimeConnection, now: float) -> Optional[float]:
-        """Seconds since anything happened in ``connection``'s call, or ``None`` while it is busy or owes a reply."""
-        with self._lock:
-            return self._quiet_for(connection, now)
-
-    def take(self, connection: RealtimeConnection, now: float) -> Optional[str]:
-        """The next post to say into ``connection`` now, removed from the outbox; ``None`` while the call is busy."""
-        self.expire(now)
-        with self._lock:
-            self._drop_overtaken(connection, now)
-            if not self._pending:
-                return None
-            quiet = self._quiet_for(connection, now)
-            if quiet is None or quiet < self.QUIET_SECONDS:
-                return None
-            post = self._pending.pop(0)
-            self._last_post_at = now
-        return post.text
-
-    def _quiet_for(self, connection: RealtimeConnection, now: float) -> Optional[float]:
-        """``quiet_for``, with the lock held."""
-        since = self._quiet_since(connection, now)
-        return None if since is None else now - since
-
-    def _quiet_since(self, connection: RealtimeConnection, now: float) -> Optional[float]:
-        """When the call last stopped being quiet, or ``None`` while it is busy; with the lock held, as it may forget the
-        last post, which a new connection owes nothing to."""
-        self._notice(connection)
-        if not connection.is_ready or connection.is_responding or connection.is_caller_speaking or self._owes_reply(connection, now):
-            return None
-        times = (
-            connection.connected_at,
-            connection.last_model_output_at,
-            connection.last_caller_speech_at,
-            connection.last_edge_text_at,
-            connection.last_tool_result_at,
-            connection.last_reconnect_at,
-            connection.last_agent_change_at,
-            self._last_post_at,
-        )
-        return max(t for t in times if t is not None)
-
-    def _drop_overtaken(self, connection: RealtimeConnection, now: float) -> None:
-        """Drop the ``while_quiet`` posts whose quiet stretch has ended, with the lock held."""
-        if not any(post.stretch is not None for post in self._pending):
-            return
-        current = self._quiet_since(connection, now)
-        kept = []
-        for post in self._pending:
-            if post.stretch is not None and post.stretch != current:
-                _log.info(f"A post for session {self.session_id} was dropped: the call moved on before it was said: {post.text[:80]}")
-            else:
-                kept.append(post)
-        self._pending = kept
-
-    def _notice(self, connection: RealtimeConnection) -> None:
-        if connection is not self._connection:
-            self._connection = connection
-            self._last_post_at = None
-
-    def _owes_reply(self, connection: RealtimeConnection, now: float) -> bool:
-        """Whether the model has still to answer something it was given, judged by what it generated after it rather than what was played."""
-        output = connection.last_model_generated_at
-        given = (
-            connection.last_caller_speech_at,
-            connection.last_edge_text_at,
-            connection.last_tool_result_at,
-            connection.last_reconnect_at,
-            self._last_post_at,
-        )
-        return any(at is not None and (output is None or output < at) and now - at < self.REPLY_TIMEOUT_SECONDS for at in given)
-
-
 # The pool: every call of this process, on one event loop
 
 
@@ -735,8 +611,7 @@ class RealtimeConnectionPool:
 
     _instance: Optional["RealtimeConnectionPool"] = None
     _lock = threading.Lock()
-    # The process's realtime observers (``RealtimeCall.observe``), kept apart from the instance since the application
-    # registers them before the pool starts; each new connection takes those registered by then.
+    # Allow observer registration before pool startup; new connections capture the current list.
     _observers: list[RealtimeObserver] = []
     _observers_lock = threading.Lock()
 
@@ -778,13 +653,8 @@ class RealtimeConnectionPool:
         self._conn_lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_ready = threading.Event()
-        # Set once shutdown starts: no connection is created after it, since the loop it would run
-        # on is about to close.
+        # Reject new connections once shutdown begins.
         self._stopping = threading.Event()
-        # What applications asked to say into each session's call (``post_when_idle``), per session so
-        # that it outlives a reconnect.
-        self._outboxes: dict[str, RealtimeOutbox] = {}
-        self._outbox_lock = threading.Lock()
 
     def get_task(self) -> ThreadRunner.Task:
         """Returns the ThreadRunner.Task that runs this pool's event loop."""
@@ -831,45 +701,22 @@ class RealtimeConnectionPool:
             now = time.time()
             if now - last_sweep > _SWEEP_SECONDS:
                 last_sweep = now
-                # Idle connections, and connections whose model socket failed: a failed one is otherwise
-                # released only when its session sends more input, which a caller who left never does.
+                # Close idle and failed connections even when no further input arrives.
                 for session_id, conn, reason in self._evict_stale(now):
                     _log.info(f"Realtime session {session_id} {reason}; evicting.")
                     self._loop.create_task(conn.close())
-            try:
-                self._deliver_posts(now)
-            except Exception:
-                _log.exception("Failed to deliver posts into realtime calls")
             before = time.monotonic()
-            await asyncio.sleep(_POST_POLL_SECONDS)
-            lag = time.monotonic() - before - _POST_POLL_SECONDS
+            await asyncio.sleep(_TICK_SECONDS)
+            lag = time.monotonic() - before - _TICK_SECONDS
             if lag > _LOOP_LAG_WARNING_SECONDS:
                 _log.warning(f"The realtime loop was blocked for {lag:.1f} s: every call's audio, replies and tools waited behind it")
 
-    # Talking into a live call, for application code (see RealtimeCall)
-
-    def post_when_idle(
-        self, session_id: str, text: str, *, key: Optional[str] = None, expires_after: float = 600.0, while_quiet: bool = False
-    ) -> bool:
-        """Say ``text`` into the session's live call at its next quiet moment (``RealtimeOutbox``); thread-safe."""
-        connection = self.live_connection(session_id) if while_quiet else None
-        with self._outbox_lock:
-            outbox = self._outboxes.setdefault(session_id, RealtimeOutbox(session_id))
-            queued = outbox.add(text, key, expires_after, time.time(), while_quiet=while_quiet, connection=connection)
-        return queued and self.live_connection(session_id) is not None
-
-    def withdraw(self, session_id: str, key: str) -> bool:
-        """Drop the post with ``key`` still waiting for the session's call; returns whether there was one."""
-        with self._outbox_lock:
-            outbox = self._outboxes.get(session_id)
-            return outbox.withdraw(key) if outbox is not None else False
+    # Reaching a session's call, for application code (see RealtimeCall)
 
     def close(self, session_id: str) -> bool:
-        """End the session's call now, closing its model connection and dropping its waiting posts; thread-safe, returns whether it was open."""
+        """End the session's call now, closing its model connection; thread-safe, returns whether it was open."""
         with self._conn_lock:
             conn = self._connections.pop(session_id, None)
-        with self._outbox_lock:
-            self._outboxes.pop(session_id, None)
         if conn is None:
             return False
         conn.closed = True
@@ -891,28 +738,6 @@ class RealtimeConnectionPool:
         with self._conn_lock:
             conn = self._connections.get(session_id)
         return conn if conn is not None and conn.is_ready else None
-
-    def outbox(self, session_id: str) -> RealtimeOutbox:
-        """The session's outbox, made on first use; it outlives a reconnect."""
-        with self._outbox_lock:
-            return self._outboxes.setdefault(session_id, RealtimeOutbox(session_id))
-
-    def _deliver_posts(self, now: float) -> None:
-        """Say each session's next post into its call if the call is quiet; forget outboxes left with nothing to do."""
-        with self._outbox_lock:
-            outboxes = list(self._outboxes.values())
-        for outbox in outboxes:
-            conn = self.live_connection(outbox.session_id)
-            if conn is None:
-                outbox.expire(now)
-            else:
-                text = outbox.take(conn, now)
-                if text is not None:
-                    _log.info(f"Posted into call {outbox.session_id}: {text[:200]}")
-                    conn.send_text(text)
-            with self._outbox_lock:
-                if conn is None and outbox.empty and self._outboxes.get(outbox.session_id) is outbox:
-                    del self._outboxes[outbox.session_id]
 
     async def _close_all(self) -> None:
         """Close every connection, including one a consumer thread registered while this ran."""
@@ -974,20 +799,27 @@ class RealtimeConnectionPool:
             existing = self._connections.get(session_id)
             if existing is not None and not existing.closed:
                 return existing
-            # Reserve the slot so a concurrent caller for a different session proceeds
-            # without waiting for this session's connect.
+            # Reserve this session before connecting so other sessions need not wait.
             conn = RealtimeConnection(session_id, agent, runtime, session, self._loop, observers=self._observers)
             conn.update_delivery_context(request_id, user_id, integration, reply_context or {})
             self._connections[session_id] = conn
 
         # Connect outside the global lock.
+        future = None
         try:
             future = asyncio.run_coroutine_threadsafe(conn.connect(), self._loop)
-            future.result(timeout=15)
+            future.result(timeout=_CONNECT_TIMEOUT_SECONDS)
             return conn
         except Exception:
+            # A connect that timed out still runs on the loop: stop it, and close whatever it opened, since nothing evicts it now.
+            if future is not None:
+                future.cancel()
+            conn.closed = True
             with self._conn_lock:
-                self._connections.pop(session_id, None)
+                if self._connections.get(session_id) is conn:
+                    del self._connections[session_id]
+            if not self._loop.is_closed() and not self._stopping.is_set():
+                asyncio.run_coroutine_threadsafe(conn.close(), self._loop)
             raise
 
     def dispatch(
@@ -1037,7 +869,7 @@ class RealtimeConnectionPool:
 
 
 class RealtimeCall:
-    """A session's live realtime call as application code outside it sees it: post into it, inspect it and end it."""
+    """Public call access; the application owns message scheduling and retry policy."""
 
     def __init__(self, session_id: str):
         """Bind the call to the session id the edge serves it under."""
@@ -1072,12 +904,15 @@ class RealtimeCall:
         """Whether the call's model socket is connected now."""
         return self._live() is not None
 
+    def quiet_since(self) -> Optional[float]:
+        """Return the quiet-stretch epoch timestamp for send_if_quiet, or None while the call is unavailable or busy."""
+        conn = self._live()
+        return conn.quiet_since(time.time()) if conn is not None else None
+
     def quiet_for(self) -> Optional[float]:
         """Seconds since anything happened in the call while it is quiet; ``None`` while it is busy or not connected."""
-        pool, conn = self._pool(), self._live()
-        if pool is None or conn is None:
-            return None
-        return pool.outbox(self.session_id).quiet_for(conn, time.time())
+        since = self.quiet_since()
+        return None if since is None else time.time() - since
 
     @property
     def agent_has_spoken(self) -> Optional[bool]:
@@ -1105,20 +940,23 @@ class RealtimeCall:
         conn = self._open()
         return conn.last_tool_result_at if conn is not None else None
 
-    def post_when_idle(self, text: str, *, key: Optional[str] = None, expires_after: float = 600.0, while_quiet: bool = False) -> bool:
-        """Say ``text`` into the call at its next quiet moment without cutting anyone off; thread-safe, returns whether it was queued."""
+    async def send_if_quiet(self, text: str, *, quiet_since: Optional[float] = None) -> bool:
+        """Await from any loop; send in the eligible quiet stretch or return False without queuing; send failures raise."""
         pool = self._pool()
-        if pool is None:
-            _log.warning(f"No realtime pool in this process: nothing posted into session {self.session_id}")
+        loop = pool._loop if pool is not None else None
+        if loop is None or loop.is_closed():
             return False
-        return pool.post_when_idle(self.session_id, text, key=key, expires_after=expires_after, while_quiet=while_quiet)
+        # Sending does not guarantee playback; later caller speech can still interrupt it.
+        send = self._send_if_quiet(pool, text, quiet_since)
+        if asyncio.get_running_loop() is loop:
+            return await send
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(send, loop))
 
-    def withdraw(self, key: str) -> bool:
-        """Drop the post with ``key`` if it is still waiting, returning whether one was dropped."""
-        pool = self._pool()
-        return pool.withdraw(self.session_id, key) if pool is not None else False
+    async def _send_if_quiet(self, pool: "RealtimeConnectionPool", text: str, quiet_since: Optional[float]) -> bool:
+        conn = pool.live_connection(self.session_id)
+        return await conn.send_if_quiet(text, quiet_since) if conn is not None else False
 
     def close(self) -> bool:
-        """End the call now, closing its model connection, dropping waiting posts and cancelling running tool calls; returns whether it was open."""
+        """End the call now, closing its model connection and cancelling running tool calls; returns whether it was open."""
         pool = self._pool()
         return pool.close(self.session_id) if pool is not None else False

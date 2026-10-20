@@ -12,7 +12,8 @@ remains, with research and review in the application as awaited tools.
 
 Revised: iterations 2, 4 and 6 built a Gemini adapter that drove Gemini Live itself and re-implemented ADK's tool
 callbacks, history and recovery. Iteration 17 replaces them with ADK's own live engine; they are kept below as built,
-marked superseded.
+marked superseded. Likewise the outbox of iterations 5 and 11: iteration 18 replaces it with a guarded send, the
+application keeping what waits.
 
 ## Iteration 1: Core contracts
 
@@ -55,8 +56,8 @@ marked superseded.
 - **Goal:** application code posts into a call at a quiet moment and watches it through observers.
 - **Files:** `realtime_pool.py`, `ak-py/src/agentkernel/pipeline/__init__.py`
 - **Steps:**
-  1. Add `RealtimeOutbox` and its delivery from the pool's loop, per spec.md "Outbox", with every state write under its lock.
-  2. Add the pool's `post_when_idle`, `withdraw` and `close`, its lookups (`open_connection`, `live_connection`, `outbox`), and `RealtimeCall` reading the call's facts through them; export `RealtimeCall`.
+  1. Add `RealtimeOutbox` and its delivery from the pool's loop, with every state write under its lock (superseded by Iteration 18).
+  2. (`post_when_idle` and `withdraw` superseded by Iteration 18.) Add the pool's `post_when_idle`, `withdraw` and `close`, its lookups (`open_connection`, `live_connection`, `outbox`), and `RealtimeCall` reading the call's facts through them; export `RealtimeCall`.
   3. Add `RealtimeCall.observe` / `unobserve` and the observer queue and task, per spec.md "Observers".
   4. Add the loop-lag warning, and make the sweep close failed connections, per spec.md "Sweep and loop lag".
 - **Verify:** `TestRealtimeOutbox`, `TestRealtimeCall`, `TestRealtimeObservers`, the sweep and loop-lag tests.
@@ -115,7 +116,7 @@ marked superseded.
 
 Iterations 11 to 16 build spec.md "Application building blocks", in the same PR, each leaving the suite green.
 
-## Iteration 11: Call facts and `while_quiet`
+## Iteration 11: Call facts and `while_quiet` (the outbox part superseded by Iteration 18)
 
 - **Goal:** application code reads the call's facts and acts on a quiet call, with no thread of its own.
 - **Files:** `pipeline/realtime_pool.py`
@@ -172,4 +173,20 @@ Iterations 11 to 16 build spec.md "Application building blocks", in the same PR,
   5. Move each agent's voice to its model (`Gemini(model=..., speech_config=...)`) in the example.
 - **Verify:** `test_adk_realtime.py` on ADK 2.7.0, 2.8.0 and 2.11.0; `TestRealtimeToolScope`; the full suite;
   `make lint-check-all`; a live call through the driving application.
+
+## Iteration 18: A guarded send instead of an outbox
+
+- **Goal:** AK keeps the delivery mechanics and the application the scheduling: no queue of application text in AK.
+- **Files:** `pipeline/realtime_pool.py`, `ak-py/tests/test_realtime_pool.py`; in the driving application, its call
+  link, the meeting's end, and their tests
+- **Steps:**
+  1. Move the quiet rule onto `RealtimeConnection` (`awaiting_reply`, `quiet_since`, `last_post_at`), the owed reply
+     named as an inference, and add `send_if_quiet`, per spec.md "The quiet rule and the guarded send".
+  2. Add `RealtimeCall.send_if_quiet` and `quiet_since`, running the send on the pool's loop from any loop.
+  3. Remove `RealtimeOutbox`, `post_when_idle`, `withdraw`, the pool's outboxes and their delivery; the loop's tick is
+     `_TICK_SECONDS`.
+  4. In the application: what waits (keys, expiry, a bounded list, the stretch a nudge is for) per call, under a lock,
+     tried by its watch on the realtime loop; cleared when the meeting ends.
+- **Verify:** `TestRealtimeQuietCall`, `TestRealtimeCall`, `TestRealtimeAwaitedTools`; the application's delivery tests;
+  the full suite; a live call (nudges, approval and project updates, the renewal notice).
 

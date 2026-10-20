@@ -3,7 +3,7 @@
 Realtime support for applications in which voice agents and other agents work together: voice agents talk to the
 caller and hand off to each other; a voice agent's tool can ask another registered agent and wait for its answer,
 which returns through the tool call. The design idea: voice is the meeting room, not the engine. The pool gains the
-turn state and an outbox that let application code speak into a call at a quiet moment, observers that let it watch one,
+turn state and a guarded send that let application code speak into a call at a quiet moment, observers that let it watch one,
 and ownership of its tool calls, so a call that ends cancels a tool still waiting; the Gemini adapter runs each call on
 ADK's own live engine, so ADK's tool callbacks, plugins, transfers, history and session resumption apply in a call as on
 any ADK run, and AK adds only what ADK lacks: the tool scope, event reporting and restarting a run that failed. On top of these, the building blocks
@@ -65,7 +65,7 @@ flowchart TB
     E <--> V["Voice agents<br/>talk, hand off (tool callbacks can refuse)"]
     V -- "async tool, awaited" --> J["Another registered agent<br/>AgentService.run_multi<br/>a session of its own"]
     J -- "result or failure: the tool's reply" --> V
-    APP["Application code<br/>policies and wording"] -- "RealtimeCall.post_when_idle" --> V
+    APP["Application code<br/>policies, wording, what waits"] -- "RealtimeCall.send_if_quiet" --> V
     V -. "RealtimeObserver events" .-> APP
 ```
 
@@ -87,11 +87,13 @@ flowchart TB
   - The ADK adapter reports `speech_started` once per caller turn, while the model is silent
 - No change to stream events, queue messages or edges
 
-### Talking into a live call (`RealtimeCall`, `RealtimeOutbox`)
+### Talking into a live call (`RealtimeCall.send_if_quiet`)
 
-- A post waits until the call is ready, nobody is talking, the model owes no reply (to the caller, edge text, a tool result, a restarted run or the last post, each bounded), and the call has been quiet for a moment
-- One outbox per session, so posts outlive a reconnect; keyed posts replace, `withdraw(key)` drops, posts expire, the queue is bounded
-- `RealtimeCall(session_id)` in `agentkernel.pipeline`: `post_when_idle`, `withdraw`, `connected`, `quiet_for()`, `agent_has_spoken`, `close()`
+- AK keeps the delivery mechanics, the application the scheduling. `await RealtimeCall(session_id).send_if_quiet(text, quiet_since=None) -> bool` sends only into a quiet call: ready, no tool running, no output still to play, the caller not speaking, no reply taken to be owed (to the caller, edge text, a tool result, a seeded reconnect or earlier application text), and quiet for a moment; with `quiet_since`, only while the call is still in that quiet stretch
+- The check and the send run as one step on the pool's loop, from whichever loop awaits it; never blocking that loop. Sent is not heard: later caller speech and barge-in still apply. A failing send raises
+- Declined, nothing is kept: AK holds no queue of application text. What waits, what replaces, expires or is withdrawn, and what a moved-on call makes obsolete are the application's, which keeps them per call so they outlive a renewed connection
+- A reply owed is inferred, not observed (the model is silent before its first output): each input counts for at most 15 s, after which the pool stops waiting; it never takes the reply for given
+- `RealtimeCall(session_id)` in `agentkernel.pipeline`: `send_if_quiet`, `connected`, `quiet_since()`, `quiet_for()`, `agent_has_spoken`, `close()`, `observe` / `unobserve`
 - No configuration: thresholds are constants
 
 ### Realtime observers (`RealtimeObserver`)
@@ -113,7 +115,7 @@ flowchart TB
 - A live run that ends or fails anyway, or stalls (no model progress for a while after it was given something to answer, never while a tool runs), is started again on the same ADK session: ADK resumes the agent that had the call with the conversation, and a one-time note that the line dropped is queued for it
 - `reconnected` is reported only once the restarted run sends its first event; a restart that fails before is not reported
 - Repeated quick drops give up as an `error`, which fails the connection as today
-- While recovering, the connection is not ready for posts; a failed connection is released by the pool even if no more input comes
+- While recovering, `send_if_quiet` declines; a failed connection is released by the pool even if no more input comes
 - OpenAI realtime is unchanged
 
 ### Tool calls that wait (`RealtimeConnection`)
@@ -132,8 +134,8 @@ flowchart TB
 
 - `RealtimeCall` reads, `None` without a connection: `last_caller_input_at` (the caller last spoke, or edge text arrived), `last_agent_change_at`, `last_tool_result_at`
 - A handover ends a quiet stretch, as caller input and model output do
-- `post_when_idle(..., while_quiet=True)`: for the quiet stretch it is made in: not queued unless the call is quiet, and dropped once that stretch ends (anything happens, or a new connection takes over) before it is said
-- No quiet-call event: an application that acts on a quiet call reads `quiet_for()` from a task of its own on the realtime loop (started by an observer on `connected`, cancelled on `disconnected`), so it needs no thread; a `while_quiet` post guards against a stretch that ended meanwhile
+- `quiet_since()` names the current quiet stretch; text meant only for it passes it to `send_if_quiet`, which declines once anything happened (a new connection included)
+- No quiet-call event: an application that acts on a quiet call reads `quiet_for()` from a task of its own on the realtime loop (started by an observer on `connected`, cancelled on `disconnected`), so it needs no thread; `send_if_quiet(..., quiet_since=...)` guards against a stretch that ended meanwhile
 - AK decides nothing: whether to act on a quiet call, and what to say, is the application's
 
 ### Gateways per session (`GatewayRunner.stop`)
@@ -150,7 +152,7 @@ flowchart TB
 
 - **No new configuration fields.** Reason each candidate was rejected:
   - Turn detection, languages: ADK's `RunConfig` already holds them, carried by `Module.run_options`
-  - Post timing, reconnect and stall thresholds: values settled in live runs, kept as constants rather than knobs nobody has asked to tune
+  - The quiet delay, the reply wait, restart and stall thresholds: values settled in live runs, kept as constants rather than knobs nobody has asked to tune
   - The tool-cancel wait: a constant, at the scale of the observer drain (2 s); a tool's own time limit is the application's
 - No new extra; existing YAML and `AK_*` env vars stay valid; the `adk` extra requires `google-adk>=2.7.0`
 
@@ -194,7 +196,7 @@ flowchart TB
 
 ## Open questions
 
-- Resolved: one PR (#818) for all of it; the parts depend on each other (posts on recovery, the example on posts and observers)
+- Resolved: one PR (#818) for all of it; the parts depend on each other (sending on recovery, the example on observers)
 - Resolved: no browser voice edge in this change. AG-UI cannot carry a voice call (no audio events; one HTTP request per turn; the stream path, not the realtime pool), and a browser edge is a new integration that needs its own design: hosting next to `GatewayRunner`, authentication, and the integration checklist. A separate issue if the team wants one
 - Resolved (revised): ADK's native session resumption is used whenever ADK holds a handle; AK restarts the run only when ADK's own recovery ends
 - Resolved (revised): a tool's result outlives a lost socket: ADK notices the loss only once its tools have returned, so the result is in the conversation the restarted run is given
@@ -204,6 +206,7 @@ flowchart TB
 - Resolved (revised): no background jobs. The application's product decision is that the caller may wait while research or review runs, so their result returns through the original tool call. Awaited tools need nothing new from AK beyond the connection owning its tool calls; the job runner, its hosting in both realtime runners, the pool's readiness wait, `BackgroundJobHost` and the job API are removed from this PR. Nothing of it was released
 - Resolved (revised): OpenAI realtime tool input guardrails are out of this PR, to keep it to what the application depends on; a tool with any tool guardrail stays unoffered, as before
 - Resolved: no failed-reply type and no agent tool in this PR (Non-goals): a check on the reply alone cannot tell an error from an answer, so failure is detected during the run, natively, by the application's own code
-- Resolved (revised): no idle event. It made the observer a per-hook timer in AK (thresholds, per-stretch counts, stale-event drops) for one application's nudge; `RealtimeCall.quiet_for()` and `while_quiet` posts already give an application all it needs, polled from a task on the realtime loop
+- Resolved (revised): no idle event. It made the observer a per-hook timer in AK (thresholds, per-stretch counts, stale-event drops) for one application's nudge; `RealtimeCall.quiet_for()` and `send_if_quiet(..., quiet_since=...)` already give an application all it needs, polled from a task on the realtime loop
 - Resolved (revised): `RealtimeObserver`, registered with `RealtimeCall.observe`, replaces `RealtimeHook` / `Module.realtime_hook` / `Agent.realtime_hooks`: it is read-only, so not one of AK's hooks, and it observes the call, not an agent
 - Resolved (revised): the pool stays in `pipeline/realtime_pool.py`, the path released in agentkernel 0.9.5, so its imports, singleton and patch targets are unchanged; no `pipeline/realtime/` package. `core/realtime/` and `integration/adapter/` are unchanged
+- Resolved (revised): no outbox in AK. `RealtimeOutbox`, `post_when_idle` and `withdraw` (never released) scheduled one application's messages inside AK: keys, expiry, a bounded queue, which posts a moved-on call makes obsolete. AK now keeps only the delivery mechanics, `send_if_quiet` with the final check on the pool's loop, so the check and the send cannot be separated by a change in the call; the application keeps what waits, per call, and when to try again. The quiet rule and the inferred owed reply stay in AK, since only the pool sees what is still playing and what the model was last given

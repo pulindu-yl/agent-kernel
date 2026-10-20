@@ -638,17 +638,20 @@ Caller <-> LiveKitEdgeGateway (StatefulEdgeAdapter, hosted by GatewayRunner via 
   agent's words to another; a barge-in drops queued audio and transcript but keeps `done` and
   `agent_changed`. The pool emits the first `AgentChanged` (starting agent + team) itself.
 - **Turn state** (#810): `RealtimeConnection` tracks responding, caller speech, model output, tool
-  results, edge text, reconnects and readiness. It is internal (the class is not exported).
-- **`RealtimeCall(session_id)`** (`agentkernel.pipeline`, #810): the public face for application code:
-  `post_when_idle(text, key=, expires_after=)` says text into the call at its next quiet moment through
-  the session's `RealtimeOutbox` (nobody talking, no reply owed, quiet for `QUIET_SECONDS`); `withdraw`,
-  `connected`, `quiet_for()`, `agent_has_spoken`, the times `last_caller_input_at` / `last_agent_change_at` /
-  `last_tool_result_at`, `close()`. `post_when_idle(..., while_quiet=True)` ties a post to the current quiet
-  stretch (`RealtimeOutbox._quiet_since`, which a handover also ends): refused when the call is not quiet, dropped
-  once the stretch changes (a new connection included). `RealtimeCall.observe(observer)` / `unobserve` register
-  process-wide realtime observers. In-process only: it reaches a call only in the process running the pool.
-- **Module layout** (#810): `pipeline/realtime_pool.py` (the pool, `RealtimeConnection`, `RealtimeOutbox`,
-  `RealtimeCall`), the path agentkernel 0.9.5 shipped, so its imports and patch targets (`_SHUTDOWN_GRACE_SECONDS`,
+  results, edge text, application text (`last_post_at`), reconnects and readiness, which are observed; and two
+  inferences, named as such: a reply owed (`awaiting_reply`: an input the model generated nothing after, for at most
+  `_REPLY_WAIT_SECONDS`, after which the pool stops waiting without recording a reply) and a response still under way
+  (`_UNFINISHED_RESPONSE_SECONDS`). `quiet_since(now)` names the current quiet stretch. Internal (the class is not exported).
+- **`RealtimeCall(session_id)`** (`agentkernel.pipeline`, #810): the public face for application code. AK keeps the
+  delivery mechanics, the application the scheduling: `await send_if_quiet(text, quiet_since=None) -> bool` runs the
+  connection's check and send as one step on the pool's loop (marshalled there from any loop, never blocking it):
+  sent only if ready, not responding, the caller not speaking, no reply owed and quiet for `_QUIET_SECONDS`, and, given
+  `quiet_since`, still in that stretch. Declined, nothing is kept: AK has no queue of application text (no outbox);
+  what waits, replaces, expires or is dropped is the application's, kept per call. Sent is not heard; a failing send
+  raises. Also `connected`, `quiet_since()`, `quiet_for()`, `agent_has_spoken`, the times `last_caller_input_at` /
+  `last_agent_change_at` / `last_tool_result_at`, `close()`, and `observe(observer)` / `unobserve`. In-process only:
+  it reaches a call only in the process running the pool.
+- **Module layout** (#810): `pipeline/realtime_pool.py` (the pool, `RealtimeConnection`, `RealtimeCall`), the path agentkernel 0.9.5 shipped, so its imports and patch targets (`_SHUTDOWN_GRACE_SECONDS`,
   ...) are unchanged; `core/realtime/` keeps the adapter contracts and audio primitives, `integration/adapter/` the
   gateways. The public path for `RealtimeCall` is `agentkernel.pipeline` (lazy export into `realtime_pool`). Logger:
   `ak.pipeline.realtime_pool`.

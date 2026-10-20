@@ -325,27 +325,37 @@ Application code outside a tool call (a realtime observer, a webhook, a timer) c
 from agentkernel.pipeline import RealtimeCall
 
 call = RealtimeCall("room_01")
-call.post_when_idle("[Team update] The build finished; 12 tests pass.", key="build")
+sent = await call.send_if_quiet("[Team update] The build finished; 12 tests pass.")
 ```
 
 Text sent into a call starts a model response, and on Gemini Live it cuts off one still being generated, so
-`post_when_idle` waits for a quiet moment: the model is not responding, the caller is not speaking, the model
-has answered what it was last given, and nothing has happened for a moment. Whichever agent has the call
-answers the post. A post waits through a reconnect and for a call that has not connected yet, and is dropped
-after `expires_after` seconds (10 minutes by default). A newer post with the same `key` replaces one still
-waiting, and `call.withdraw(key)` drops one that no longer applies. Say whose words a post is (for example
-`[Team update] ...`): the model takes it as it would the caller's words.
+`send_if_quiet` sends only into a quiet call: connected and not recovering, no tool running, no output still to play,
+the caller not speaking, the model not taken to owe a reply (to the caller's turn, typed text, a tool result or earlier
+application text), and nothing having happened for a moment. It returns whether it sent the text. Declined, nothing is
+kept: Agent Kernel keeps no queue of application text, so whether to try again, when, and when to give up are the
+application's (keep what is waiting per call, so it outlives a renewed model connection). Whichever agent has the call
+answers. Say whose words the text is (for example `[Team update] ...`): the model takes it as it would the caller's words.
 
-`RealtimeCall` also tells what the call is doing: `connected`, `quiet_for()` (seconds the call has been quiet,
-or `None` while it is busy) and `agent_has_spoken` (whether the agent with the call has said anything since it
-got it, known as soon as the model generates the words: a handoff policy can refuse an agent that hands the call
-on without a word). It tells when each last happened, too: `last_caller_input_at` (the caller spoke, or the edge
-sent text), `last_agent_change_at` and `last_tool_result_at`, in epoch seconds, `None` without a call. See
-[Turn state](../architecture/realtime-internals.md#turn-state) for how quiet is decided.
+- **One step on the pool's loop.** The check and the send run together on the realtime pool's event loop, whichever
+  loop awaits `send_if_quiet` (a web handler's, or the pool's own in an observer's task), so the call cannot change
+  between them. It never blocks the pool's loop.
+- **Sent is not heard.** The caller may start speaking right after; the usual barge-in applies.
+- **A failing send raises**; without a pool or a live call, `send_if_quiet` returns `False`.
+- **The owed reply is inferred.** Between being given something and its first output, the model is silent: a reply is
+  taken to be owed while it has generated nothing since, for at most 15 seconds, after which the pool stops waiting (the
+  model may never answer). The pool does not take that as an answer having come.
 
-`post_when_idle(..., while_quiet=True)` is for text that only applies to the quiet moment it was made in: it is
-not queued unless the call is quiet now (it returns `False`), and it is dropped if that quiet ends before it is
-said (the caller, the model, a handoff, a tool result, another post, or a new model connection).
+`RealtimeCall` also tells what the call is doing: `connected`, `quiet_since()` / `quiet_for()` (when the call's quiet
+stretch began, and for how long, or `None` while it is busy) and `agent_has_spoken` (whether the agent with the call
+has said anything since it got it, known as soon as the model generates the words: a handoff policy can refuse an
+agent that hands the call on without a word). It tells when each last happened, too: `last_caller_input_at` (the
+caller spoke, or the edge sent text), `last_agent_change_at` and `last_tool_result_at`, in epoch seconds, `None` without
+a call. See [Turn state](../architecture/realtime-internals.md#turn-state) for how quiet is decided.
+
+Text that only applies to one quiet moment (a nudge) passes the stretch it was made for:
+`send_if_quiet(text, quiet_since=stretch)`, with `stretch` from `quiet_since()`. It is sent only while the call is still
+in that stretch; anything happening (the caller, the model, a handoff, a tool result, other text, a new model
+connection) starts a new one.
 
 ## Tools that wait for long work
 
@@ -373,7 +383,7 @@ async def request_research(question: str) -> str:
 - **Sessions**: a realtime tool runs inside the call's AK session and holds its lock until it returns, so the agent
   it asks must run in a session of its own; running it in the call's session would wait on that lock for ever. Tool
   calls the model makes in one turn share the call's session, so they run one after another.
-- **While it waits**: the call counts as busy (`is_responding`). Nothing posted with `post_when_idle` is said and
+- **While it waits**: the call counts as busy (`is_responding`). `send_if_quiet` declines and
   `RealtimeCall.quiet_for()` is `None` until the result is sent. The caller's audio still reaches the model; what the model
   does with it while its tool call is open is the model's own behaviour. Gemini Live is not taken for stalled
   meanwhile: its wait for an answer starts when the result is sent. On Google ADK, ADK reads nothing from the
@@ -428,8 +438,8 @@ and the next one still runs.
 
 To act on a call that has gone quiet (nudge a stalled agent, say), read `RealtimeCall.quiet_for()`: an observer can
 start a task on `connected` that checks it every second or so and cancel it on `disconnected`, so the application
-needs no thread of its own. Whether to act, and what to say, is the application's; a
-`post_when_idle(..., while_quiet=True)` post is dropped if anything happens before it is said.
+needs no thread of its own. Whether to act, and what to say, is the application's; text sent with
+`send_if_quiet(..., quiet_since=...)` is declined if anything happened since the quiet stretch began.
 
 ## Example Projects
 
