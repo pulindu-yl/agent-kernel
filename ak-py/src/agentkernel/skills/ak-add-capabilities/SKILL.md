@@ -719,7 +719,7 @@ module.run_options(agent, options_for, max_turns=25, hooks=ProgressHooks())
 | smolagents | `agent.run` | `max_steps` | `step_callbacks` on the agent constructor (needs nothing from Agent Kernel) | `task`, `reset`, `additional_args`, `stream`, `return_full_result` |
 | Claude Agent SDK | the run's `ClaudeAgentOptions` (any field; a name that is not a field is rejected) | `max_turns` (and `max_budget_usd`) | native `hooks` | `resume`, `session_id`, `continue_conversation`, `fork_session`, `resume_session_at`, `resume_drops_turn`, `session_store`, `session_store_flush`, `enable_file_checkpointing`, `include_partial_messages`, and the `ak` entry of `mcp_servers` |
 
-Worked demos: `examples/cli/<framework>-run-options` for each of the six original frameworks (none yet for the Claude Agent SDK), and
+Worked demos: `examples/cli/<framework>-run-options` for each of the seven frameworks, and
 `examples/cli/openai-dynamic-run-options` for options computed per run.
 
 **Streaming event hook (optional):** override `on_stream_event` on a `PostHook` to inspect or modify every event a streamed run produces while `execution.mode: stream` is active. Unlike `on_run` it sees the whole stream — message and reasoning text, tool call names, arguments and results, and the boundaries that pair them. Return the event to pass it on, a modified event of the same `type` to rewrite it, `None` to drop it, or a list to emit several events in its place (a list is emitted as-is and ends the chain for that event, so `return event` and `return [event]` differ). Raise `StreamHalt` to end the run: Agent Kernel closes any open boundary, emits one error chunk, and does not store the session. Only called when streaming; regular `on_run()` still handles the non-streaming path.
@@ -766,7 +766,7 @@ these accessors are for hooks only. Tools must use their framework's native hand
 (`RunContextWrapper.context` on OpenAI, `RunContext.deps` on Pydantic AI, `tool_context.state` on ADK,
 ...) since a tool writing through `ToolContext.get().session` writes to a different object than the one
 the run is carrying. Round-trip fidelity is framework-dependent (full for OpenAI/Pydantic AI, partial for
-ADK/smolagents/LangGraph, unsupported for CrewAI and the Claude Agent SDK) — see the framework's page under `docs/docs/frameworks/`
+ADK/smolagents/LangGraph, supported for Claude-bound Python tools through `ClaudeToolContext.get()`, and unsupported for CrewAI) — see the framework's page under `docs/docs/frameworks/`
 for specifics.
 
 **Accessing the framework-native session (optional):** unlike `framework_context` above (an app-defined
@@ -1262,9 +1262,11 @@ needed, so it is declared where the framework declares it. Agent Kernel answers 
 `status: "PAUSED"` and the pending interruptions; the next request carries a `resume` block instead
 of a prompt.
 
-**Ask:** Which framework is the agent on? Only four can pause — OpenAI Agents SDK, LangGraph, Pydantic
-AI and Google ADK. CrewAI and smolagents cannot, and the Claude Agent SDK adapter does not yet; all three report
-`supports_pause = False` rather than pretending.
+**Ask:** Which framework is the agent on? OpenAI Agents SDK, LangGraph, Pydantic AI, Google ADK and
+Claude Agent SDK can pause. Claude pauses a single tool call with `ClaudeToolBuilder.bind(...,
+needs_approval=True)`; concurrent tool calls cannot be deferred by the native SDK, and the bound
+tool handler refuses execution without a matching approval. CrewAI and smolagents report
+`supports_pause = False`.
 
 **Important:** the pause is written into the **session**, so a durable one needs a shared session
 backend. With `session.type: in_memory` the record lives in one process and the replica receiving the

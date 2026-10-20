@@ -80,8 +80,31 @@ class TestSchema:
         with pytest.raises(TypeError, match="Expected a callable"):
             ClaudeToolBuilder.bind(["nope"])
 
+    def test_variadic_parameters_are_rejected_at_bind_time(self):
+        def unsupported(*values: str) -> str:
+            return ",".join(values)
+
+        with pytest.raises(TypeError, match="variadic parameter 'values'"):
+            ClaudeToolBuilder.bind([unsupported])
+
+    def test_unresolvable_annotations_fail_at_bind_time(self):
+        def unsupported(value: "MissingType") -> str:
+            return value
+
+        with pytest.raises(NameError, match="MissingType"):
+            ClaudeToolBuilder.bind([unsupported])
+
 
 class TestHandler:
+    @pytest.mark.asyncio
+    async def test_positional_only_parameters_are_passed_positionally(self):
+        def greet(name: str, /, punctuation: str = "!") -> str:
+            return f"Hello {name}{punctuation}"
+
+        [tool] = ClaudeToolBuilder.bind([greet])
+
+        assert await tool.handler({"name": "Ada"}) == {"content": [{"type": "text", "text": "Hello Ada!"}]}
+
     @pytest.mark.asyncio
     async def test_a_sync_function_returns_text_content(self):
         [tool] = ClaudeToolBuilder.bind([get_weather])
@@ -125,3 +148,32 @@ class TestNames:
     def test_mcp_tool_name(self):
         assert ClaudeToolBuilder.MCP_SERVER == "ak"
         assert ClaudeToolBuilder.mcp_tool_name("double") == "mcp__ak__double"
+
+    def test_ak_tool_name_strips_the_prefix(self):
+        assert ClaudeToolBuilder.ak_tool_name("mcp__ak__double") == "double"
+
+    def test_ak_tool_name_leaves_other_names_alone(self):
+        assert ClaudeToolBuilder.ak_tool_name("Bash") == "Bash"
+        assert ClaudeToolBuilder.ak_tool_name("mcp__other__double") == "mcp__other__double"
+
+
+class TestNeedsApproval:
+    def test_defaults_to_false(self):
+        [tool] = ClaudeToolBuilder.bind([get_weather])
+        assert tool.ak_needs_approval is False
+
+    def test_can_be_set_true(self):
+        [tool] = ClaudeToolBuilder.bind([get_weather], needs_approval=True)
+        assert tool.ak_needs_approval is True
+
+    def test_applies_to_every_function_in_the_call(self):
+        tools = ClaudeToolBuilder.bind([get_weather, lookup], needs_approval=True)
+        assert all(tool.ak_needs_approval for tool in tools)
+
+    def test_is_not_a_declared_sdkmcptool_field(self):
+        """Must stay adapter-side bookkeeping: an extra instance attribute, invisible to the SDK's own dataclass fields."""
+        import dataclasses
+
+        [tool] = ClaudeToolBuilder.bind([get_weather], needs_approval=True)
+        assert "ak_needs_approval" not in {f.name for f in dataclasses.fields(tool)}
+        assert tool.ak_needs_approval is True

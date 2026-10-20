@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
+import copy
 import dataclasses
 import inspect
 import json
@@ -13,10 +15,10 @@ from typing import Any, Callable, ClassVar, List, Mapping
 from uuid import uuid4
 
 from claude_agent_sdk import (
-    AgentDefinition,
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    HookMatcher,
     ResultMessage,
     SdkMcpTool,
     ServerToolResultBlock,
@@ -34,9 +36,11 @@ from ...core.config import AKConfig
 from ...core.event import (
     MessageEnd,
     MessageStart,
+    PausedInterruption,
     ReasoningDelta,
     ReasoningEnd,
     ReasoningStart,
+    RunPaused,
     StreamEvent,
     TextDelta,
     ToolCallArgs,
@@ -45,6 +49,7 @@ from ...core.event import (
     ToolCallStart,
 )
 from ...core.model import (
+    AgentPausedReplyAny,
     AgentReply,
     AgentReplyAny,
     AgentReplyText,
@@ -53,7 +58,9 @@ from ...core.model import (
     AgentRequestFile,
     AgentRequestImage,
     AgentRequestText,
+    ResumeDecision,
 )
+from ...core.paused_run import PausedRun, PausedRunState
 from ...core.util.error_util import user_facing_error_message
 from ...trace import Trace
 
@@ -183,6 +190,96 @@ class _ClaudeSessionStore:
         self._session.save(self._agent_name, session_id, transcript)
 
 
+_UNSET = object()
+"""Sentinel distinguishing `ClaudeToolContext.get()` called outside any run from one called during a run
+that simply has no framework_context seeded (which reads back as a legitimate `None`)."""
+
+_framework_context: contextvars.ContextVar[Any] = contextvars.ContextVar("claude_framework_context", default=_UNSET)
+
+
+class _ClaudeApprovalGuard:
+    """One-use approvals for AK tools in a single Claude run."""
+
+    def __init__(self) -> None:
+        self._grants: list[tuple[str, dict[str, Any]]] = []
+
+    def grant(self, name: str, arguments: dict[str, Any]) -> None:
+        self._grants.append((name, arguments))
+
+    def consume(self, name: str, arguments: dict[str, Any]) -> bool:
+        for index, (allowed_name, allowed_arguments) in enumerate(self._grants):
+            if allowed_name == name and allowed_arguments == arguments:
+                self._grants.pop(index)
+                return True
+        return False
+
+
+_approval_guard: contextvars.ContextVar[_ClaudeApprovalGuard | None] = contextvars.ContextVar("claude_approval_guard", default=None)
+
+
+class ClaudeToolContext:
+    """
+    The per-run caller-state handle for tools bound with `ClaudeToolBuilder`.
+
+    The SDK has no native `RunContext`/`tool_context.state` equivalent a tool handler can read, so this is
+    Agent Kernel's own handle filling that gap: `ClaudeRunner` sets it to a copy of the session's
+    `framework_context` for the run, a tool mutates the dict in place, and the runner writes the touched keys
+    back on success — reaching only tools bound through `ClaudeToolBuilder`, never a Claude built-in tool or an
+    external MCP server.
+    """
+
+    @staticmethod
+    def get() -> dict | None:
+        """
+        :return: The mutable per-run context dict, or None when the session carries no `framework_context`.
+        :raises RuntimeError: If called outside a Claude Agent SDK tool call.
+        """
+        value = _framework_context.get()
+        if value is _UNSET:
+            raise RuntimeError("ClaudeToolContext.get() requires a running Claude Agent SDK tool call.")
+        return typing.cast("dict | None", value)
+
+
+class ClaudeTelemetry:
+    """
+    Builds the environment variables that turn on the Claude Code CLI's own (beta) OpenTelemetry trace export.
+
+    Opt-in and standalone — no traced runner enables this implicitly, since none of AK's four tracer backends
+    can see model calls happening inside the CLI subprocess anyway. The SDK propagates an active span's W3C
+    trace context into the subprocess automatically, so spans built from this still link to an active AK trace
+    with no further code.
+    """
+
+    @staticmethod
+    def enable_traces(
+        endpoint: str | None = None, *, headers: str | None = None, protocol: str = "http/protobuf", **extra_env: str
+    ) -> dict[str, str]:
+        """
+        Builds the env entries that enable Claude Code's native trace export, for merging into
+        `ClaudeAgentOptions.env` (or declared via `Module.run_options(agent, env=...)`).
+
+        :param endpoint: `OTEL_EXPORTER_OTLP_ENDPOINT`. Omit it to rely on the value already in the process
+            environment, which the CLI subprocess inherits.
+        :param headers: `OTEL_EXPORTER_OTLP_HEADERS`, e.g. `"Authorization=Bearer ..."`.
+        :param protocol: `OTEL_EXPORTER_OTLP_PROTOCOL`.
+        :param extra_env: Further env vars included verbatim (e.g. `OTEL_SERVICE_NAME`).
+        :return: The env dict. Merge it into your own `env=` — this never touches `ClaudeAgentOptions.env` itself.
+        """
+        env = {
+            "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+            # Traces are beta and need this in addition to the exporter; metrics/log events do not.
+            "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
+            "OTEL_TRACES_EXPORTER": "otlp",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": protocol,
+        }
+        if endpoint is not None:
+            env["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
+        if headers is not None:
+            env["OTEL_EXPORTER_OTLP_HEADERS"] = headers
+        env.update(extra_env)
+        return env
+
+
 class _ClaudeStreamMapper:
     """
     Maps one run's SDK messages onto Agent Kernel stream events.
@@ -254,8 +351,7 @@ class _ClaudeStreamMapper:
                     events.append(ReasoningDelta(message_id=stream_id, content=block["thinking"]))
         elif block_type in ("tool_use", "server_tool_use") and block.get("id"):
             self._open[index] = ("tool", block["id"])
-            name = (block.get("name") or "").removeprefix(f"mcp__{ClaudeToolBuilder.MCP_SERVER}__")
-            events.append(ToolCallStart(tool_call_id=block["id"], name=name))
+            events.append(ToolCallStart(tool_call_id=block["id"], name=ClaudeToolBuilder.ak_tool_name(block.get("name") or "")))
         return events
 
     def _delta(self, index: int, delta: dict[str, Any]) -> list[StreamEvent]:
@@ -302,8 +398,9 @@ class ClaudeRunner(BaseRunner):
     """
     ClaudeRunner class provides a runner for Claude Agent SDK agents.
 
-    Each run spawns its own `ClaudeSDKClient` (one Claude Code CLI subprocess), created after the ToolContext is
-    set so the in-process tool handlers, which run in tasks the client spawns, inherit it.
+    Each run spawns its own `ClaudeSDKClient` (one Claude Code CLI subprocess), created after the ToolContext and
+    `ClaudeToolContext` are set so the in-process tool handlers, which run in tasks the client spawns, inherit
+    them.
     """
 
     def __init__(self) -> None:
@@ -311,7 +408,6 @@ class ClaudeRunner(BaseRunner):
         Initializes a ClaudeRunner instance.
         """
         super().__init__(FRAMEWORK)
-        self._context_warned = False
 
     @staticmethod
     def _session(session: Session) -> ClaudeSession:
@@ -378,7 +474,8 @@ class ClaudeRunner(BaseRunner):
     @staticmethod
     def _prompt(content: list[dict[str, Any]]) -> str | AsyncIterator[dict[str, Any]]:
         """
-        Text-only content goes as a string; content with an image or document goes as one streaming-input user
+        Text-only content goes as a string (empty content becomes an empty string, which is how a bare resume
+        decision carries no extra text); content with an image or document goes as one streaming-input user
         message, the only form the SDK accepts it in.
         :param content: The content blocks for this turn.
         :return: The prompt for `ClaudeSDKClient.query`.
@@ -391,75 +488,126 @@ class ClaudeRunner(BaseRunner):
 
         return message()
 
-    def _warn_framework_context(self, session: Session) -> None:
+    @staticmethod
+    def _gated_tools(spec: ClaudeAgentSpec) -> frozenset[str]:
         """
-        The Claude Agent SDK has no per-run caller-state slot, so a framework_context is not injected. Warn once,
-        and leave the stored context untouched.
-        :param session: The session to check.
+        :param spec: The agent declaration whose tools to inspect.
+        :return: The fully-qualified `mcp__ak__<name>` names of its tools bound with `needs_approval=True`.
         """
-        if not self._context_warned and session is not None and session.get_framework_context():
-            _log.warning("framework_context is set but the Claude Agent SDK has no per-run caller context/state slot; ignoring it.")
-            self._context_warned = True
+        return frozenset(ClaudeToolBuilder.mcp_tool_name(tool.name) for tool in spec.tools if getattr(tool, "ak_needs_approval", False))
+
+    def _decision_hook(self, gated: frozenset[str], resume_decision: tuple[str, ResumeDecision] | None) -> Any:
+        """
+        Builds the one `PreToolUse` hook that both gates approval-required tools and resolves the one deferred
+        call a resume answers. One hook, not two: two hooks matching the same tool would race under the SDK's
+        `deny > defer > ask > allow` precedence, where the still-standing gate's `defer` would override an
+        `allow` the resume hook just granted for that call.
+
+        :param gated: The tool names (see `_gated_tools`) that defer on their first attempt.
+        :param resume_decision: The `(tool_use_id, decision)` a resume is answering, or None on an ordinary run.
+        :return: The hook callback.
+        """
+
+        async def hook(input_data: dict[str, Any], tool_use_id: str | None, context: dict[str, Any]) -> dict[str, Any]:
+            if resume_decision is not None and tool_use_id == resume_decision[0]:
+                decision = resume_decision[1]
+                name = input_data.get("tool_name")
+                if decision.status == "approved" and name in gated:
+                    guard = _approval_guard.get()
+                    if guard is not None:
+                        arguments = decision.payload if isinstance(decision.payload, dict) else input_data.get("tool_input", {})
+                        guard.grant(name, arguments)
+                return self._hook_decision(decision)
+            if input_data.get("tool_name") in gated:
+                return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "defer"}}
+            return {}
+
+        return hook
+
+    def _hook_decision(self, decision: ResumeDecision) -> dict[str, Any]:
+        """
+        Renders a human's decision as the `PreToolUse` hook response that resolves the one deferred call it answers.
+
+        :param decision: The human's decision. `approved` becomes `allow`, with the payload (if an object) as
+            `updatedInput`; `denied` becomes `deny` with the human's message, if any; `cancelled` becomes `deny`
+            with Agent Kernel's own wording, since the SDK has no third verb and "nobody decided" must not read
+            as a refusal.
+        :return: The raw hook response dict the SDK expects.
+        """
+        if decision.status == "approved":
+            output: dict[str, Any] = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
+            if isinstance(decision.payload, dict):
+                output["updatedInput"] = decision.payload
+            return {"hookSpecificOutput": output}
+        output = {"hookEventName": "PreToolUse", "permissionDecision": "deny"}
+        reason = decision.message if decision.status == "denied" else self.CANCELLED_DECISION_MESSAGE
+        if reason:
+            output["permissionDecisionReason"] = reason
+        return {"hookSpecificOutput": output}
 
     def _native_options(
-        self, agent: Any, options: Mapping[str, Any], claude_session: ClaudeSession, store: _ClaudeSessionStore, *, stream: bool
+        self,
+        agent: Any,
+        options: Mapping[str, Any],
+        claude_session: ClaudeSession,
+        store: _ClaudeSessionStore,
+        *,
+        stream: bool,
+        resume_decision: tuple[str, ResumeDecision] | None = None,
     ) -> ClaudeAgentOptions:
         """
         Builds the options for one run: the agent's options, the resolved run options over them, and the fields
-        Agent Kernel owns written last. The agent's tools, and its subagents' tools, are served by an in-process MCP
-        server and approved by name, the same as a bound tool simply runs in every other framework. Subagents become
-        the SDK's `agents=` definitions, delegated to through the `Agent` tool, which is enabled and approved.
+        Agent Kernel owns written last. The parent's bound tools are served by an in-process MCP server and
+        approved by name, except one bound with `needs_approval=True`, which a merged `PreToolUse` hook gates
+        instead; declared hooks are merged into, never replaced. Native `agents=` definitions are reached
+        through the `Agent` tool.
         :param agent: The ClaudeAgent being run.
         :param options: The run options resolved for this run.
         :param claude_session: The ClaudeSession holding the agent's conversation.
         :param store: The store mirroring this run's transcript.
         :param stream: Whether this is a streamed run.
+        :param resume_decision: The `(tool_use_id, decision)` a resume answers, or None on an ordinary run.
         :return: A new ClaudeAgentOptions; the agent's own is untouched.
         """
         spec: ClaudeAgentSpec = agent.agent
         declared = dataclasses.replace(spec.options, **options)
-        ak_owned: dict[str, Any] = {"session_store": store, "session_store_flush": "batched"}
+        ak_owned: dict[str, Any] = {
+            "session_store": store,
+            "session_store_flush": "batched",
+            "resume": None,
+            "session_id": None,
+            "continue_conversation": False,
+            "fork_session": False,
+            "resume_session_at": None,
+            "resume_drops_turn": None,
+            "enable_file_checkpointing": False,
+            "include_partial_messages": stream,
+        }
         if claude_session.transcript(agent.name).get(""):
             ak_owned["resume"] = claude_session.session_id(agent.name)
         else:
             ak_owned["session_id"] = str(uuid4())
-        # A subagent runs inside this session and can only use tools that exist here, so its tools are served too.
-        served = {tool.name: tool for agent_spec in (spec, *spec.subagents) for tool in agent_spec.tools}
-        approved = [ClaudeToolBuilder.mcp_tool_name(name) for name in served]
+        # Native subagents can use the tools served in the parent's session.
+        served = {tool.name: tool for tool in spec.tools}
+        gated = self._gated_tools(spec)
+        approved = [ClaudeToolBuilder.mcp_tool_name(name) for name in served if ClaudeToolBuilder.mcp_tool_name(name) not in gated]
         if served:
             server = create_sdk_mcp_server(ClaudeToolBuilder.MCP_SERVER, tools=list(served.values()))
             # A dict whenever the agent has tools: ClaudeAgent rejects a config-file path at declaration.
             servers = declared.mcp_servers if isinstance(declared.mcp_servers, dict) else {}
             ak_owned["mcp_servers"] = {**servers, ClaudeToolBuilder.MCP_SERVER: server}
-        if spec.subagents:
-            ak_owned["agents"] = {**(declared.agents or {}), **{s.name: self._subagent(s) for s in spec.subagents}}
+        if declared.agents:
             if isinstance(declared.tools, list) and "Agent" not in declared.tools:
                 ak_owned["tools"] = [*declared.tools, "Agent"]
             approved.append("Agent")
         if approved:
             ak_owned["allowed_tools"] = declared.allowed_tools + [name for name in approved if name not in declared.allowed_tools]
-        if stream:
-            ak_owned["include_partial_messages"] = True
+        if gated or resume_decision is not None:
+            hooks = {event: list(matchers) for event, matchers in (declared.hooks or {}).items()}
+            hooks.setdefault("PreToolUse", []).append(HookMatcher(matcher=None, hooks=[self._decision_hook(gated, resume_decision)]))
+            ak_owned["hooks"] = hooks
         native: ClaudeAgentOptions = dataclasses.replace(spec.options, **self._native_kwargs(options, **ak_owned))
         return native
-
-    @staticmethod
-    def _subagent(spec: ClaudeAgentSpec) -> AgentDefinition:
-        """
-        Converts a subagent declaration into the SDK's `AgentDefinition`: its description, system prompt and model,
-        and the tools it may use. With `tools` left at the SDK default (None) the subagent may use every tool of the
-        session, as the SDK defines; otherwise it may use the listed built-in tools plus its own Agent Kernel tools.
-        :param spec: The subagent declaration.
-        :return: The AgentDefinition for the parent's `agents=`.
-        """
-        declared = spec.options.system_prompt
-        # A custom prompt carries its text under "prompt"; ClaudeAgent rejects the preset and file forms at declaration.
-        prompt = str(declared.get("prompt", "")) if isinstance(declared, Mapping) else declared or ""
-        tools = spec.options.tools
-        allowed = (
-            None if tools is None else [*(tools if isinstance(tools, list) else []), *(ClaudeToolBuilder.mcp_tool_name(t.name) for t in spec.tools)]
-        )
-        return AgentDefinition(description=spec.description or spec.name, prompt=prompt, tools=allowed, model=spec.options.model)
 
     @staticmethod
     def _error(result: ResultMessage) -> RuntimeError:
@@ -475,6 +623,98 @@ class ClaudeRunner(BaseRunner):
             reason = f"API error {result.api_error_status}" if result.api_error_status else "error result"
         return RuntimeError(f"Claude Agent SDK run failed ({reason}){': ' + detail if detail else ''}")
 
+    def _paused_reply(self, agent: Any, session: Session, result: ResultMessage) -> AgentPausedReplyAny:
+        """
+        Records a paused run and returns the reply that carries it back to the caller.
+
+        Replaces rather than appends: Claude's `defer` resolves exactly one pending tool call at a time, so an
+        earlier record for this runner could never be resumed once a newer one exists. Scoped to this runner,
+        since a pause another framework holds on the same session is a separate conversation and still
+        answerable. The payload holds the deferred call's id and the saved transcript position, so a later
+        ordinary turn cannot silently redirect a decision to the wrong conversation state. The conversation
+        itself is durable through `_ClaudeSessionStore`.
+
+        :param agent: The agent that paused.
+        :param session: The session the record is written to.
+        :param result: The ResultMessage whose `deferred_tool_use` is set.
+        :return: The paused reply, carrying the assigned run id.
+        """
+        PausedRunState.clear_for_runner(session, self.name)
+
+        deferred = result.deferred_tool_use
+        assert deferred is not None  # the caller checks this before calling _paused_reply
+        interruption = PausedInterruption(
+            id=deferred.id,
+            kind="tool_call",
+            tool_name=ClaudeToolBuilder.ak_tool_name(deferred.name),
+            arguments=json.dumps(deferred.input, default=str),
+        )
+        record = PausedRunState.add(
+            session,
+            agent=agent.name,
+            runner=self.name,
+            interruptions=[interruption],
+            payload={
+                "tool_use_id": deferred.id,
+                "session_id": result.session_id,
+                "main_entries": len(self._session(session).transcript(agent.name).get("", [])),
+            },
+        )
+        return AgentPausedReplyAny(run_id=record.id, session_id=session.id, agent=agent.name, interruptions=record.interruptions)
+
+    def _require_resume_state(self, agent: Any, session: Session, record: PausedRun) -> None:
+        """Reject a pause whose Claude transcript is missing or has advanced since it was recorded."""
+        claude_session = session.get(FRAMEWORK)
+        payload = record.payload
+        if not isinstance(claude_session, ClaudeSession) or not isinstance(payload, dict):
+            raise ValueError(f"Paused Claude run '{record.id}' has no saved conversation to resume")
+        transcript = claude_session.transcript(agent.name).get("", [])
+        if not transcript or claude_session.session_id(agent.name) != payload.get("session_id") or len(transcript) != payload.get("main_entries"):
+            raise ValueError(f"Paused Claude run '{record.id}' cannot resume: its saved conversation changed after the pause")
+
+    @staticmethod
+    def _reject_not_the_one_deferred_call(decisions: list[ResumeDecision], record: PausedRun) -> None:
+        """
+        Refuses a resume that does not answer exactly the one call `defer` is waiting on, before the adapter's
+        `try` opens. Claude's defer mechanism resolves a single pending tool call; Runtime's own generic checks
+        (unknown interruption ids, a missing status) do not know that a Claude pause can only ever hold one.
+
+        :param decisions: The human's decisions.
+        :param record: The record Runtime validated.
+        :raises ValueError: If more or fewer than the one expected decision is given.
+        """
+        expected = record.interruptions[0].id
+        if len(decisions) != 1 or decisions[0].id != expected:
+            raise ValueError(
+                f"Claude Agent SDK resumes exactly the one deferred tool call in run '{record.id}' (interruption "
+                f"'{expected}'); got decision(s) {[d.id for d in decisions]}. The SDK's defer mechanism answers a "
+                f"single pending tool call at a time."
+            )
+
+    @staticmethod
+    def _reject_unusable_override(decisions: list[ResumeDecision]) -> None:
+        """
+        Refuses an approval payload that cannot become the tool's updated input, before the adapter's `try` opens.
+
+        :param decisions: The human's decisions.
+        :raises ValueError: If an approved decision carries a payload that is not a JSON object.
+        """
+        offenders = [d.id for d in decisions if d.status == "approved" and d.payload is not None and not isinstance(d.payload, dict)]
+        if offenders:
+            raise ValueError(
+                f"A Claude Agent SDK approval can only carry a JSON object as its payload; decision(s) {offenders} carry "
+                f"another shape. The payload becomes the tool call's updated input, so send an object of argument names."
+            )
+
+    @property
+    def supports_pause(self) -> bool:
+        """
+        :return: True — a `PreToolUse` hook's `defer` is durable (the transcript is already committed when the
+            paused reply returns) and `resume=<session_id>` re-fires it. Only honored for a single tool call per
+            turn; several at once fall through to the ordinary permission flow instead of pausing.
+        """
+        return True
+
     async def run(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AgentReply:
         """
         Runs the Claude agent with the provided multi modal inputs.
@@ -484,9 +724,12 @@ class ClaudeRunner(BaseRunner):
         :return: The result of the agent's execution.
         """
         context: ToolContext | None = None
+        fw_token: contextvars.Token | None = None
+        approval_token: contextvars.Token | None = None
         prompt = ""
         try:
             context = ToolContext(Runtime.current(), agent, session, requests).set()
+            approval_token = _approval_guard.set(_ClaudeApprovalGuard())
             prompt, content = self._process_requests(requests)
 
             if not content:
@@ -494,7 +737,9 @@ class ClaudeRunner(BaseRunner):
 
             # Resolved once per run: the static options with a declared factory's result merged over them.
             options = await agent.resolve_run_options(session, requests)
-            self._warn_framework_context(session)
+            incoming = self._load_framework_context(session)
+            produced = copy.deepcopy(incoming)
+            fw_token = _framework_context.set(produced)
             claude_session = self._session(session)
             store = _ClaudeSessionStore(claude_session, agent.name)
 
@@ -510,11 +755,16 @@ class ClaudeRunner(BaseRunner):
 
             if result is None:
                 raise RuntimeError("Claude Agent SDK run ended without a result")
-            # The transcript is whole once the result arrives, even for an error result such as max turns.
+            # The transcript is whole once the result arrives, even for an error or a deferred-tool stop.
             store.commit(result.session_id)
+
+            if result.deferred_tool_use is not None and not result.is_error:
+                self._store_framework_context(session, incoming, produced)
+                return self._paused_reply(agent, session, result)
             if result.is_error:
                 raise self._error(result)
 
+            self._store_framework_context(session, incoming, produced)
             structured = AgentReplyAny.from_output(result.structured_output, prompt)
             if structured is not None:
                 return structured
@@ -522,6 +772,92 @@ class ClaudeRunner(BaseRunner):
         except Exception as e:
             return AgentReplyText(response=user_facing_error_message(e), prompt=prompt)
         finally:
+            if approval_token is not None:
+                _approval_guard.reset(approval_token)
+            if fw_token is not None:
+                _framework_context.reset(fw_token)
+            if context is not None:
+                context.reset()
+
+    async def resume(
+        self,
+        agent: Any,
+        session: Session,
+        requests: list[AgentRequest],
+        decisions: list[ResumeDecision],
+        record: PausedRun,
+    ) -> AgentReply:
+        """
+        Continues a paused run from the human's decision on the one deferred tool call.
+
+        The bare decision needs no accompanying text: `resume=<session_id>` replays the pending call, re-firing
+        the same `PreToolUse` hook. Grounded in the SDK's documented contract rather than a live-verified resume
+        — treat the exact replay mechanics as unverified until exercised against a real model.
+
+        :param agent: The agent that paused.
+        :param session: The session holding the record.
+        :param requests: The hook-processed request list, carrying the resume request.
+        :param decisions: One per interruption being answered.
+        :param record: The record Runtime validated.
+        :return: The continued run's reply, which may itself be paused again.
+        """
+        self._reject_not_the_one_deferred_call(decisions, record)
+        self._reject_unusable_override(decisions)
+        self._require_resume_state(agent, session, record)
+
+        context: ToolContext | None = None
+        fw_token: contextvars.Token | None = None
+        approval_token: contextvars.Token | None = None
+        prompt = ""
+        try:
+            context = ToolContext(Runtime.current(), agent, session, requests).set()
+            approval_token = _approval_guard.set(_ClaudeApprovalGuard())
+            prompt, content = self._process_requests(requests)
+
+            options = await agent.resolve_run_options(session, requests)
+            incoming = self._load_framework_context(session)
+            produced = copy.deepcopy(incoming)
+            fw_token = _framework_context.set(produced)
+            claude_session = self._session(session)
+            store = _ClaudeSessionStore(claude_session, agent.name)
+            resume_decision = (record.payload["tool_use_id"], decisions[0])
+
+            texts: list[str] = []
+            result: ResultMessage | None = None
+            native_options = self._native_options(agent, options, claude_session, store, stream=False, resume_decision=resume_decision)
+            async with ClaudeSDKClient(options=native_options) as client:
+                await client.query(self._prompt(content))
+                async for message in client.receive_response():
+                    if isinstance(message, ResultMessage):
+                        result = message
+                    elif isinstance(message, AssistantMessage) and message.parent_tool_use_id is None:
+                        texts.extend(block.text for block in message.content if isinstance(block, TextBlock))
+
+            if result is None:
+                raise RuntimeError("Claude Agent SDK resume ended without a result")
+            store.commit(result.session_id)
+
+            if result.deferred_tool_use is not None and not result.is_error:
+                # A fresh pause (the same call deferred again, or a new one later in the turn) supersedes this
+                # record; _paused_reply's clear_for_runner removes it as part of adding the new one.
+                self._store_framework_context(session, incoming, produced)
+                return self._paused_reply(agent, session, result)
+            if result.is_error:
+                raise self._error(result)
+
+            PausedRunState.clear(session, record.id)
+            self._store_framework_context(session, incoming, produced)
+            structured = AgentReplyAny.from_output(result.structured_output, prompt)
+            if structured is not None:
+                return structured
+            return AgentReplyText(response=result.result if result.result is not None else "\n".join(texts), prompt=prompt)
+        except Exception as e:
+            return AgentReplyText(response=user_facing_error_message(e), prompt=prompt)
+        finally:
+            if approval_token is not None:
+                _approval_guard.reset(approval_token)
+            if fw_token is not None:
+                _framework_context.reset(fw_token)
             if context is not None:
                 context.reset()
 
@@ -535,8 +871,11 @@ class ClaudeRunner(BaseRunner):
         :return: An async generator yielding StreamEvent objects.
         """
         context: ToolContext | None = None
+        fw_token: contextvars.Token | None = None
+        approval_token: contextvars.Token | None = None
         try:
             context = ToolContext(Runtime.current(), agent, session, requests).set()
+            approval_token = _approval_guard.set(_ClaudeApprovalGuard())
             _, content = self._process_requests(requests)
 
             if not content:
@@ -544,7 +883,9 @@ class ClaudeRunner(BaseRunner):
 
             # Resolved once per run: the static options with a declared factory's result merged over them.
             options = await agent.resolve_run_options(session, requests)
-            self._warn_framework_context(session)
+            incoming = self._load_framework_context(session)
+            produced = copy.deepcopy(incoming)
+            fw_token = _framework_context.set(produced)
             claude_session = self._session(session)
             store = _ClaudeSessionStore(claude_session, agent.name)
             mapper = _ClaudeStreamMapper()  # local — the runner is shared across sessions
@@ -566,9 +907,108 @@ class ClaudeRunner(BaseRunner):
                 raise RuntimeError("Claude Agent SDK stream ended without a result")
             # After a normal drain only — a disconnect or error leaves the stored transcript intact.
             store.commit(result.session_id)
+
+            if result.deferred_tool_use is not None and not result.is_error:
+                try:
+                    self._store_framework_context(session, incoming, produced)
+                except Exception as e:
+                    self._log_framework_context_stream_failure(session, e)
+                paused = self._paused_reply(agent, session, result)
+                yield RunPaused(run_id=paused.run_id, agent=agent.name, interruptions=paused.interruptions)
+                return
             if result.is_error:
                 raise self._error(result)
+
+            try:
+                self._store_framework_context(session, incoming, produced)
+            except Exception as e:
+                self._log_framework_context_stream_failure(session, e)
         finally:
+            if approval_token is not None:
+                _approval_guard.reset(approval_token)
+            if fw_token is not None:
+                _framework_context.reset(fw_token)
+            if context is not None:
+                context.reset()
+
+    async def resume_stream(
+        self,
+        agent: Any,
+        session: Session,
+        requests: list[AgentRequest],
+        decisions: list[ResumeDecision],
+        record: PausedRun,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """
+        Streaming counterpart of `resume()`, mapping events exactly as `stream()` does and ending in `RunPaused`
+        if the run pauses again.
+        :param agent: The agent that paused.
+        :param session: The session holding the record.
+        :param requests: The hook-processed request list, carrying the resume request.
+        :param decisions: One per interruption being answered.
+        :param record: The record Runtime validated.
+        :return: The events the continued run produces.
+        """
+        self._reject_not_the_one_deferred_call(decisions, record)
+        self._reject_unusable_override(decisions)
+        self._require_resume_state(agent, session, record)
+
+        context: ToolContext | None = None
+        fw_token: contextvars.Token | None = None
+        approval_token: contextvars.Token | None = None
+        try:
+            context = ToolContext(Runtime.current(), agent, session, requests).set()
+            approval_token = _approval_guard.set(_ClaudeApprovalGuard())
+            _, content = self._process_requests(requests)
+
+            options = await agent.resolve_run_options(session, requests)
+            incoming = self._load_framework_context(session)
+            produced = copy.deepcopy(incoming)
+            fw_token = _framework_context.set(produced)
+            claude_session = self._session(session)
+            store = _ClaudeSessionStore(claude_session, agent.name)
+            mapper = _ClaudeStreamMapper()
+            resume_decision = (record.payload["tool_use_id"], decisions[0])
+
+            result: ResultMessage | None = None
+            native_options = self._native_options(agent, options, claude_session, store, stream=True, resume_decision=resume_decision)
+            async with ClaudeSDKClient(options=native_options) as client:
+                await client.query(self._prompt(content))
+                async for message in client.receive_response():
+                    if isinstance(message, ResultMessage):
+                        result = message
+                        continue
+                    for event in mapper.events(message):
+                        yield event
+
+            for event in mapper.close():
+                yield event
+
+            if result is None:
+                raise RuntimeError("Claude Agent SDK resume stream ended without a result")
+            store.commit(result.session_id)
+
+            if result.deferred_tool_use is not None and not result.is_error:
+                try:
+                    self._store_framework_context(session, incoming, produced)
+                except Exception as e:
+                    self._log_framework_context_stream_failure(session, e)
+                paused = self._paused_reply(agent, session, result)
+                yield RunPaused(run_id=paused.run_id, agent=agent.name, interruptions=paused.interruptions)
+                return
+            if result.is_error:
+                raise self._error(result)
+
+            PausedRunState.clear(session, record.id)
+            try:
+                self._store_framework_context(session, incoming, produced)
+            except Exception as e:
+                self._log_framework_context_stream_failure(session, e)
+        finally:
+            if approval_token is not None:
+                _approval_guard.reset(approval_token)
+            if fw_token is not None:
+                _framework_context.reset(fw_token)
             if context is not None:
                 context.reset()
 
@@ -577,22 +1017,19 @@ class ClaudeRunner(BaseRunner):
 class ClaudeAgentSpec:
     """
     Declares a Claude Agent SDK agent. The SDK configures an agent with `ClaudeAgentOptions`, which carries no
-    name or description; this adds those two, the agent's tools and its subagents, and passes the options through
+    name or description; this adds those two and the agent's tools, and passes the options through
     unchanged.
 
     name: str : the name Agent Kernel registers the agent under
-    description: str : what the agent does, used for routing, the A2A card and, for a subagent, delegation
+    description: str : what the main AK agent does, used for routing and its A2A card
     options: ClaudeAgentOptions : the SDK's options, passed to every run
     tools: list[SdkMcpTool] : in-process tools, from `ClaudeToolBuilder.bind` or the SDK's `@tool`
-    subagents: list[ClaudeAgentSpec] : agents this one delegates to, as Claude subagents through its `Agent` tool;
-        each becomes an SDK `AgentDefinition` built from its description, system prompt, model and tools
     """
 
     name: str
     description: str = ""
     options: ClaudeAgentOptions = field(default_factory=ClaudeAgentOptions)
     tools: list[SdkMcpTool] = field(default_factory=list)
-    subagents: list[ClaudeAgentSpec] = field(default_factory=list)
 
 
 class ClaudeAgent(BaseAgent):
@@ -628,7 +1065,6 @@ class ClaudeAgent(BaseAgent):
         self._attach_system_tools()
         self._setup_system_prompt()
         self._check_mcp_servers(spec.options.mcp_servers)
-        self._check_subagents()
 
     @property
     def agent(self) -> ClaudeAgentSpec:
@@ -648,21 +1084,6 @@ class ClaudeAgent(BaseAgent):
                 raise ValueError(f"MCP server name '{ClaudeToolBuilder.MCP_SERVER}' is reserved by the '{FRAMEWORK}' adapter for agent tools")
         elif self.agent.tools:
             raise ValueError(f"mcp_servers for agent '{self.name}' must be a dict, so the '{FRAMEWORK}' adapter can add its tool server")
-
-    def _check_subagents(self) -> None:
-        """
-        :raises ValueError: If a subagent has no name, shares a name with an `agents=` entry, or has a system prompt an
-            `AgentDefinition` cannot carry (the `claude_code` preset or a file).
-        """
-        native = set(self.agent.options.agents or {})
-        for subagent in self.agent.subagents:
-            if not subagent.name:
-                raise ValueError(f"A subagent of agent '{self.name}' has no name")
-            if subagent.name in native:
-                raise ValueError(f"Subagent '{subagent.name}' of agent '{self.name}' is also defined in its options' agents=")
-            prompt = subagent.options.system_prompt
-            if isinstance(prompt, Mapping) and prompt.get("type") != "custom":
-                raise ValueError(f"Subagent '{subagent.name}' of agent '{self.name}' needs a string system prompt, not a {prompt.get('type')} prompt")
 
     def validate_run_options(self, options: Mapping[str, Any]) -> None:
         """
@@ -776,27 +1197,47 @@ class ClaudeModule(Module):
 class ClaudeToolBuilder(ToolBuilder):
     """
     Tool builder for the Claude Agent SDK. Wraps generic tool functions into the SDK's in-process `SdkMcpTool`s;
-    AK tools reach execution context via `ToolContext.get()`.
+    AK tools reach execution context via `ToolContext.get()` and `ClaudeToolContext.get()`.
     """
 
     MCP_SERVER: ClassVar[str] = "ak"
     """The in-process MCP server the runner serves an agent's tools from; the model calls them mcp__ak__<tool>."""
 
     @classmethod
-    def bind(cls, funcs: list[Callable], **options: Any) -> list[SdkMcpTool]:
+    def bind(cls, funcs: list[Callable], *, needs_approval: bool = False, **options: Any) -> list[SdkMcpTool]:
         """
         Bind generic tool functions to Claude Agent SDK tools.
 
         Keyword options become the tools' `ToolAnnotations` (e.g. `readOnlyHint=True`, `maxResultSizeChars=N`) and
         apply to every function in the call, so tools wanting different options are bound in separate calls.
 
+        `needs_approval` is this adapter's human-in-the-loop gate — the SDK has no such flag, so it is recorded
+        as a plain extra attribute on the returned `SdkMcpTool`, invisible to the wire protocol, and read back by
+        `ClaudeRunner` to build the gating hook. The handler also requires a matching one-use approval, so a
+        parallel call that the SDK cannot defer cannot execute through a permissive permission setting.
+
         :param funcs: List of generic tool functions to bind.
+        :param needs_approval: If True, calling this tool defers for a human decision instead of running
+            immediately; see `Runner.supports_pause` for the single-tool-call-per-turn limit this is subject to.
         :param options: Keyword arguments for `ToolAnnotations`.
         :return: List of `SdkMcpTool` definitions.
         :raises TypeError: If any item in funcs is not callable.
         """
         annotations = ToolAnnotations(**options) if options else None
-        return [cls._wrap(func, annotations) for func in funcs]
+        tools = [cls._wrap(func, annotations) for func in funcs]
+        for tool in tools:
+            setattr(tool, "ak_needs_approval", needs_approval)  # noqa: B010 — SdkMcpTool has no such field
+            if needs_approval:
+                original = tool.handler
+
+                async def guarded(args: dict[str, Any], *, _name: str = tool.name, _handler: Callable = original) -> dict[str, Any]:
+                    guard = _approval_guard.get()
+                    if guard is None or not guard.consume(cls.mcp_tool_name(_name), args):
+                        return {"content": [{"type": "text", "text": "Agent Kernel approval is required for this tool call."}], "isError": True}
+                    return await _handler(args)
+
+                tool.handler = guarded
+        return tools
 
     @classmethod
     def mcp_tool_name(cls, name: str) -> str:
@@ -805,6 +1246,15 @@ class ClaudeToolBuilder(ToolBuilder):
         :return: The name the model calls the tool by, for example in an `AgentDefinition`'s `tools`.
         """
         return f"mcp__{cls.MCP_SERVER}__{name}"
+
+    @classmethod
+    def ak_tool_name(cls, name: str) -> str:
+        """
+        :param name: A tool name as the model or SDK reported it.
+        :return: The bare name, with this adapter's `mcp__ak__` prefix removed if present; any other name is
+            returned unchanged (a built-in tool, or one from a different MCP server).
+        """
+        return name.removeprefix(f"mcp__{cls.MCP_SERVER}__")
 
     @classmethod
     def _wrap(cls, func: Callable, annotations: ToolAnnotations | None) -> SdkMcpTool:
@@ -816,20 +1266,18 @@ class ClaudeToolBuilder(ToolBuilder):
         :param func: The generic tool function to wrap.
         :param annotations: The annotations to attach, if any.
         :return: The SdkMcpTool serving the function.
-        :raises TypeError: If the function is not callable.
+        :raises TypeError: If the function is not callable or has variadic parameters that cannot be represented in the MCP schema.
         """
         if not callable(func):
             raise TypeError(f"Expected a callable, got {type(func).__name__}")
 
         name = getattr(func, "__name__", type(func).__name__)
-        try:
-            hints = typing.get_type_hints(func)
-        except Exception:
-            hints = {}
+        hints = typing.get_type_hints(func)
         fields: dict[str, Any] = {}
-        for param in inspect.signature(func).parameters.values():
+        parameters = list(inspect.signature(func).parameters.values())
+        for param in parameters:
             if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                continue
+                raise TypeError(f"Tool '{name}' cannot bind variadic parameter '{param.name}' to an MCP input schema")
             annotation = hints.get(param.name, Any if param.annotation is inspect.Parameter.empty else param.annotation)
             fields[param.name] = (annotation, Field(... if param.default is inspect.Parameter.empty else param.default))
         arguments = create_model(f"{name}_arguments", **fields)
@@ -837,8 +1285,9 @@ class ClaudeToolBuilder(ToolBuilder):
 
         async def handler(args: dict[str, Any]) -> dict[str, Any]:
             values = arguments.model_validate(args)
-            kwargs = {key: getattr(values, key) for key in arguments.model_fields}
-            result = await func(**kwargs) if is_async else await asyncio.to_thread(func, **kwargs)
+            positional = [getattr(values, param.name) for param in parameters if param.kind is inspect.Parameter.POSITIONAL_ONLY]
+            kwargs = {param.name: getattr(values, param.name) for param in parameters if param.kind is not inspect.Parameter.POSITIONAL_ONLY}
+            result = await func(*positional, **kwargs) if is_async else await asyncio.to_thread(func, *positional, **kwargs)
             text = result if isinstance(result, str) else json.dumps(result, default=str)
             return {"content": [{"type": "text", "text": text}]}
 

@@ -1,10 +1,13 @@
 import logging
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import logfire
 
 from ...core import Session
-from ...core.model import AgentReply, AgentRequest
+from ...core.event import StreamEvent
+from ...core.model import AgentReply, AgentRequest, ResumeDecision
+from ...core.paused_run import PausedRun
 from ...framework.claude.claude import ClaudeRunner
 
 
@@ -35,3 +38,23 @@ class LogfireClaudeRunner(ClaudeRunner):
             span.set_attribute("input", result.prompt)
             span.set_attribute("output", str(result))
         return result
+
+    async def resume(
+        self, agent: Any, session: Session, requests: list[AgentRequest], decisions: list[ResumeDecision], record: PausedRun
+    ) -> AgentReply:
+        with logfire.span("Agent Kernel Claude resume", session_id=session.id) as span:
+            result = await super().resume(agent, session, requests, decisions, record)
+            span.set_attribute("output", str(result))
+        return result
+
+    async def stream(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AsyncGenerator[StreamEvent, None]:
+        with logfire.span("Agent Kernel Claude stream", session_id=session.id):
+            async for event in super().stream(agent, session, requests):
+                yield event
+
+    async def resume_stream(
+        self, agent: Any, session: Session, requests: list[AgentRequest], decisions: list[ResumeDecision], record: PausedRun
+    ) -> AsyncGenerator[StreamEvent, None]:
+        with logfire.span("Agent Kernel Claude resume", session_id=session.id):
+            async for event in super().resume_stream(agent, session, requests, decisions, record):
+                yield event

@@ -24,13 +24,27 @@ pip install agentkernel[claude]
 ```
 
 Authenticate with an Anthropic API key or a cloud provider. Anthropic does not allow third-party products to
-offer a claude.ai login, so use one of:
+offer a claude.ai login.
+
+:::caution Set exactly one of these
+Setting more than one, or setting a cloud provider without real credentials behind it, makes the Claude Code CLI
+hang silently instead of raising an error — there is no fast-fail check.
+:::
 
 ```bash
-export ANTHROPIC_API_KEY=...          # Claude API
-export CLAUDE_CODE_USE_BEDROCK=1      # Amazon Bedrock (with AWS credentials)
-export CLAUDE_CODE_USE_VERTEX=1       # Google Vertex AI (with GCP credentials)
-export CLAUDE_CODE_USE_FOUNDRY=1      # Microsoft Foundry
+export ANTHROPIC_API_KEY=...          # Claude API — simplest, no extra setup
+
+# or
+
+export CLAUDE_CODE_USE_BEDROCK=1      # Amazon Bedrock — needs a configured AWS account with Bedrock access to Claude models
+
+# or
+
+export CLAUDE_CODE_USE_VERTEX=1       # Google Vertex AI — needs a configured GCP project with Vertex access to Claude models
+
+# or
+
+export CLAUDE_CODE_USE_FOUNDRY=1      # Microsoft Foundry — needs configured Foundry credentials
 ```
 
 ## Basic Usage
@@ -132,36 +146,42 @@ Agent Kernel serves an agent's tools from an in-process MCP server named `ak`, s
 
 ## Multi-Agent System
 
-Claude's native multi-agent primitive is the **subagent**: the parent delegates to it through its `Agent` tool.
-List other `ClaudeAgentSpec`s in `subagents=`, as you would pass agents to OpenAI's `handoffs=` or ADK's
-`sub_agents=`:
+Claude's native multi-agent primitive is the **subagent**: the parent delegates through its `Agent` tool.
+Define subagents with the SDK's `AgentDefinition` in `ClaudeAgentOptions.agents`. Agent Kernel serves any
+bound Python tools from the parent agent's session:
 
 ```python
-weather = ClaudeAgentSpec(
-    name="weather",
-    description="Agent that provides weather information",
-    options=ClaudeAgentOptions(system_prompt="Use the get_weather tool for weather questions.", tools=[]),
-    tools=ClaudeToolBuilder.bind([get_weather]),
-)
+from claude_agent_sdk import AgentDefinition
+
+weather_tools = ClaudeToolBuilder.bind([get_weather])
 
 triage = ClaudeAgentSpec(
     name="triage",
     description="Routes each question to the right specialist",
-    options=ClaudeAgentOptions(system_prompt="Delegate each question to the right agent.", tools=[], permission_mode="dontAsk"),
-    subagents=[weather],
+    options=ClaudeAgentOptions(
+        system_prompt="Delegate each question to the right agent.",
+        tools=[],
+        permission_mode="dontAsk",
+        agents={
+            "weather": AgentDefinition(
+                description="Agent that provides weather information",
+                prompt="Use the get_weather tool for weather questions.",
+                tools=[ClaudeToolBuilder.mcp_tool_name("get_weather")],
+            )
+        },
+    ),
+    tools=weather_tools,
 )
 
-ClaudeModule([triage, weather])
+ClaudeModule([triage])
 ```
 
-For each subagent, Agent Kernel builds the SDK's `AgentDefinition` from its description, system prompt (a string
-or custom prompt), model and tools, and adds it to the parent's `agents=`. A subagent runs inside the parent's
-session, so the parent serves the subagent's Agent Kernel tools, and the subagent may use only those plus the
-built-in tools its own `tools=` lists (the session's tools when left unset). The parent's `Agent` tool is enabled and
-approved. Native `agents=` definitions still work alongside; a name used in both is rejected.
+The SDK keeps every `AgentDefinition` field, including `skills`, `maxTurns`, and `permissionMode`. A subagent
+runs inside the parent's session and may call tools listed in its native `tools=` field. When `agents=` is set,
+Agent Kernel enables and approves the parent's `Agent` tool.
 
 Subagent traffic is not streamed: the subagent's answer arrives as the result of the parent's `Agent` tool call. A
-subagent's own `subagents` are not included.
+subagent's own nested configuration follows the SDK's rules.
 
 ## Conversations and Sessions
 
@@ -215,9 +235,22 @@ blocks. `s3://` references and other file types are rejected; voice input is not
 
 ## Per-run context/state
 
-The SDK has no per-run caller-state slot: tool handlers receive only their arguments. A `framework_context` set
-on the session is **not injected** and is left untouched, with one warning logged per runner. Tools that need
-session data read it through `ToolContext.get().session`.
+The SDK has no per-run caller-state slot of its own: a tool handler receives only its validated arguments. A
+`framework_context` set on the session is injected through an adapter-defined handle, `ClaudeToolContext`: a
+deep copy of the dict for the duration of one run, read with `ClaudeToolContext.get()` inside a tool bound with
+`ClaudeToolBuilder`. A tool mutates the dict it returns in place; the runner writes the touched keys back to
+the session after a successful run, the same load/mutate/write-back contract every other adapter's native
+handle gives:
+
+```python
+def add_item(item: str) -> str:
+    ClaudeToolContext.get()["cart"].append(item)
+    return "added"
+```
+
+This reaches only tools bound through `ClaudeToolBuilder.bind()` — never Claude's built-in tools (`Bash`,
+`Read`, ...) and never an externally connected MCP server, since neither is Python code Agent Kernel can hand
+the context to.
 
 ## Native run options
 
@@ -237,9 +270,29 @@ allowed with a session store) and `include_partial_messages` (set in stream mode
 
 ## Human in the loop
 
-Not supported yet: `supports_pause` is `False`. The SDK's `can_use_tool` callback waits inside the live CLI
-process, so it cannot survive a restart or move to another replica. The SDK's durable `defer` hook decision is
-the candidate mechanism for a later release.
+`supports_pause` is `True`, backed by the SDK's durable `defer` permission decision — distinct from the live
+`can_use_tool` callback, which waits inside the CLI process and cannot survive a restart or move to another
+replica. Gate a tool at bind time:
+
+```python
+tools = ClaudeToolBuilder.bind([issue_refund], needs_approval=True)
+```
+
+A gated tool's call is deferred by a `PreToolUse` hook the runner installs; the run ends in a paused reply
+carrying the pending call's name and arguments. `resume()`/`resume_stream()` continue it with
+`resume=<session_id>`, which replays the pending call so the same hook can resolve it from the human's decision
+(`approved`, optionally with an object payload that becomes the tool's updated input; `denied`, with the human's
+message; `cancelled`, which Agent Kernel reports distinctly from a denial). The conversation up to the deferred
+call is already committed to the session before the paused reply is returned, so the pause is durable across
+processes.
+
+**Limitation**: Anthropic's SDK honors `defer` only when the model makes a single tool call in that turn. With
+several tool calls at once, `defer` is ignored for all of them and they fall through to the ordinary permission
+flow instead of pausing. An AK bound tool marked `needs_approval=True` also checks for a matching, one-use
+approval in its handler, so it refuses execution if `defer` is ignored or the tool is otherwise auto-approved.
+A Claude pause always holds exactly one pending call; resuming it answers that one interruption.
+If another turn advances the same Claude conversation before the decision arrives, the old pause is rejected
+instead of applying its decision to the changed transcript.
 
 ## Tracing
 
@@ -250,9 +303,24 @@ the candidate mechanism for a later release.
 | CloudWatch | An Agent Kernel span per run, plus agent and tool spans from the OpenInference instrumentor |
 | OpenLLMetry | An Agent Kernel span per run only |
 
-The model calls happen inside the CLI subprocess, so Python-side LLM instrumentation does not see them. The CLI
-can export its own OpenTelemetry spans (`CLAUDE_CODE_ENABLE_TELEMETRY=1` and the `OTEL_*` variables in `env`);
-see Anthropic's [observability guide](https://code.claude.com/docs/en/agent-sdk/observability).
+The model calls happen inside the CLI subprocess, so none of the four backends above see them through Python
+instrumentation alone. Their Agent Kernel span covers `run`, `stream`, `resume`, and `resume_stream`; the
+Langfuse, Logfire and CloudWatch integrations also add Python-side agent/tool instrumentation.
+
+To see the actual `claude_code.llm_request` spans, opt in to the CLI's own (beta) OpenTelemetry export with
+`ClaudeTelemetry`, merged into the run's `env` yourself — nothing wires this in automatically, and no caller
+`env` entry is ever overwritten:
+
+```python
+from agentkernel.claude import ClaudeTelemetry
+
+module.run_options(agent, env={**existing_env, **ClaudeTelemetry.enable_traces(endpoint="http://otel-collector:4318")})
+```
+
+If an OpenTelemetry span is active when the run starts (as it is inside any of the four traced runners above),
+the SDK propagates its W3C trace context into the CLI subprocess automatically, so the CLI's spans link to the
+active Agent Kernel trace without further wiring — this is documented SDK behavior, not something this adapter
+implements. See Anthropic's [observability guide](https://code.claude.com/docs/en/agent-sdk/observability).
 
 ## Deployment
 
@@ -272,4 +340,5 @@ provider, and may not be branded "Claude Code". See Anthropic's
 
 ## Example
 
-See [`examples/cli/claude`](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/cli/claude).
+See the [CLI example](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/cli/claude) and
+the [REST API example](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/api/claude).

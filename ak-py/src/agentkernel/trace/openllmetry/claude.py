@@ -1,8 +1,11 @@
 import logging
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from ...core import Session
-from ...core.model import AgentReply, AgentRequest
+from ...core.event import StreamEvent
+from ...core.model import AgentReply, AgentRequest, ResumeDecision
+from ...core.paused_run import PausedRun
 from ...framework.claude.claude import ClaudeRunner
 from .openllmetry import TraceloopContext
 
@@ -31,3 +34,21 @@ class OpenLLMetryClaudeRunner(ClaudeRunner):
         with TraceloopContext(app_name="AgentKernel Claude", association_properties={"session_id": session.id}):
             result = await super().run(agent, session, requests)
         return result
+
+    async def resume(
+        self, agent: Any, session: Session, requests: list[AgentRequest], decisions: list[ResumeDecision], record: PausedRun
+    ) -> AgentReply:
+        with TraceloopContext(app_name="AgentKernel Claude", association_properties={"session_id": session.id}):
+            return await super().resume(agent, session, requests, decisions, record)
+
+    async def stream(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AsyncGenerator[StreamEvent, None]:
+        with TraceloopContext(app_name="AgentKernel Claude", association_properties={"session_id": session.id}):
+            async for event in super().stream(agent, session, requests):
+                yield event
+
+    async def resume_stream(
+        self, agent: Any, session: Session, requests: list[AgentRequest], decisions: list[ResumeDecision], record: PausedRun
+    ) -> AsyncGenerator[StreamEvent, None]:
+        with TraceloopContext(app_name="AgentKernel Claude", association_properties={"session_id": session.id}):
+            async for event in super().resume_stream(agent, session, requests, decisions, record):
+                yield event

@@ -3,7 +3,7 @@ import logging
 from agentkernel.claude import ClaudeAgentSpec, ClaudeModule, ClaudeToolBuilder
 from agentkernel.cli import CLI
 from agentkernel.core import ToolContext
-from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions
 
 MODEL = "sonnet"
 
@@ -19,60 +19,73 @@ def get_weather(city: str) -> str:
         return f"Cannot find weather for {city}."
 
 
-# tools=[] and setting_sources=[] turn off Claude Code's built-in tools (Bash, Read, Write, ...) and ~/.claude
-# settings; permission_mode="dontAsk" denies any tool call that is not explicitly approved. Agent Kernel approves
-# the tools bound with ClaudeToolBuilder.
+def options(system_prompt: str, agents: dict[str, AgentDefinition] | None = None) -> ClaudeAgentOptions:
+    """
+    ClaudeAgentOptions locked down for a server: no built-in Claude Code tools (Bash, Read, Write, ...), no
+    ~/.claude settings or CLAUDE.md, and no unapproved tool calls. Agent Kernel approves the tools bound with
+    ClaudeToolBuilder. `strict_mcp_config` and `verbatim_prompts` additionally keep local MCP configuration and
+    `@path` expansion out of user prompts; `max_turns` bounds a runaway run.
+    """
+    return ClaudeAgentOptions(
+        model=MODEL,
+        system_prompt=system_prompt,
+        tools=[],
+        setting_sources=[],
+        strict_mcp_config=True,
+        permission_mode="dontAsk",
+        verbatim_prompts=True,
+        max_turns=8,
+        agents=agents,
+    )
+
+
 math_agent = ClaudeAgentSpec(
     name="math",
     description="Specialist agent for math questions",
-    options=ClaudeAgentOptions(
-        model=MODEL,
-        tools=[],
-        setting_sources=[],
-        permission_mode="dontAsk",
-        system_prompt="You provide help with math problems. Give short and direct answers exactly to the question. "
-        "Don't provide any explanations nor additional details.",
+    options=options(
+        "You provide help with math problems. Give short and direct answers exactly to the question. "
+        "Don't provide any explanations nor additional details."
     ),
 )
 
 general_agent = ClaudeAgentSpec(
     name="general",
     description="Agent for general questions",
-    options=ClaudeAgentOptions(
-        model=MODEL,
-        tools=[],
-        setting_sources=[],
-        permission_mode="dontAsk",
-        system_prompt="You provide assistance with general queries. Give short and direct answers exactly to the question. "
-        "Don't provide any explanations nor additional details",
+    options=options(
+        "You provide assistance with general queries. Give short and direct answers exactly to the question. "
+        "Don't provide any explanations nor additional details"
     ),
 )
 
 weather_agent = ClaudeAgentSpec(
     name="weather",
     description="Agent that provides weather information",
-    options=ClaudeAgentOptions(
-        model=MODEL,
-        tools=[],
-        setting_sources=[],
-        permission_mode="dontAsk",
-        system_prompt="You provide weather information upon request. Use the get_weather tool for all weather-related questions.",
+    options=options(
+        "You provide weather information upon request. Use the get_weather tool for all weather-related questions."
     ),
     tools=ClaudeToolBuilder.bind([get_weather]),
 )
 
+# The native subagents share triage's session. Its bound tool is served to the weather subagent by name.
 triage_agent = ClaudeAgentSpec(
     name="triage",
     description="Front-line agent that routes each question to the right specialist",
-    options=ClaudeAgentOptions(
-        model=MODEL,
-        tools=[],
-        setting_sources=[],
-        permission_mode="dontAsk",
-        system_prompt="You determine which agent to use based on the user's question. Give short and direct answers "
+    options=options(
+        "You determine which agent to use based on the user's question. Give short and direct answers "
         "exactly to the question. Don't provide any explanations nor additional details",
+        agents={
+            "general": AgentDefinition(
+                description=general_agent.description, prompt=general_agent.options.system_prompt
+            ),
+            "math": AgentDefinition(description=math_agent.description, prompt=math_agent.options.system_prompt),
+            "weather": AgentDefinition(
+                description=weather_agent.description,
+                prompt=weather_agent.options.system_prompt,
+                tools=[ClaudeToolBuilder.mcp_tool_name("get_weather")],
+            ),
+        },
     ),
-    subagents=[general_agent, math_agent, weather_agent],
+    tools=weather_agent.tools,
 )
 
 ClaudeModule([triage_agent, math_agent, general_agent, weather_agent])

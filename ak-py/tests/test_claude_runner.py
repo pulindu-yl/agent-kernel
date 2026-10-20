@@ -8,6 +8,7 @@ SessionStore (as the SDK does before yielding a ResultMessage), stamp the result
 and call tool handlers (as the CLI does through the in-process MCP server).
 """
 
+import asyncio
 import base64
 import logging
 from unittest.mock import AsyncMock
@@ -17,6 +18,7 @@ from claude_agent_sdk import (
     AgentDefinition,
     AssistantMessage,
     ClaudeAgentOptions,
+    DeferredToolUse,
     ResultMessage,
     StreamEvent,
     TextBlock,
@@ -27,7 +29,18 @@ from claude_agent_sdk import (
 import agentkernel.framework.claude.claude as claude_mod
 from agentkernel.core import Session
 from agentkernel.core.builder import SessionStoreBuilder
-from agentkernel.core.model import AgentReplyAny, AgentReplyText, AgentRequestFile, AgentRequestImage, AgentRequestText
+from agentkernel.core.event import RunPaused
+from agentkernel.core.model import (
+    AgentPausedReplyAny,
+    AgentReplyAny,
+    AgentReplyText,
+    AgentRequestFile,
+    AgentRequestImage,
+    AgentRequestText,
+    AgentResumeRequestAny,
+    ResumeDecision,
+)
+from agentkernel.core.paused_run import PausedRunState
 from agentkernel.core.runtime import Runtime
 from agentkernel.core.session.serde import BinarySerde
 from agentkernel.core.tool import ToolContext
@@ -488,6 +501,33 @@ class TestRunOptions:
         assert options.session_store_flush == "batched"
         assert options.session_id != "declared"
 
+    def test_declared_conversation_controls_cannot_override_session_state(self, runtime):
+        spec = _spec(
+            resume="unrelated",
+            continue_conversation=True,
+            fork_session=True,
+            resume_session_at="old-message",
+            resume_drops_turn="old-turn",
+            enable_file_checkpointing=True,
+            include_partial_messages=True,
+        )
+        agent = _module(spec).get_agent("general")
+        claude_session = ClaudeSession()
+
+        first = agent.runner._native_options(agent, {}, claude_session, _ClaudeSessionStore(claude_session, agent.name), stream=False)
+        assert first.session_id and first.resume is None
+        assert first.continue_conversation is False
+        assert first.fork_session is False
+        assert first.resume_session_at is None
+        assert first.resume_drops_turn is None
+        assert first.enable_file_checkpointing is False
+        assert first.include_partial_messages is False
+
+        claude_session.save(agent.name, "saved", {"": [{"type": "user", "uuid": "u1"}]})
+        later = agent.runner._native_options(agent, {}, claude_session, _ClaudeSessionStore(claude_session, agent.name), stream=True)
+        assert later.resume == "saved" and later.session_id is None
+        assert later.include_partial_messages is True
+
     def test_reserved_unknown_and_colliding_keys_are_rejected_at_declaration(self, runtime):
         spec = _spec()
         spec.tools = ClaudeToolBuilder.bind([double])
@@ -522,19 +562,124 @@ class TestRunOptions:
 
 
 class TestFrameworkContext:
+    """
+    framework_context injection and write-back for ClaudeRunner. There is no native context slot a Claude Agent
+    SDK tool handler can read, so the runner hands a copy through `ClaudeToolContext`, a per-run contextvar; a
+    tool mutating the dict it returns round-trips back to the session on a successful call.
+    """
+
     @pytest.mark.asyncio
-    async def test_context_is_not_injected_and_warns_once(self, fake_client, runtime, caplog):
-        agent = _module(_spec()).get_agent("general")
+    async def test_tool_sees_and_mutates_the_context(self, fake_client, runtime):
+        def add_item(item: str) -> str:
+            """Append an item to the caller's cart carried in framework_context."""
+            claude_mod.ClaudeToolContext.get()["cart"].append(item)
+            return "added"
+
+        spec = _spec()
+        spec.tools = ClaudeToolBuilder.bind([add_item])
+        agent = _module(spec).get_agent("general")
         session = Session("s")
-        session.set_framework_context({"user": "u1"})
-        fake_client.script = [_result()]
+        session.set_framework_context({"cart": []})
 
-        with caplog.at_level(logging.WARNING, logger="ak.claude.runner"):
-            await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
-            await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        async def call_tool(client):
+            tool = next(t for t in agent.agent.tools if t.name == "add_item")
+            await tool.handler({"item": "apple"})
 
-        assert len([r for r in caplog.records if "framework_context" in r.getMessage()]) == 1
-        assert session.get_framework_context() == {"user": "u1"}
+        fake_client.script = [call_tool, _result()]
+        await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+
+        assert session.get_framework_context() == {"cart": ["apple"]}
+
+    @pytest.mark.asyncio
+    async def test_absent_context_reads_back_as_none(self, fake_client, runtime):
+        seen = {}
+
+        def whoami() -> str:
+            """Report whether a context dict is present."""
+            seen["context"] = claude_mod.ClaudeToolContext.get()
+            return "ok"
+
+        spec = _spec()
+        spec.tools = ClaudeToolBuilder.bind([whoami])
+        agent = _module(spec).get_agent("general")
+        session = Session("s")
+
+        async def call_tool(client):
+            tool = next(t for t in agent.agent.tools if t.name == "whoami")
+            await tool.handler({})
+
+        fake_client.script = [call_tool, _result()]
+        await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+
+        assert seen["context"] is None
+        assert session.get_framework_context() is None
+
+    @pytest.mark.asyncio
+    async def test_get_outside_a_run_raises(self):
+        with pytest.raises(RuntimeError, match="running Claude Agent SDK tool call"):
+            claude_mod.ClaudeToolContext.get()
+
+    @pytest.mark.asyncio
+    async def test_error_leaves_stored_context_intact(self, fake_client, runtime):
+        def boom() -> str:
+            """Mutate the context then fail the turn."""
+            claude_mod.ClaudeToolContext.get()["cart"].append("apple")
+            raise RuntimeError("tool boom")
+
+        spec = _spec()
+        spec.tools = ClaudeToolBuilder.bind([boom])
+        agent = _module(spec).get_agent("general")
+        session = Session("s")
+        session.set_framework_context({"cart": []})
+
+        fake_client.script = [_result(is_error=True, subtype="error_max_turns")]
+        reply = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+
+        assert isinstance(reply, AgentReplyText)
+        assert session.get_framework_context() == {"cart": []}
+
+    @pytest.mark.asyncio
+    async def test_stream_normal_drain_writes_back(self, fake_client, runtime):
+        def add_item(item: str) -> str:
+            """Append an item to the caller's cart carried in framework_context."""
+            claude_mod.ClaudeToolContext.get()["cart"].append(item)
+            return "added"
+
+        spec = _spec()
+        spec.tools = ClaudeToolBuilder.bind([add_item])
+        agent = _module(spec).get_agent("general")
+        session = Session("stream-session")
+        session.set_framework_context({"cart": []})
+
+        async def call_tool(client):
+            tool = next(t for t in agent.agent.tools if t.name == "add_item")
+            await tool.handler({"item": "apple"})
+
+        fake_client.script = [call_tool, _result()]
+        events = [event async for event in agent.runner.stream(agent, session, [AgentRequestText(prompt="hi")])]
+
+        assert events == []  # the fake script carries no raw stream events, only the result
+        assert session.get_framework_context() == {"cart": ["apple"]}
+
+    @pytest.mark.asyncio
+    async def test_stream_disconnect_leaves_context_intact(self, fake_client, runtime):
+        session = Session("stream-session")
+        session.set_framework_context({"cart": []})
+        agent = _module(_spec()).get_agent("general")
+
+        async def hang(client):
+            await asyncio.Event().wait()
+
+        fake_client.script = [hang]
+        agen = agent.runner.stream(agent, session, [AgentRequestText(prompt="hi")])
+        task = asyncio.ensure_future(agen.__anext__())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await agen.aclose()
+
+        assert session.get_framework_context() == {"cart": []}
 
 
 # --- multimodal ----------------------------------------------------------------------------------------
@@ -772,8 +917,8 @@ class TestAgent:
         with pytest.raises(ValueError, match="must have a name"):
             _module(ClaudeAgentSpec(name=""))
 
-    def test_does_not_pause(self):
-        assert ClaudeRunner().supports_pause is False
+    def test_supports_pause_and_streaming(self):
+        assert ClaudeRunner().supports_pause is True
         assert ClaudeRunner().supports_streaming is True
 
 
@@ -786,29 +931,29 @@ class TestSubagents:
         claude_session = ClaudeSession()
         return agent.runner._native_options(agent, {}, claude_session, _ClaudeSessionStore(claude_session, agent.name), stream=False)
 
-    def test_subagents_become_definitions_whose_tools_the_parent_serves(self, runtime):
-        weather = ClaudeAgentSpec(
-            name="weather",
-            description="Weather questions",
-            options=ClaudeAgentOptions(system_prompt="Use get_weather.", tools=[], model="haiku"),
+    def test_native_subagent_fields_and_parent_tools_are_preserved(self, runtime):
+        weather = AgentDefinition(
+            description="Weather questions", prompt="Use get_weather.", tools=["mcp__ak__double"], model="haiku", maxTurns=4, skills=["forecast"]
+        )
+        triage = ClaudeAgentSpec(
+            name="triage",
+            options=ClaudeAgentOptions(tools=[], allowed_tools=["Read"], agents={"weather": weather}),
             tools=ClaudeToolBuilder.bind([double]),
         )
-        triage = ClaudeAgentSpec(name="triage", options=ClaudeAgentOptions(tools=[], allowed_tools=["Read"]), subagents=[weather])
-        agent = _module(triage, weather).get_agent("triage")
+        agent = _module(triage).get_agent("triage")
 
         options = self._options(agent)
 
-        assert options.agents["weather"].description == "Weather questions"
-        assert options.agents["weather"].prompt == "Use get_weather."
-        assert options.agents["weather"].tools == ["mcp__ak__double"]
-        assert options.agents["weather"].model == "haiku"
+        assert options.agents["weather"] is weather
+        assert options.agents["weather"].maxTurns == 4
+        assert options.agents["weather"].skills == ["forecast"]
         assert AK_MCP_SERVER in options.mcp_servers
         assert options.tools == ["Agent"]
         assert options.allowed_tools == ["Read", "mcp__ak__double", "Agent"]
-        assert agent.agent.options.tools == [] and agent.agent.options.agents is None  # the declaration is untouched
+        assert agent.agent.options.tools == [] and agent.agent.options.agents == {"weather": weather}
 
     def test_a_subagent_with_default_tools_inherits_the_sessions_tools(self, runtime):
-        triage = ClaudeAgentSpec(name="triage", subagents=[ClaudeAgentSpec(name="helper", options=ClaudeAgentOptions(system_prompt="Help."))])
+        triage = ClaudeAgentSpec(name="triage", options=ClaudeAgentOptions(agents={"helper": AgentDefinition(description="helper", prompt="Help.")}))
 
         options = self._options(_module(triage).get_agent("triage"))
 
@@ -816,25 +961,386 @@ class TestSubagents:
         assert options.agents["helper"].description == "helper"
         assert options.tools is None  # the full built-in toolset, which already includes Agent
 
-    def test_a_custom_prompt_is_unwrapped_and_native_agents_are_kept(self, runtime):
-        native = AgentDefinition(description="Native", prompt="P")
-        sub = ClaudeAgentSpec(name="sub", options=ClaudeAgentOptions(system_prompt={"type": "custom", "prompt": "Custom."}))
-        triage = ClaudeAgentSpec(name="triage", options=ClaudeAgentOptions(agents={"native": native}), subagents=[sub])
+    def test_native_agent_remains_available_after_per_run_override(self, runtime):
+        native = AgentDefinition(description="Native", prompt="P", permissionMode="dontAsk")
+        triage = ClaudeAgentSpec(name="triage", options=ClaudeAgentOptions(tools=[], agents={"native": native}))
+        agent = _module(triage).get_agent("triage")
+        agent.run_options["model"] = "sonnet"
 
-        options = self._options(_module(triage).get_agent("triage"))
+        options = self._options(agent)
 
         assert options.agents["native"] is native
-        assert options.agents["sub"].prompt == "Custom."
+        assert options.tools == ["Agent"]
 
-    def test_invalid_subagents_are_rejected_at_load(self, runtime):
-        clash = ClaudeAgentSpec(
-            name="triage",
-            options=ClaudeAgentOptions(agents={"sub": AgentDefinition(description="d", prompt="p")}),
-            subagents=[ClaudeAgentSpec(name="sub")],
+
+# --- human in the loop ----------------------------------------------------------------------------------
+
+
+def _gated_spec(name="gated", tool_name="echo", needs_approval=True):
+    spec = _spec(name)
+    spec.tools = ClaudeToolBuilder.bind([_echo], needs_approval=needs_approval)
+    if tool_name != "echo":
+        spec.tools[0].name = tool_name
+    return spec
+
+
+def _defer(tool_use_id="tu-1", name="echo", arguments=None, **result_kwargs):
+    """A script step yielding a ResultMessage that defers one tool call, stamped with the run's session id.
+    Mirrors one entry first, as a real turn always does (at minimum the user message), so the next turn
+    correctly resumes rather than reading an empty transcript as "no prior turn"."""
+    deferred = DeferredToolUse(id=tool_use_id, name=ClaudeToolBuilder.mcp_tool_name(name), input=arguments or {})
+
+    async def step(client):
+        await client.options.session_store.append({"project_key": "p", "session_id": client.session_id}, [{"type": "user", "uuid": tool_use_id}])
+        return ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id=client.session_id,
+            result=None,
+            deferred_tool_use=deferred,
+            **result_kwargs,
         )
-        with pytest.raises(ValueError, match="also defined"):
-            _module(clash)
 
-        preset = ClaudeAgentSpec(name="sub", options=ClaudeAgentOptions(system_prompt={"type": "preset", "preset": "claude_code"}))
-        with pytest.raises(ValueError, match="string system prompt"):
-            _module(ClaudeAgentSpec(name="triage2", subagents=[preset]))
+    return step
+
+
+def _resume_requests(*decisions, prompt=None):
+    requests = [AgentRequestText(prompt=prompt)] if prompt else []
+    return requests + [AgentResumeRequestAny(decisions=list(decisions))], list(decisions)
+
+
+class TestHITLDecisionHook:
+    """`_decision_hook`/`_hook_decision` directly: the combined PreToolUse hook and the verb mapping,
+    independent of a full run."""
+
+    @pytest.mark.asyncio
+    async def test_a_gated_tool_defers_on_its_first_attempt(self):
+        hook = ClaudeRunner()._decision_hook(frozenset({"mcp__ak__echo"}), None)
+        out = await hook({"tool_name": "mcp__ak__echo"}, "tu-1", {})
+        assert out == {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "defer"}}
+
+    @pytest.mark.asyncio
+    async def test_an_ungated_tool_is_left_alone(self):
+        hook = ClaudeRunner()._decision_hook(frozenset(), None)
+        assert await hook({"tool_name": "mcp__ak__other"}, "tu-1", {}) == {}
+
+    @pytest.mark.asyncio
+    async def test_the_resumed_call_s_own_decision_wins_over_the_standing_gate(self):
+        decision = ResumeDecision(id="x", status="approved")
+        hook = ClaudeRunner()._decision_hook(frozenset({"mcp__ak__echo"}), ("tu-1", decision))
+        out = await hook({"tool_name": "mcp__ak__echo"}, "tu-1", {})
+        assert out["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+    @pytest.mark.asyncio
+    async def test_a_different_pending_call_still_defers_while_one_is_being_resumed(self):
+        """The precedence fix: only the resumed call's own id bypasses the standing gate."""
+        decision = ResumeDecision(id="x", status="approved")
+        hook = ClaudeRunner()._decision_hook(frozenset({"mcp__ak__echo"}), ("tu-1", decision))
+        out = await hook({"tool_name": "mcp__ak__echo"}, "tu-2", {})
+        assert out["hookSpecificOutput"]["permissionDecision"] == "defer"
+
+    def test_approved_payload_becomes_updated_input(self):
+        decision = ResumeDecision(id="x", status="approved", payload={"text": "override"})
+        out = ClaudeRunner()._hook_decision(decision)
+        assert out == {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": {"text": "override"}}}
+
+    def test_approved_without_a_payload_carries_no_updated_input(self):
+        out = ClaudeRunner()._hook_decision(ResumeDecision(id="x", status="approved"))
+        assert out == {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
+
+    def test_denied_carries_the_human_s_message(self):
+        out = ClaudeRunner()._hook_decision(ResumeDecision(id="x", status="denied", message="too expensive"))
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert out["hookSpecificOutput"]["permissionDecisionReason"] == "too expensive"
+
+    def test_cancelled_does_not_read_as_a_refusal(self):
+        out = ClaudeRunner()._hook_decision(ResumeDecision(id="x", status="cancelled"))
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert out["hookSpecificOutput"]["permissionDecisionReason"] == ClaudeRunner.CANCELLED_DECISION_MESSAGE
+
+
+class TestHITLPauseDetection:
+    def test_the_runner_declares_the_capability(self):
+        assert ClaudeRunner().supports_pause is True
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_call_returns_a_paused_reply(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        fake_client.script = [_defer(arguments={"text": "hi"})]
+
+        reply = await agent.runner.run(agent, Session("s"), [AgentRequestText(prompt="hi")])
+
+        assert isinstance(reply, AgentPausedReplyAny)
+        assert reply.interruptions[0].kind == "tool_call"
+        assert reply.interruptions[0].tool_name == "echo"
+        assert reply.interruptions[0].arguments == '{"text": "hi"}'
+
+    @pytest.mark.asyncio
+    async def test_a_gated_tool_is_approved_automatically_everywhere_else(self, fake_client, runtime):
+        """Only the gated tool defers; an ungated tool bound alongside it is approved like any other."""
+        agent = _module(_gated_spec()).get_agent("gated")
+        fake_client.script = [_result()]
+
+        await agent.runner.run(agent, Session("s"), [AgentRequestText(prompt="hi")])
+
+        options = fake_client.instances[0].options
+        assert "mcp__ak__echo" not in options.allowed_tools
+
+    @pytest.mark.asyncio
+    async def test_permission_bypass_cannot_execute_a_gated_tool_without_a_decision(self, fake_client, runtime):
+        calls = []
+
+        async def charge(amount: int) -> str:
+            calls.append(amount)
+            return "charged"
+
+        spec = _spec(permission_mode="bypassPermissions", allowed_tools=["mcp__ak__charge"])
+        spec.tools = ClaudeToolBuilder.bind([charge], needs_approval=True)
+        agent = _module(spec).get_agent("general")
+        seen = []
+
+        async def attempt(client):
+            seen.append(await spec.tools[0].handler({"amount": 5}))
+
+        fake_client.script = [attempt, _result()]
+        await agent.runner.run(agent, Session("s"), [AgentRequestText(prompt="charge")])
+
+        assert calls == []
+        assert seen[0]["isError"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_record_can_be_found_and_survives_a_pickle(self, fake_client, runtime):
+        import pickle
+
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+
+        reply = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+
+        record = PausedRunState.get(pickle.loads(pickle.dumps(session)), reply.run_id)
+        assert record is not None
+        assert record.payload["tool_use_id"] == "tu-1"
+        assert record.payload["session_id"] == session.get("claude").session_id("gated")
+        assert record.payload["main_entries"] == 1
+
+    @pytest.mark.asyncio
+    async def test_it_replaces_only_its_own_framework_s_pause(self, fake_client, runtime):
+        from agentkernel.core.event import PausedInterruption
+
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        foreign = PausedRunState.add(
+            session, agent="support", runner="openai", interruptions=[PausedInterruption(id="openai-1", kind="tool_call", tool_name="issue_refund")]
+        )
+
+        fake_client.script = [_defer()]
+        await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+
+        assert foreign.id in [r.id for r in PausedRunState.list(session)]
+        assert [r.runner for r in PausedRunState.list(session) if r.id != foreign.id] == ["claude"]
+
+
+class TestHITLResume:
+    @pytest.mark.asyncio
+    async def test_another_turn_invalidates_a_pending_resume(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="first")])
+        record = PausedRunState.get(session, paused.run_id)
+        fake_client.script = [_finish({"type": "assistant", "uuid": "later"})]
+        await agent.runner.run(agent, session, [AgentRequestText(prompt="another turn")])
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="approved"))
+
+        with pytest.raises(ValueError, match="conversation changed"):
+            await agent.runner.resume(agent, session, requests, decisions, record)
+
+    @pytest.mark.asyncio
+    async def test_approved_tool_call_is_allowed_once_with_matching_arguments(self, fake_client, runtime):
+        calls = []
+
+        async def charge(amount: int) -> str:
+            calls.append(amount)
+            return "charged"
+
+        spec = _spec()
+        spec.tools = ClaudeToolBuilder.bind([charge], needs_approval=True)
+        agent = _module(spec).get_agent("general")
+        session = Session("s")
+        fake_client.script = [_defer(name="charge", arguments={"amount": 5})]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="charge")])
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="approved"))
+        seen = []
+
+        async def execute(client):
+            hook = client.options.hooks["PreToolUse"][-1].hooks[0]
+            await hook({"tool_name": "mcp__ak__charge", "tool_input": {"amount": 5}}, "tu-1", {})
+            seen.append(await spec.tools[0].handler({"amount": 5}))
+            seen.append(await spec.tools[0].handler({"amount": 5}))
+
+        fake_client.script = [execute, _finish(result="done")]
+        await agent.runner.resume(agent, session, requests, decisions, record)
+
+        assert calls == [5]
+        assert "isError" not in seen[0]
+        assert seen[1]["isError"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_successful_resume_clears_its_record_and_returns_the_reply(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="approved"))
+
+        fake_client.script = [_finish({"type": "assistant", "uuid": "a-1"}, result="done")]
+        reply = await agent.runner.resume(agent, session, requests, decisions, record)
+
+        assert isinstance(reply, AgentReplyText)
+        assert reply.response == "done"
+        assert PausedRunState.list(session) == []
+
+    @pytest.mark.asyncio
+    async def test_the_resumed_call_carries_resume_as_the_claude_session(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        first_session_id = fake_client.instances[0].options.session_id
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="approved"))
+
+        fake_client.script = [_finish(result="done")]
+        await agent.runner.resume(agent, session, requests, decisions, record)
+
+        assert fake_client.instances[1].options.resume == first_session_id
+        assert fake_client.instances[1].options.session_id is None
+
+    @pytest.mark.asyncio
+    async def test_the_resume_hook_is_wired_to_this_decision(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="denied", message="no"))
+
+        fake_client.script = [_finish(result="done")]
+        await agent.runner.resume(agent, session, requests, decisions, record)
+
+        hooks = fake_client.instances[1].options.hooks["PreToolUse"]
+        out = await hooks[-1].hooks[0]({"tool_name": "mcp__ak__echo"}, "tu-1", {})
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert out["hookSpecificOutput"]["permissionDecisionReason"] == "no"
+
+    @pytest.mark.asyncio
+    async def test_framework_context_survives_a_resume(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        session.set_framework_context({"user_id": "42"})
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="approved"))
+
+        fake_client.script = [_finish(result="done")]
+        await agent.runner.resume(agent, session, requests, decisions, record)
+
+        assert session.get_framework_context() == {"user_id": "42"}
+
+    @pytest.mark.asyncio
+    async def test_a_re_deferred_call_on_resume_supersedes_the_record(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="approved"))
+
+        fake_client.script = [_defer(tool_use_id="tu-2")]
+        reply = await agent.runner.resume(agent, session, requests, decisions, record)
+
+        assert isinstance(reply, AgentPausedReplyAny)
+        records = PausedRunState.list(session)
+        assert len(records) == 1 and records[0].id != record.id
+
+    @pytest.mark.asyncio
+    async def test_a_failed_resume_keeps_its_record(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="approved"))
+
+        fake_client.script = [_result(is_error=True, subtype="error_max_turns")]
+        reply = await agent.runner.resume(agent, session, requests, decisions, record)
+
+        assert isinstance(reply, AgentReplyText)
+        assert PausedRunState.get(session, paused.run_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_resume_stream_ends_in_run_paused_when_deferred_again(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="approved"))
+
+        fake_client.script = [_defer(tool_use_id="tu-2")]
+        events = [event async for event in agent.runner.resume_stream(agent, session, requests, decisions, record)]
+
+        assert isinstance(events[-1], RunPaused)
+
+    @pytest.mark.asyncio
+    async def test_resume_stream_clears_its_record_on_success(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="approved"))
+
+        fake_client.script = [_finish(result="done")]
+        events = [event async for event in agent.runner.resume_stream(agent, session, requests, decisions, record)]
+
+        assert PausedRunState.list(session) == []
+        assert not any(isinstance(e, RunPaused) for e in events)
+
+
+class TestHITLRejectsAnUnanswerableResume:
+    """Raised above the adapter's `try`, since the `except Exception` below would otherwise flatten the message."""
+
+    @pytest.mark.asyncio
+    async def test_more_than_one_decision_is_refused(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(
+            ResumeDecision(id=paused.interruptions[0].id, status="approved"), ResumeDecision(id="extra", status="approved")
+        )
+
+        with pytest.raises(ValueError, match="single pending tool call"):
+            await agent.runner.resume(agent, session, requests, decisions, record)
+        assert PausedRunState.get(session, paused.run_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_a_non_object_approval_payload_is_refused(self, fake_client, runtime):
+        agent = _module(_gated_spec()).get_agent("gated")
+        session = Session("s")
+        fake_client.script = [_defer()]
+        paused = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
+        record = PausedRunState.get(session, paused.run_id)
+        requests, decisions = _resume_requests(ResumeDecision(id=paused.interruptions[0].id, status="approved", payload="large"))
+
+        with pytest.raises(ValueError, match="only carry a JSON object"):
+            await agent.runner.resume(agent, session, requests, decisions, record)

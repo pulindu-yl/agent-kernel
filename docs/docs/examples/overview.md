@@ -30,6 +30,7 @@ Examples demonstrating Agent Kernel's API capabilities and integrations:
 - **`instagram/`** - Instagram integration example
 - **`telegram/`** - Telegram integration example
 - **`schedule-openai/`** - Deferred and recurring chats: a chat request carrying a `schedule` block is registered instead of run (HTTP 202), with the in-process `local` provider, an `in_memory` task store, the `/api/v1/schedules` management routes, and an agent that can schedule work itself
+- **`claude/`** - Claude Agent SDK subagents and a bound tool served through the REST chat endpoint
 
 ### 📁 CLI Examples (`/examples/cli`)
 
@@ -68,6 +69,7 @@ Per-agent native run options demos, one per framework plus a per-run factory var
 - **`pydanticai-run-options/`** - Pydantic AI, `UsageLimits` and an `event_stream_handler`
 - **`crewai-run-options/`** - CrewAI, a `Crew` `step_callback` and `max_rpm`
 - **`smolagents-run-options/`** - smolagents, `max_steps` (progress via the native `step_callbacks` constructor argument)
+- **`claude-run-options/`** - Claude Agent SDK, `max_turns` and a native `PostToolUse` hook via `hooks=`
 
 ### 📁 Sandbox Examples (`/examples/sandbox`)
 
@@ -158,7 +160,7 @@ Agent Kernel supports multiple AI agent frameworks:
 | **LangGraph** | Graph-based agent framework | CLI, AWS Serverless, Azure Serverless |
 | **OpenAI Agent SDK** | OpenAI's official agent framework | CLI, Containerized, AWS Serverless, AWS Containerized, Azure Serverless, Azure Containerized, GCP Serverless, GCP Containerized, API |
 | **Pydantic AI** | Type-safe agent framework from the Pydantic team | CLI, API |
-| **Claude Agent SDK** | Anthropic's Claude Code agent harness | CLI |
+| **Claude Agent SDK** | Anthropic's Claude Code agent harness | CLI, API |
 | **smolagents** | HuggingFace's code-first agent framework | CLI |
 
 ## Deployment Patterns

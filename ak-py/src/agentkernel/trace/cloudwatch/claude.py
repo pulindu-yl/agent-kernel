@@ -1,10 +1,13 @@
 import logging
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from openinference.instrumentation.claude_agent_sdk import ClaudeAgentSDKInstrumentor
 
 from ...core import Session
-from ...core.model import AgentReply, AgentRequest
+from ...core.event import StreamEvent
+from ...core.model import AgentReply, AgentRequest, ResumeDecision
+from ...core.paused_run import PausedRun
 from ...framework.claude.claude import ClaudeRunner
 from .cloudwatch import INPUT_VALUE, OUTPUT_VALUE, CloudWatch
 
@@ -38,3 +41,23 @@ class CloudWatchClaudeRunner(ClaudeRunner):
             span.set_attribute(INPUT_VALUE, result.prompt)
             span.set_attribute(OUTPUT_VALUE, str(result))
         return result
+
+    async def resume(
+        self, agent: Any, session: Session, requests: list[AgentRequest], decisions: list[ResumeDecision], record: PausedRun
+    ) -> AgentReply:
+        with self._tracer.span("Agent Kernel Claude resume", session) as span:
+            result = await super().resume(agent, session, requests, decisions, record)
+            span.set_attribute(OUTPUT_VALUE, str(result))
+        return result
+
+    async def stream(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AsyncGenerator[StreamEvent, None]:
+        with self._tracer.span("Agent Kernel Claude stream", session):
+            async for event in super().stream(agent, session, requests):
+                yield event
+
+    async def resume_stream(
+        self, agent: Any, session: Session, requests: list[AgentRequest], decisions: list[ResumeDecision], record: PausedRun
+    ) -> AsyncGenerator[StreamEvent, None]:
+        with self._tracer.span("Agent Kernel Claude resume", session):
+            async for event in super().resume_stream(agent, session, requests, decisions, record):
+                yield event
