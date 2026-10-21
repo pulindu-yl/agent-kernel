@@ -1,14 +1,11 @@
 import logging
-from collections.abc import AsyncGenerator
 from typing import Any
 
 from langfuse import Langfuse, propagate_attributes
 from openinference.instrumentation.claude_agent_sdk import ClaudeAgentSDKInstrumentor
 
 from ...core import Session
-from ...core.event import StreamEvent
-from ...core.model import AgentReply, AgentRequest, ResumeDecision
-from ...core.paused_run import PausedRun
+from ...core.model import AgentReply, AgentRequest
 from ...framework.claude.claude import ClaudeRunner
 
 
@@ -45,26 +42,3 @@ class LangFuseClaudeRunner(ClaudeRunner):
                 span.update(input=result.prompt, output=str(result))
 
         return result
-
-    async def resume(
-        self, agent: Any, session: Session, requests: list[AgentRequest], decisions: list[ResumeDecision], record: PausedRun
-    ) -> AgentReply:
-        with propagate_attributes(session_id=session.id, tags=["agentkernel"]):
-            with self._client.start_as_current_observation(name="Agent Kernel Claude resume", as_type="span") as span:
-                result = await super().resume(agent, session, requests, decisions, record)
-                span.update(output=str(result))
-        return result
-
-    async def stream(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AsyncGenerator[StreamEvent, None]:
-        with propagate_attributes(session_id=session.id, tags=["agentkernel"]):
-            with self._client.start_as_current_observation(name="Agent Kernel Claude stream", as_type="span"):
-                async for event in super().stream(agent, session, requests):
-                    yield event
-
-    async def resume_stream(
-        self, agent: Any, session: Session, requests: list[AgentRequest], decisions: list[ResumeDecision], record: PausedRun
-    ) -> AsyncGenerator[StreamEvent, None]:
-        with propagate_attributes(session_id=session.id, tags=["agentkernel"]):
-            with self._client.start_as_current_observation(name="Agent Kernel Claude resume", as_type="span"):
-                async for event in super().resume_stream(agent, session, requests, decisions, record):
-                    yield event
