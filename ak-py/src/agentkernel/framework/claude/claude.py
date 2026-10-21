@@ -197,26 +197,6 @@ that simply has no framework_context seeded (which reads back as a legitimate `N
 _framework_context: contextvars.ContextVar[Any] = contextvars.ContextVar("claude_framework_context", default=_UNSET)
 
 
-class _ClaudeApprovalGuard:
-    """One-use approvals for AK tools in a single Claude run."""
-
-    def __init__(self) -> None:
-        self._grants: list[tuple[str, dict[str, Any]]] = []
-
-    def grant(self, name: str, arguments: dict[str, Any]) -> None:
-        self._grants.append((name, arguments))
-
-    def consume(self, name: str, arguments: dict[str, Any]) -> bool:
-        for index, (allowed_name, allowed_arguments) in enumerate(self._grants):
-            if allowed_name == name and allowed_arguments == arguments:
-                self._grants.pop(index)
-                return True
-        return False
-
-
-_approval_guard: contextvars.ContextVar[_ClaudeApprovalGuard | None] = contextvars.ContextVar("claude_approval_guard", default=None)
-
-
 class ClaudeToolContext:
     """
     The per-run caller-state handle for tools bound with `ClaudeToolBuilder`.
@@ -238,6 +218,26 @@ class ClaudeToolContext:
         if value is _UNSET:
             raise RuntimeError("ClaudeToolContext.get() requires a running Claude Agent SDK tool call.")
         return typing.cast("dict | None", value)
+
+
+class _ClaudeApprovalGuard:
+    """One-use approvals for AK tools in a single Claude run."""
+
+    def __init__(self) -> None:
+        self._grants: list[tuple[str, dict[str, Any]]] = []
+
+    def grant(self, name: str, arguments: dict[str, Any]) -> None:
+        self._grants.append((name, arguments))
+
+    def consume(self, name: str, arguments: dict[str, Any]) -> bool:
+        for index, (allowed_name, allowed_arguments) in enumerate(self._grants):
+            if allowed_name == name and allowed_arguments == arguments:
+                self._grants.pop(index)
+                return True
+        return False
+
+
+_approval_guard: contextvars.ContextVar[_ClaudeApprovalGuard | None] = contextvars.ContextVar("claude_approval_guard", default=None)
 
 
 class ClaudeTelemetry:
@@ -791,8 +791,7 @@ class ClaudeRunner(BaseRunner):
         Continues a paused run from the human's decision on the one deferred tool call.
 
         The bare decision needs no accompanying text: `resume=<session_id>` replays the pending call, re-firing
-        the same `PreToolUse` hook. Grounded in the SDK's documented contract rather than a live-verified resume
-        — treat the exact replay mechanics as unverified until exercised against a real model.
+        the same `PreToolUse` hook.
 
         :param agent: The agent that paused.
         :param session: The session holding the record.

@@ -31,6 +31,7 @@ Examples demonstrating Agent Kernel's API capabilities and integrations:
 - **`telegram/`** - Telegram integration example
 - **`schedule-openai/`** - Deferred and recurring chats: a chat request carrying a `schedule` block is registered instead of run (HTTP 202), with the in-process `local` provider, an `in_memory` task store, the `/api/v1/schedules` management routes, and an agent that can schedule work itself
 - **`claude/`** - Claude Agent SDK subagents and a bound tool served through the REST chat endpoint
+- **`claude-hitl/`** - Claude Agent SDK tool approval: pause a REST request, approve or deny it, and resume the same session
 
 ### 📁 CLI Examples (`/examples/cli`)
 
@@ -59,6 +60,7 @@ Per-run framework context/state demos — a grocery assistant that carries a car
 - **`langgraph_context/`** - LangGraph, via a declared state channel on a custom graph
 - **`adk_context/`** - Google ADK, via `ToolContext.state`
 - **`pydanticai_context/`** - Pydantic AI, via `RunContext.deps`
+- **`claude_context/`** - Claude Agent SDK, via `ClaudeToolContext.get()` in bound Python tools
 
 Per-agent native run options demos, one per framework plus a per-run factory variant: each declares that framework's turn-limit option and progress-hook option through `Module.run_options` and appends a deterministic `Run stats:` line to every reply (see the [Runner](../core-concepts/runner.md#native-run-options) guide):
 

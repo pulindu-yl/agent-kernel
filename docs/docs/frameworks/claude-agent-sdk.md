@@ -252,6 +252,9 @@ This reaches only tools bound through `ClaudeToolBuilder.bind()` — never Claud
 `Read`, ...) and never an externally connected MCP server, since neither is Python code Agent Kernel can hand
 the context to.
 
+See the [runnable Claude context example](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/cli/claude_context)
+for a cart that survives across turns.
+
 ## Native run options
 
 `Module.run_options(spec, **options)` takes any `ClaudeAgentOptions` field, applied over the agent's options
@@ -293,6 +296,9 @@ approval in its handler, so it refuses execution if `defer` is ignored or the to
 A Claude pause always holds exactly one pending call; resuming it answers that one interruption.
 If another turn advances the same Claude conversation before the decision arrives, the old pause is rejected
 instead of applying its decision to the changed transcript.
+
+For a runnable approval and denial flow over REST, see
+[`examples/api/claude-hitl`](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/api/claude-hitl).
 
 ## Tracing
 
