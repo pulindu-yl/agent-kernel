@@ -37,8 +37,7 @@ Build order for the [implementation spec](spec.md), based on the requirements in
 - **Goal:** The configured AK tracer covers ordinary runs, resumes, streams, and streamed resumes without claiming CLI-internal model visibility.
 - **Files:** `ak-py/src/agentkernel/trace/{langfuse,logfire,openllmetry,cloudwatch}/claude.py`, `ak-py/src/agentkernel/framework/claude/{claude,__init__}.py`, `ak-py/tests/test_claude_traced_runner.py`.
 - **Steps:**
-  1. Wrap all four runner entry points in each tracer (spec §Tracing, configuration, and consumer changes).
-  2. Export the opt-in `ClaudeTelemetry` environment helper for CLI-level OpenTelemetry export.
+  1. Wrap `run()` in each tracer (spec §Tracing, configuration, and consumer changes).
 - **Verify:** `test_claude_traced_runner.py` checks active trace context through async stream iteration; formatting and import checks pass.
 
 ## Iteration 5: Tests and live validation

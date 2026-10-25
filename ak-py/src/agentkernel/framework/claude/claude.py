@@ -58,6 +58,7 @@ from ...core.model import (
     AgentRequestFile,
     AgentRequestImage,
     AgentRequestText,
+    AgentRequestVoice,
     ResumeDecision,
 )
 from ...core.paused_run import PausedRun, PausedRunState
@@ -240,46 +241,6 @@ class _ClaudeApprovalGuard:
 _approval_guard: contextvars.ContextVar[_ClaudeApprovalGuard | None] = contextvars.ContextVar("claude_approval_guard", default=None)
 
 
-class ClaudeTelemetry:
-    """
-    Builds the environment variables that turn on the Claude Code CLI's own (beta) OpenTelemetry trace export.
-
-    Opt-in and standalone — no traced runner enables this implicitly, since none of AK's four tracer backends
-    can see model calls happening inside the CLI subprocess anyway. The SDK propagates an active span's W3C
-    trace context into the subprocess automatically, so spans built from this still link to an active AK trace
-    with no further code.
-    """
-
-    @staticmethod
-    def enable_traces(
-        endpoint: str | None = None, *, headers: str | None = None, protocol: str = "http/protobuf", **extra_env: str
-    ) -> dict[str, str]:
-        """
-        Builds the env entries that enable Claude Code's native trace export, for merging into
-        `ClaudeAgentOptions.env` (or declared via `Module.run_options(agent, env=...)`).
-
-        :param endpoint: `OTEL_EXPORTER_OTLP_ENDPOINT`. Omit it to rely on the value already in the process
-            environment, which the CLI subprocess inherits.
-        :param headers: `OTEL_EXPORTER_OTLP_HEADERS`, e.g. `"Authorization=Bearer ..."`.
-        :param protocol: `OTEL_EXPORTER_OTLP_PROTOCOL`.
-        :param extra_env: Further env vars included verbatim (e.g. `OTEL_SERVICE_NAME`).
-        :return: The env dict. Merge it into your own `env=` — this never touches `ClaudeAgentOptions.env` itself.
-        """
-        env = {
-            "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
-            # Traces are beta and need this in addition to the exporter; metrics/log events do not.
-            "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA": "1",
-            "OTEL_TRACES_EXPORTER": "otlp",
-            "OTEL_EXPORTER_OTLP_PROTOCOL": protocol,
-        }
-        if endpoint is not None:
-            env["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
-        if headers is not None:
-            env["OTEL_EXPORTER_OTLP_HEADERS"] = headers
-        env.update(extra_env)
-        return env
-
-
 class _ClaudeStreamMapper:
     """
     Maps one run's SDK messages onto Agent Kernel stream events.
@@ -422,6 +383,18 @@ class ClaudeRunner(BaseRunner):
         return claude_session
 
     @staticmethod
+    def _split_data_uri(data: str, mime_type: str | None) -> tuple[str, str | None]:
+        """
+        :param data: Image or file data: a URL, base64, or a `data:<mime>;base64,<payload>` URI.
+        :param mime_type: The request's explicit mime type, if any.
+        :return: The data with any `data:` prefix removed, and the mime type (the URI's own when it has one).
+        """
+        if not data.startswith("data:"):
+            return data, mime_type
+        header, _, payload = data.partition(",")
+        return payload, header[5:].split(";")[0] or mime_type
+
+    @staticmethod
     def _process_requests(requests: list[AgentRequest]) -> tuple[str, list[dict[str, Any]]]:
         """
         Process requests and extract prompt text and Anthropic content blocks.
@@ -443,31 +416,36 @@ class ClaudeRunner(BaseRunner):
             elif isinstance(req, AgentRequestImage):
                 if not req.image_data:
                     raise ValueError("no image input provided")
-                if req.image_data.startswith(("http://", "https://")):
-                    content.append({"type": "image", "source": {"type": "url", "url": req.image_data}})
-                elif req.image_data.startswith("s3://"):
+                image_data, mime_type = ClaudeRunner._split_data_uri(req.image_data, req.mime_type)
+                if image_data.startswith(("http://", "https://")):
+                    content.append({"type": "image", "source": {"type": "url", "url": image_data}})
+                elif image_data.startswith("s3://"):
                     raise ValueError("s3:// image references are not supported by the Claude Agent SDK; provide base64 data or an https URL")
-                elif not req.mime_type:
+                elif not mime_type:
                     raise ValueError("mime_type is missing for image input, either in the base64 or explicitly")
                 else:
-                    content.append({"type": "image", "source": {"type": "base64", "media_type": req.mime_type, "data": req.image_data}})
+                    content.append({"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": image_data}})
 
             elif isinstance(req, AgentRequestFile):
                 if not req.file_data:
                     raise ValueError("no file input provided")
-                if req.file_data.startswith(("http://", "https://")):
-                    content.append({"type": "document", "source": {"type": "url", "url": req.file_data}})
-                elif req.file_data.startswith("s3://"):
+                file_data, mime_type = ClaudeRunner._split_data_uri(req.file_data, req.mime_type)
+                if file_data.startswith(("http://", "https://")):
+                    content.append({"type": "document", "source": {"type": "url", "url": file_data}})
+                elif file_data.startswith("s3://"):
                     raise ValueError("s3:// file references are not supported by the Claude Agent SDK; provide base64 data or an https URL")
-                elif not req.mime_type:
+                elif not mime_type:
                     raise ValueError("mime_type is missing for file input, either in the base64 or explicitly")
-                elif req.mime_type == "application/pdf":
-                    content.append({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": req.file_data}})
-                elif req.mime_type.startswith("text/"):
-                    text = base64.b64decode(req.file_data).decode("utf-8", errors="replace")
+                elif mime_type == "application/pdf":
+                    content.append({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": file_data}})
+                elif mime_type.startswith("text/"):
+                    text = base64.b64decode(file_data).decode("utf-8", errors="replace")
                     content.append({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": text}})
                 else:
-                    raise ValueError(f"file type '{req.mime_type}' is not supported by the Claude Agent SDK; send a PDF or a text file")
+                    raise ValueError(f"file type '{mime_type}' is not supported by the Claude Agent SDK; send a PDF or a text file")
+
+            elif isinstance(req, AgentRequestVoice):
+                raise ValueError("voice input is not supported by the Claude Agent SDK; Claude models take no audio input")
 
         return prompt, content
 

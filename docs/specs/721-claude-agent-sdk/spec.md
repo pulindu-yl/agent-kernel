@@ -9,7 +9,7 @@ This describes how the [design](design.md) maps the Claude Agent SDK onto Agent 
 | Location | Responsibility |
 | --- | --- |
 | `ak-py/src/agentkernel/framework/claude/claude.py` | Framework state, SDK bridge, stream mapper, runner, agent wrapper, module, and tool builder. |
-| `ak-py/src/agentkernel/framework/claude/__init__.py` | Export `ClaudeAgentSpec`, `ClaudeModule`, `ClaudeToolBuilder`, `ClaudeToolContext`, and `ClaudeTelemetry`. |
+| `ak-py/src/agentkernel/framework/claude/__init__.py` | Export `ClaudeAgentSpec`, `ClaudeModule`, `ClaudeToolBuilder`, and `ClaudeToolContext`. |
 | `ak-py/src/agentkernel/claude.py` | Keep the short `agentkernel.claude` import path. |
 | `ak-py/src/agentkernel/trace/{langfuse,logfire,openllmetry,cloudwatch}/claude.py` | Framework-specific traced runners selected by the existing trace interface. |
 
@@ -86,7 +86,6 @@ class _ClaudeSessionStore:
 ### Tracing, configuration, and consumer changes
 
 - The four Claude tracing adapters wrap `run`, `resume`, `stream`, and `resume_stream` so their outer spans cover execution and stream iteration. Python-side instrumentation cannot expose model calls performed inside the CLI subprocess.
-- `ClaudeTelemetry.enable_traces()` returns opt-in environment variables for the CLI's own OpenTelemetry export. The application merges them into native `ClaudeAgentOptions.env` or declared run options; the adapter does not silently enable CLI telemetry.
 - No `AKConfig` fields change. Existing `session` and `trace` configuration selects persistence and AK tracing. Existing YAML and `AK_*` environment variables retain their meaning.
 - CLI, API, and run-options examples use the public `agentkernel.claude` import path and native `ClaudeAgentOptions`; the framework page documents the process, permissions, subagents, sessions, context, and tracing boundaries.
 

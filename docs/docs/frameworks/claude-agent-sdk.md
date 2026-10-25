@@ -310,23 +310,10 @@ For a runnable approval and denial flow over REST, see
 | OpenLLMetry | An Agent Kernel span per run only |
 
 The model calls happen inside the CLI subprocess, so none of the four backends above see them through Python
-instrumentation alone. Their Agent Kernel span covers `run`, `stream`, `resume`, and `resume_stream`; the
+instrumentation alone. Their Agent Kernel span covers `run`; the
 Langfuse, Logfire and CloudWatch integrations also add Python-side agent/tool instrumentation.
 
-To see the actual `claude_code.llm_request` spans, opt in to the CLI's own (beta) OpenTelemetry export with
-`ClaudeTelemetry`, merged into the run's `env` yourself — nothing wires this in automatically, and no caller
-`env` entry is ever overwritten:
-
-```python
-from agentkernel.claude import ClaudeTelemetry
-
-module.run_options(agent, env={**existing_env, **ClaudeTelemetry.enable_traces(endpoint="http://otel-collector:4318")})
-```
-
-If an OpenTelemetry span is active when the run starts (as it is inside any of the four traced runners above),
-the SDK propagates its W3C trace context into the CLI subprocess automatically, so the CLI's spans link to the
-active Agent Kernel trace without further wiring — this is documented SDK behavior, not something this adapter
-implements. See Anthropic's [observability guide](https://code.claude.com/docs/en/agent-sdk/observability).
+See Anthropic's [observability guide](https://code.claude.com/docs/en/agent-sdk/observability).
 
 ## Deployment
 

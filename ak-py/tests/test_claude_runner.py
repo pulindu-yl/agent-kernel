@@ -52,7 +52,6 @@ from agentkernel.framework.claude.claude import (
     ClaudeModule,
     ClaudeRunner,
     ClaudeSession,
-    ClaudeTelemetry,
     ClaudeToolBuilder,
     _ClaudeSessionStore,
     _ClaudeStreamMapper,
@@ -1346,53 +1345,3 @@ class TestHITLRejectsAnUnanswerableResume:
 
         with pytest.raises(ValueError, match="only carry a JSON object"):
             await agent.runner.resume(agent, session, requests, decisions, record)
-
-
-# --- telemetry --------------------------------------------------------------------------------------
-
-
-class TestClaudeTelemetry:
-    """`ClaudeTelemetry.enable_traces()` is a pure helper: no live CLI, no OTel collector, no network
-    needed to verify it builds the right env dict and never touches anything outside its return value."""
-
-    def test_defaults_enable_the_beta_trace_export_over_otlp(self):
-        env = ClaudeTelemetry.enable_traces()
-
-        assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
-        assert env["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] == "1"
-        assert env["OTEL_TRACES_EXPORTER"] == "otlp"
-        assert env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
-        assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in env
-        assert "OTEL_EXPORTER_OTLP_HEADERS" not in env
-
-    def test_endpoint_and_headers_are_included_when_given(self):
-        env = ClaudeTelemetry.enable_traces(endpoint="http://collector:4318", headers="Authorization=Bearer t")
-
-        assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://collector:4318"
-        assert env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=Bearer t"
-
-    def test_protocol_is_overridable(self):
-        env = ClaudeTelemetry.enable_traces(protocol="grpc")
-        assert env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "grpc"
-
-    def test_extra_env_is_passed_through_verbatim(self):
-        env = ClaudeTelemetry.enable_traces(OTEL_SERVICE_NAME="my-agent")
-        assert env["OTEL_SERVICE_NAME"] == "my-agent"
-
-    def test_extra_env_can_override_a_built_in_key(self):
-        """The caller has the last word on any key, including ones this helper sets itself."""
-        env = ClaudeTelemetry.enable_traces(OTEL_TRACES_EXPORTER="console")
-        assert env["OTEL_TRACES_EXPORTER"] == "console"
-
-    def test_never_reads_or_mutates_the_process_environment(self, monkeypatch):
-        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://should-not-be-read:4318")
-        env = ClaudeTelemetry.enable_traces()
-        assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in env
-        assert os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://should-not-be-read:4318"
-
-    def test_returns_a_fresh_dict_each_call(self):
-        """The caller merges this into their own env=; it must never be a shared mutable object."""
-        first = ClaudeTelemetry.enable_traces()
-        first["CLAUDE_CODE_ENABLE_TELEMETRY"] = "mutated"
-        second = ClaudeTelemetry.enable_traces()
-        assert second["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"

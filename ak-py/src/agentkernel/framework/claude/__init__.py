@@ -13,4 +13,4 @@ try:
 except importlib.metadata.PackageNotFoundError:
     __version__ = "0.1.0"
 
-from .claude import ClaudeAgentSpec, ClaudeModule, ClaudeTelemetry, ClaudeToolBuilder, ClaudeToolContext
+from .claude import ClaudeAgentSpec, ClaudeModule, ClaudeToolBuilder, ClaudeToolContext
