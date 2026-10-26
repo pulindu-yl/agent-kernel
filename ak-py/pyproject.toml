@@ -32,7 +32,7 @@ openllmetry = [
     "traceloop-sdk>=0.61.0",
 ]
 logfire = [
-    "logfire>=3.0",
+    "logfire>=4.31.0",
 ]
 cloudwatch = [
     "opentelemetry-sdk>=1.30.0",
