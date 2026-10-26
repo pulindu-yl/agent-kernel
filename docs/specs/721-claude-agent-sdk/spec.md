@@ -83,7 +83,7 @@ class ClaudeSession:
 
 ### Tracing, configuration, and consumer changes
 
-- The four Claude tracing adapters wrap `run`, `resume`, `stream`, and `resume_stream` so their outer spans cover execution and stream iteration. Python-side instrumentation cannot expose model calls performed inside the CLI subprocess.
+- The four Claude tracing adapters wrap `run()` in an outer Agent Kernel span, as every other framework's tracers do. `resume`, `stream`, and `resume_stream` are not wrapped, for Claude or for any framework: that gap is shared and is left to a change that covers all adapters. OpenLLMetry has no Claude instrumentation to supply a span, so its Claude runner creates an OpenTelemetry span of its own. Python-side instrumentation cannot expose model calls performed inside the CLI subprocess.
 - No `AKConfig` fields change. Existing `session` and `trace` configuration selects persistence and AK tracing. Existing YAML and `AK_*` environment variables retain their meaning.
 - CLI, API, and run-options examples use the public `agentkernel.claude` import path and native `ClaudeAgentOptions`; the framework page documents the process, permissions, subagents, sessions, context, and tracing boundaries.
 
@@ -91,7 +91,7 @@ class ClaudeSession:
 
 1. Native `options.agents` replaces the branch's earlier partial `ClaudeAgentSpec.subagents` conversion. Branch examples using the old field must change; `AgentDefinition` fields now reach the SDK unchanged.
 2. Gated AK tools pause through `defer` and refuse execution without a matching one-use approval. This is an explicit opt-in through `needs_approval=True`.
-3. Claude tracing wrappers now cover resume and both streamed paths, in addition to ordinary runs.
+3. `BaseTrace.claude()` is abstract, like the method of every other framework (each earlier framework was added the same way). A bring-your-own tracer written before the Claude adapter existed must add `claude()` before it can be instantiated.
 
 **Non-changes:** The AK `Session` API, configured session backends, trace selection, core event types, and native SDK option defaults are unchanged. There is no new persistent data migration beyond the branch's Claude session data.
 
@@ -107,6 +107,6 @@ class ClaudeSession:
 
 - `ak-py/tests/test_claude_runner.py` patches `agentkernel.framework.claude.claude.ClaudeSDKClient` with `FakeClient`. Cover first/resumed turns, serialized session restore, agent isolation, transcript append/dedupe, native options and subagents, input/output mapping, stream close, context write-back, pause, and resume.
 - `ak-py/tests/test_tool_claude.py` covers tool schemas, annotations, validation, sync/async handlers, names, and `needs_approval` metadata.
-- `ak-py/tests/test_claude_traced_runner.py` patches `ClaudeRunner.resume`, `stream`, and `resume_stream` and checks trace contexts remain active through streamed iteration in each tracer.
+- `ak-py/tests/test_claude_traced_runner.py` runs each tracer's `run()` against a probe span and checks the span is open around it and records the reply; for OpenLLMetry it also checks that a real OpenTelemetry span is created.
 - `ak-py/tests/test_claude_hitl_live.py` is an opt-in credentialed check for an actual Claude CLI pause and resume. Before production claims, also run a credentialed two-turn session and native subagent flow, including a resumed turn after reloading the AK session from the configured backend.
 - Run the focused tests from `ak-py` with `uv run pytest tests/test_claude_runner.py tests/test_tool_claude.py tests/test_claude_traced_runner.py`; run the repo's `make lint-check-all` gate before merge. Credentialed examples and live tests require the corresponding local credentials and runtime.

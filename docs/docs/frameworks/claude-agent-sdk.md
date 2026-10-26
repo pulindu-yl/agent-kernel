@@ -358,13 +358,14 @@ For a runnable approval and denial flow over REST, see
 | Backend | What you get |
 |---------|--------------|
 | Langfuse | An Agent Kernel span per run, plus agent and tool spans from the OpenInference Claude Agent SDK instrumentor |
-| Logfire | An Agent Kernel span per run, plus `logfire.instrument_claude_agent_sdk()` |
+| Logfire | An Agent Kernel span per run, plus `logfire.instrument_claude_agent_sdk()` (needs `logfire>=4.31.0`) |
 | CloudWatch | An Agent Kernel span per run, plus agent and tool spans from the OpenInference instrumentor |
-| OpenLLMetry | An Agent Kernel span per run only |
+| OpenLLMetry | An Agent Kernel span per run only, an OpenTelemetry span created by the runner |
 
 The model calls happen inside the CLI subprocess, so none of the four backends above see them through Python
-instrumentation alone. Their Agent Kernel span covers `run`; the
-Langfuse, Logfire and CloudWatch integrations also add Python-side agent/tool instrumentation.
+instrumentation alone. Their Agent Kernel span covers `run()`, as it does for every framework; a streamed or resumed
+run is not wrapped in it. The Langfuse, Logfire and CloudWatch integrations also add Python-side agent/tool
+instrumentation.
 
 See Anthropic's [observability guide](https://code.claude.com/docs/en/agent-sdk/observability).
 

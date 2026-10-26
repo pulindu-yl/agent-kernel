@@ -32,13 +32,13 @@ Build order for the [implementation spec](spec.md), based on the requirements in
   3. Add `needs_approval`, the merged `PreToolUse` decision hook, one-use handler guard, paused records, `resume()`, and `resume_stream()` (spec §Human approval and resume).
 - **Verify:** Tool schema and handler tests, framework-context tests, pause/resume and stale-transcript tests. The live test remains opt-in pending credentials.
 
-## Iteration 4: Trace every entry point
+## Iteration 4: Trace each run
 
-- **Goal:** The configured AK tracer covers ordinary runs, resumes, streams, and streamed resumes without claiming CLI-internal model visibility.
+- **Goal:** The configured AK tracer wraps each ordinary run in an outer span, as for the other frameworks, without claiming CLI-internal model visibility. Resumes and streams are untraced for every framework and are out of scope.
 - **Files:** `ak-py/src/agentkernel/trace/{langfuse,logfire,openllmetry,cloudwatch}/claude.py`, `ak-py/src/agentkernel/framework/claude/{claude,__init__}.py`, `ak-py/tests/test_claude_traced_runner.py`.
 - **Steps:**
   1. Wrap `run()` in each tracer (spec §Tracing, configuration, and consumer changes).
-- **Verify:** `test_claude_traced_runner.py` checks active trace context through async stream iteration; formatting and import checks pass.
+- **Verify:** `test_claude_traced_runner.py` checks the span is open around `run()` and records the reply; formatting and import checks pass.
 
 ## Iteration 5: Tests and live validation
 

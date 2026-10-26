@@ -175,7 +175,7 @@ where it can still reach you, rather than being flattened into "something went w
 | A `prompt` beside a decision | **rejected** | yes | yes | **rejected** | yes |
 | A second pause in one session | **appends** | replaces | replaces | replaces | replaces |
 | `cancelled` distinguishable from `denied` | yes | yes | yes | **no, on a confirmation** | yes |
-| Detects a stale resume | **no** | n/a — re-pauses | yes, refuses | no | no |
+| Detects a stale resume | **no** | n/a — re-pauses | yes, refuses | no | yes, refuses |
 
 Replacement stops at the framework boundary. One session can be shared by agents on different
 frameworks — you send the session id and name the agent per request — so a LangGraph question never
