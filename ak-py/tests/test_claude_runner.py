@@ -12,7 +12,7 @@ import asyncio
 import base64
 import logging
 import os
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from claude_agent_sdk import (
@@ -44,7 +44,7 @@ from agentkernel.core.model import (
 from agentkernel.core.paused_run import PausedRunState
 from agentkernel.core.runtime import Runtime
 from agentkernel.core.session.serde import BinarySerde
-from agentkernel.core.tool import ToolContext
+from agentkernel.core.tool import SystemToolFactory, ToolContext
 from agentkernel.framework.claude.claude import (
     FRAMEWORK,
     ClaudeAgent,
@@ -906,6 +906,28 @@ class TestAgent:
         agent.attach_tool(double)
 
         assert [t.name for t in agent.agent.tools] == ["double"]
+
+    @pytest.mark.parametrize(
+        ("declared", "expected"),
+        [
+            ("BASE", "BASE\n\nSUFFIX"),
+            (None, "SUFFIX"),
+            ({"type": "preset", "preset": "claude_code", "append": "BASE"}, {"type": "preset", "preset": "claude_code", "append": "BASE\n\nSUFFIX"}),
+            ({"type": "custom", "prompt": "BASE"}, {"type": "custom", "prompt": "BASE\n\nSUFFIX"}),
+        ],
+    )
+    def test_loading_the_same_spec_twice_adds_the_system_instructions_once(self, runtime, declared, expected):
+        """Like the other adapters, the instructions are added once however often the declaration is wrapped."""
+        spec = _spec("again", system_prompt=declared)
+        spec.tools = ClaudeToolBuilder.bind([double])
+
+        with patch.object(SystemToolFactory, "get_system_prompt_suffix", return_value="SUFFIX"):
+            first = ClaudeAgent("again", ClaudeRunner(), spec)
+            second = ClaudeAgent("again", ClaudeRunner(), spec)
+
+        assert first.agent.options.system_prompt == expected
+        assert second.agent.options.system_prompt == expected
+        assert [tool.name for tool in second.agent.tools] == ["double"]
 
     def test_module_requires_a_name(self, runtime):
         with pytest.raises(ValueError, match="must have a name"):

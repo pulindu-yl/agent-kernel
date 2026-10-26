@@ -995,12 +995,16 @@ class ClaudeAgent(BaseAgent):
         Appends additional instructions to the system prompt in the form it was declared: a string, a custom
         prompt, or the `claude_code` preset's `append`. The SDK's default (None) sends an empty system prompt, so
         the instructions become the prompt. A prompt loaded from a file cannot be extended.
-        :param prompt: The instruction text to append.
+        :param prompt: The instruction text to append. Text the prompt already carries is not added again, so
+            wrapping the same declaration twice does not repeat it, as the other adapters.
         """
         if not prompt:
             return
         current = self.agent.options.system_prompt
         declared: dict[str, Any] = dict(current) if isinstance(current, Mapping) else {}
+        existing = current if isinstance(current, str) else str(declared.get("append") or declared.get("prompt") or "")
+        if prompt in existing:
+            return
         if current is None:
             updated: Any = prompt
         elif isinstance(current, str):
