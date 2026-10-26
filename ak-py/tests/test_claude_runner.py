@@ -1017,30 +1017,6 @@ class TestSubagents:
 
         assert options.hooks == {"PreToolUse": [matcher]}
 
-    def test_native_subagents_are_kept_in_the_foreground(self, runtime):
-        """The CLI otherwise backgrounds a subagent, and the run's first result is then "still running"."""
-        helper = AgentDefinition(description="helper", prompt="Help.", tools=[])
-        triage = ClaudeAgentSpec(name="triage", options=ClaudeAgentOptions(tools=[], agents={"helper": helper}))
-
-        options = self._options(_module(triage).get_agent("triage"))
-
-        assert options.env == {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
-        assert triage.options.env == {}
-
-    def test_an_env_the_agent_sets_wins_over_the_foreground_default(self, runtime):
-        helper = AgentDefinition(description="helper", prompt="Help.", tools=[])
-        env = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0", "OTHER": "1"}
-        triage = ClaudeAgentSpec(name="triage", options=ClaudeAgentOptions(tools=[], agents={"helper": helper}, env=env))
-
-        options = self._options(_module(triage).get_agent("triage"))
-
-        assert options.env == env
-
-    def test_an_agent_without_subagents_gets_no_env(self, runtime):
-        options = self._options(_module(_spec()).get_agent("general"))
-
-        assert options.env == {}
-
 
 # --- human in the loop ----------------------------------------------------------------------------------
 

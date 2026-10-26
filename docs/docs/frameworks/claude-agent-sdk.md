@@ -229,11 +229,6 @@ invisible to the agent that routes to it, register the specialist as an agent of
 Setting the parent's `disallowed_tools` for the tool does **not** work: the rule applies to the subagent as well, so
 the subagent fails to start, and the tool stays in the parent's list.
 
-With `agents=` set, Agent Kernel starts the CLI with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, so a subagent runs in
-the foreground and the run's first result is its answer. The CLI otherwise starts a subagent in the background and
-that first result is a "still running" note. Set the variable yourself in `ClaudeAgentOptions.env` to choose
-differently.
-
 ## Conversations and Sessions
 
 Each agent is its own Claude conversation. The CLI writes its transcript to local disk, which a stateless
