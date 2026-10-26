@@ -17,8 +17,8 @@ Build order for the [implementation spec](spec.md), based on the requirements in
 - **Goal:** A second turn resumes the right native conversation, including after AK session serialization; real SDK events stream through AK.
 - **Files:** `ak-py/src/agentkernel/framework/claude/claude.py`, `ak-py/tests/test_claude_runner.py`.
 - **Steps:**
-  1. Add `ClaudeSession` under the `claude` key and a per-run `_ClaudeSessionStore` implementing SDK transcript methods (spec §Session and SDK transcript bridge).
-  2. Assign a native session ID for the first turn, resume from saved ID and transcript later, and commit only after a complete result.
+  1. Add `ClaudeSession` under the `claude` key implementing the SDK transcript methods itself (spec §Session and SDK transcript bridge).
+  2. Assign a native session ID for the first turn, resume from saved ID and transcript later, and bind the agent to the result's session ID.
   3. Add `_ClaudeStreamMapper` and `ClaudeRunner.stream()` with early-close cleanup (spec §Runner, options, input, and output).
 - **Verify:** Conversation, serialization, agent-isolation, subagent-transcript, streaming, error-result, and early-close tests in `test_claude_runner.py`.
 
@@ -28,7 +28,7 @@ Build order for the [implementation spec](spec.md), based on the requirements in
 - **Files:** `ak-py/src/agentkernel/framework/claude/claude.py`, `ak-py/src/agentkernel/framework/claude/__init__.py`, `ak-py/tests/{test_tool_claude,test_claude_runner,test_claude_hitl_live}.py`.
 - **Steps:**
   1. Add `ClaudeToolBuilder`, the reserved `ak` server, and ordinary tool approvals (spec §Bound tools and per-run context).
-  2. Add `ClaudeToolContext` and per-run context write-back for completed runs and streams.
+  2. Add `ToolContext.framework_context` (filled by the Claude runner) and per-run context write-back for completed runs and streams.
   3. Add `needs_approval`, the merged `PreToolUse` decision hook, one-use handler guard, paused records, `resume()`, and `resume_stream()` (spec §Human approval and resume).
 - **Verify:** Tool schema and handler tests, framework-context tests, pause/resume and stale-transcript tests. The live test remains opt-in pending credentials.
 

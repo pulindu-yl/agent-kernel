@@ -73,12 +73,15 @@ _log = logging.getLogger("ak.claude.runner")
 class ClaudeSession:
     """
     ClaudeSession stores each agent's Claude conversation: the Claude session id and the transcript the CLI
-    mirrored out of it.
+    mirrored out of it. It is also the SDK `SessionStore` the run is given, as `OpenAISession` is the OpenAI
+    SDK's session.
 
     The CLI keeps its transcript on local disk, which another replica does not have, so the transcript is kept
     here and persisted with the Agent Kernel session. Entries are the CLI's own transcript lines as plain JSON
     objects, so a pickled session carries no SDK objects. Each agent has its own conversation, because the CLI
-    records an agent's system prompt in its transcript.
+    records an agent's system prompt in its transcript. The SDK mirrors entries as the CLI runs and they are
+    stored as they arrive, so a turn that fails part way leaves its entries in the conversation, which the CLI
+    resumes from.
     """
 
     def __init__(self) -> None:
@@ -91,7 +94,7 @@ class ClaudeSession:
     def session_id(self, agent_name: str) -> str | None:
         """
         :param agent_name: The agent whose conversation to read.
-        :return: The Claude session id the agent's last turn ended on, or None before its first turn.
+        :return: The Claude session id the agent's conversation is on, or None before its first turn.
         """
         return self._session_ids.get(agent_name)
 
@@ -100,125 +103,50 @@ class ClaudeSession:
         :param agent_name: The agent whose conversation to read.
         :return: The transcript entries by subpath: "" is the main transcript, "subagents/agent-<id>" a subagent's.
         """
-        return self._transcripts.get(agent_name, {})
+        session_id = self._session_ids.get(agent_name)
+        return self._transcripts.get(session_id, {}) if session_id is not None else {}
 
-    def save(self, agent_name: str, session_id: str, transcript: dict[str, list[dict]]) -> None:
+    def bind(self, agent_name: str, session_id: str) -> None:
         """
-        Records the conversation an agent's turn ended on.
-        :param agent_name: The agent whose conversation to record.
-        :param session_id: The Claude session id from the turn's result.
-        :param transcript: The transcript entries by subpath.
+        Points an agent's conversation at a Claude session id, dropping the transcript of the one it was on.
+        :param agent_name: The agent whose conversation to point.
+        :param session_id: The Claude session id its turns are recorded under.
         """
+        previous = self._session_ids.get(agent_name)
+        if previous is not None and previous != session_id:
+            self._transcripts.pop(previous, None)
         self._session_ids[agent_name] = session_id
-        self._transcripts[agent_name] = transcript
-
-
-class _ClaudeSessionStore:
-    """
-    The SDK `SessionStore` for one run, backed by the agent's conversation in the ClaudeSession.
-
-    The SDK mirrors transcript entries to `append()` while the CLI runs, and on `resume` restores the transcript
-    from `load()` before spawning the CLI. Appends are buffered and saved only by `commit()`, once the turn's
-    result arrives, so a failed or abandoned turn leaves the stored conversation as it was. `project_key` is
-    ignored: the store is already scoped to one agent's conversation, so the CLI's working directory does not
-    need to match across replicas.
-    """
-
-    def __init__(self, session: ClaudeSession, agent_name: str) -> None:
-        """
-        :param session: The ClaudeSession holding the conversation.
-        :param agent_name: The agent whose conversation this run continues.
-        """
-        self._session = session
-        self._agent_name = agent_name
-        self._pending: dict[tuple[str, str], list[dict]] = {}
-        self._seen: dict[tuple[str, str], set[str]] = {}
-
-    def _stored(self, session_id: str, subpath: str) -> list[dict]:
-        """
-        :return: The saved entries of a transcript, or none for any Claude session other than the saved one.
-        """
-        if session_id != self._session.session_id(self._agent_name):
-            return []
-        return self._session.transcript(self._agent_name).get(subpath, [])
 
     async def append(self, key: Mapping[str, Any], entries: list[dict]) -> None:
         """
-        Buffers mirrored transcript entries, skipping any whose `uuid` is already stored.
-        :param key: The SDK SessionKey the entries belong to.
+        Stores mirrored transcript entries, skipping any whose `uuid` is already stored.
+        :param key: The SDK SessionKey the entries belong to. `project_key` is ignored: the conversation is
+            already scoped to one agent, so the CLI's working directory does not need to match across replicas.
         :param entries: The transcript entries.
         """
-        slot = (key["session_id"], key.get("subpath") or "")
-        seen = self._seen.setdefault(slot, {entry["uuid"] for entry in self._stored(*slot) if entry.get("uuid")})
-        buffer = self._pending.setdefault(slot, [])
+        stored = self._transcripts.setdefault(key["session_id"], {}).setdefault(key.get("subpath") or "", [])
+        seen = {entry["uuid"] for entry in stored if entry.get("uuid")}
         for entry in entries:
             uid = entry.get("uuid")
             if uid and uid in seen:
                 continue
             if uid:
                 seen.add(uid)
-            buffer.append(entry)
+            stored.append(entry)
 
     async def load(self, key: Mapping[str, Any]) -> list[dict] | None:
         """
         :param key: The SDK SessionKey to load.
-        :return: The saved entries followed by this run's buffered ones, or None when there are none.
+        :return: The stored entries, or None when there are none.
         """
-        slot = (key["session_id"], key.get("subpath") or "")
-        return [*self._stored(*slot), *self._pending.get(slot, [])] or None
+        return list(self._transcripts.get(key["session_id"], {}).get(key.get("subpath") or "", [])) or None
 
     async def list_subkeys(self, key: Mapping[str, Any]) -> list[str]:
         """
         :param key: The SDK key naming the Claude session.
         :return: The subagent transcripts held for it, so a resume restores them too.
         """
-        session_id = key["session_id"]
-        stored = self._session.transcript(self._agent_name) if session_id == self._session.session_id(self._agent_name) else {}
-        subpaths = {subpath for subpath in stored if subpath}
-        subpaths |= {subpath for (pending_id, subpath) in self._pending if pending_id == session_id and subpath}
-        return sorted(subpaths)
-
-    def commit(self, session_id: str) -> None:
-        """
-        Saves this run's buffered entries onto the conversation the turn ended on.
-        :param session_id: The session id from the turn's ResultMessage.
-        """
-        same = session_id == self._session.session_id(self._agent_name)
-        transcript = {subpath: list(entries) for subpath, entries in self._session.transcript(self._agent_name).items()} if same else {}
-        for (pending_id, subpath), entries in self._pending.items():
-            if pending_id == session_id:
-                transcript.setdefault(subpath, []).extend(entries)
-        self._session.save(self._agent_name, session_id, transcript)
-
-
-_UNSET = object()
-"""Sentinel distinguishing `ClaudeToolContext.get()` called outside any run from one called during a run
-that simply has no framework_context seeded (which reads back as a legitimate `None`)."""
-
-_framework_context: contextvars.ContextVar[Any] = contextvars.ContextVar("claude_framework_context", default=_UNSET)
-
-
-class ClaudeToolContext:
-    """
-    The per-run caller-state handle for tools bound with `ClaudeToolBuilder`.
-
-    The SDK has no native `RunContext`/`tool_context.state` equivalent a tool handler can read, so this is
-    Agent Kernel's own handle filling that gap: `ClaudeRunner` sets it to a copy of the session's
-    `framework_context` for the run, a tool mutates the dict in place, and the runner writes the touched keys
-    back on success — reaching only tools bound through `ClaudeToolBuilder`, never a Claude built-in tool or an
-    external MCP server.
-    """
-
-    @staticmethod
-    def get() -> dict | None:
-        """
-        :return: The mutable per-run context dict, or None when the session carries no `framework_context`.
-        :raises RuntimeError: If called outside a Claude Agent SDK tool call.
-        """
-        value = _framework_context.get()
-        if value is _UNSET:
-            raise RuntimeError("ClaudeToolContext.get() requires a running Claude Agent SDK tool call.")
-        return typing.cast("dict | None", value)
+        return sorted(subpath for subpath in self._transcripts.get(key["session_id"], {}) if subpath)
 
 
 class _ClaudeApprovalGuard:
@@ -360,7 +288,7 @@ class ClaudeRunner(BaseRunner):
     ClaudeRunner class provides a runner for Claude Agent SDK agents.
 
     Each run spawns its own `ClaudeSDKClient` (one Claude Code CLI subprocess), created after the ToolContext and
-    `ClaudeToolContext` are set so the in-process tool handlers, which run in tasks the client spawns, inherit
+    `ToolContext` (with its per-run `framework_context`) are set so the in-process tool handlers, which run in tasks the client spawns, inherit
     them.
     """
 
@@ -528,7 +456,6 @@ class ClaudeRunner(BaseRunner):
         agent: Any,
         options: Mapping[str, Any],
         claude_session: ClaudeSession,
-        store: _ClaudeSessionStore,
         *,
         stream: bool,
         resume_decision: tuple[str, ResumeDecision] | None = None,
@@ -542,7 +469,6 @@ class ClaudeRunner(BaseRunner):
         :param agent: The ClaudeAgent being run.
         :param options: The run options resolved for this run.
         :param claude_session: The ClaudeSession holding the agent's conversation.
-        :param store: The store mirroring this run's transcript.
         :param stream: Whether this is a streamed run.
         :param resume_decision: The `(tool_use_id, decision)` a resume answers, or None on an ordinary run.
         :return: A new ClaudeAgentOptions; the agent's own is untouched.
@@ -550,7 +476,7 @@ class ClaudeRunner(BaseRunner):
         spec: ClaudeAgentSpec = agent.agent
         declared = dataclasses.replace(spec.options, **options)
         ak_owned: dict[str, Any] = {
-            "session_store": store,
+            "session_store": claude_session,
             "session_store_flush": "batched",
             "resume": None,
             "session_id": None,
@@ -565,6 +491,7 @@ class ClaudeRunner(BaseRunner):
             ak_owned["resume"] = claude_session.session_id(agent.name)
         else:
             ak_owned["session_id"] = str(uuid4())
+            claude_session.bind(agent.name, ak_owned["session_id"])
         # Native subagents can use the tools served in the parent's session.
         served = {tool.name: tool for tool in spec.tools}
         gated = self._gated_tools(spec)
@@ -610,7 +537,7 @@ class ClaudeRunner(BaseRunner):
         since a pause another framework holds on the same session is a separate conversation and still
         answerable. The payload holds the deferred call's id and the saved transcript position, so a later
         ordinary turn cannot silently redirect a decision to the wrong conversation state. The conversation
-        itself is durable through `_ClaudeSessionStore`.
+        itself is durable through `ClaudeSession`.
 
         :param agent: The agent that paused.
         :param session: The session the record is written to.
@@ -702,7 +629,6 @@ class ClaudeRunner(BaseRunner):
         :return: The result of the agent's execution.
         """
         context: ToolContext | None = None
-        fw_token: contextvars.Token | None = None
         approval_token: contextvars.Token | None = None
         prompt = ""
         try:
@@ -717,13 +643,12 @@ class ClaudeRunner(BaseRunner):
             options = await agent.resolve_run_options(session, requests)
             incoming = self._load_framework_context(session)
             produced = copy.deepcopy(incoming)
-            fw_token = _framework_context.set(produced)
+            context.framework_context = produced
             claude_session = self._session(session)
-            store = _ClaudeSessionStore(claude_session, agent.name)
 
             texts: list[str] = []
             result: ResultMessage | None = None
-            async with ClaudeSDKClient(options=self._native_options(agent, options, claude_session, store, stream=False)) as client:
+            async with ClaudeSDKClient(options=self._native_options(agent, options, claude_session, stream=False)) as client:
                 await client.query(self._prompt(content))
                 async for message in client.receive_response():
                     if isinstance(message, ResultMessage):
@@ -734,7 +659,7 @@ class ClaudeRunner(BaseRunner):
             if result is None:
                 raise RuntimeError("Claude Agent SDK run ended without a result")
             # The transcript is whole once the result arrives, even for an error or a deferred-tool stop.
-            store.commit(result.session_id)
+            claude_session.bind(agent.name, result.session_id)
 
             if result.deferred_tool_use is not None and not result.is_error:
                 self._store_framework_context(session, incoming, produced)
@@ -752,8 +677,6 @@ class ClaudeRunner(BaseRunner):
         finally:
             if approval_token is not None:
                 _approval_guard.reset(approval_token)
-            if fw_token is not None:
-                _framework_context.reset(fw_token)
             if context is not None:
                 context.reset()
 
@@ -783,7 +706,6 @@ class ClaudeRunner(BaseRunner):
         self._require_resume_state(agent, session, record)
 
         context: ToolContext | None = None
-        fw_token: contextvars.Token | None = None
         approval_token: contextvars.Token | None = None
         prompt = ""
         try:
@@ -794,14 +716,13 @@ class ClaudeRunner(BaseRunner):
             options = await agent.resolve_run_options(session, requests)
             incoming = self._load_framework_context(session)
             produced = copy.deepcopy(incoming)
-            fw_token = _framework_context.set(produced)
+            context.framework_context = produced
             claude_session = self._session(session)
-            store = _ClaudeSessionStore(claude_session, agent.name)
             resume_decision = (record.payload["tool_use_id"], decisions[0])
 
             texts: list[str] = []
             result: ResultMessage | None = None
-            native_options = self._native_options(agent, options, claude_session, store, stream=False, resume_decision=resume_decision)
+            native_options = self._native_options(agent, options, claude_session, stream=False, resume_decision=resume_decision)
             async with ClaudeSDKClient(options=native_options) as client:
                 await client.query(self._prompt(content))
                 async for message in client.receive_response():
@@ -812,7 +733,7 @@ class ClaudeRunner(BaseRunner):
 
             if result is None:
                 raise RuntimeError("Claude Agent SDK resume ended without a result")
-            store.commit(result.session_id)
+            claude_session.bind(agent.name, result.session_id)
 
             if result.deferred_tool_use is not None and not result.is_error:
                 # A fresh pause (the same call deferred again, or a new one later in the turn) supersedes this
@@ -833,8 +754,6 @@ class ClaudeRunner(BaseRunner):
         finally:
             if approval_token is not None:
                 _approval_guard.reset(approval_token)
-            if fw_token is not None:
-                _framework_context.reset(fw_token)
             if context is not None:
                 context.reset()
 
@@ -848,7 +767,6 @@ class ClaudeRunner(BaseRunner):
         :return: An async generator yielding StreamEvent objects.
         """
         context: ToolContext | None = None
-        fw_token: contextvars.Token | None = None
         approval_token: contextvars.Token | None = None
         try:
             context = ToolContext(Runtime.current(), agent, session, requests).set()
@@ -862,13 +780,12 @@ class ClaudeRunner(BaseRunner):
             options = await agent.resolve_run_options(session, requests)
             incoming = self._load_framework_context(session)
             produced = copy.deepcopy(incoming)
-            fw_token = _framework_context.set(produced)
+            context.framework_context = produced
             claude_session = self._session(session)
-            store = _ClaudeSessionStore(claude_session, agent.name)
             mapper = _ClaudeStreamMapper()  # local — the runner is shared across sessions
 
             result: ResultMessage | None = None
-            async with ClaudeSDKClient(options=self._native_options(agent, options, claude_session, store, stream=True)) as client:
+            async with ClaudeSDKClient(options=self._native_options(agent, options, claude_session, stream=True)) as client:
                 await client.query(self._prompt(content))
                 async for message in client.receive_response():
                     if isinstance(message, ResultMessage):
@@ -883,7 +800,7 @@ class ClaudeRunner(BaseRunner):
             if result is None:
                 raise RuntimeError("Claude Agent SDK stream ended without a result")
             # After a normal drain only — a disconnect or error leaves the stored transcript intact.
-            store.commit(result.session_id)
+            claude_session.bind(agent.name, result.session_id)
 
             if result.deferred_tool_use is not None and not result.is_error:
                 try:
@@ -903,8 +820,6 @@ class ClaudeRunner(BaseRunner):
         finally:
             if approval_token is not None:
                 _approval_guard.reset(approval_token)
-            if fw_token is not None:
-                _framework_context.reset(fw_token)
             if context is not None:
                 context.reset()
 
@@ -931,7 +846,6 @@ class ClaudeRunner(BaseRunner):
         self._require_resume_state(agent, session, record)
 
         context: ToolContext | None = None
-        fw_token: contextvars.Token | None = None
         approval_token: contextvars.Token | None = None
         try:
             context = ToolContext(Runtime.current(), agent, session, requests).set()
@@ -941,14 +855,13 @@ class ClaudeRunner(BaseRunner):
             options = await agent.resolve_run_options(session, requests)
             incoming = self._load_framework_context(session)
             produced = copy.deepcopy(incoming)
-            fw_token = _framework_context.set(produced)
+            context.framework_context = produced
             claude_session = self._session(session)
-            store = _ClaudeSessionStore(claude_session, agent.name)
             mapper = _ClaudeStreamMapper()
             resume_decision = (record.payload["tool_use_id"], decisions[0])
 
             result: ResultMessage | None = None
-            native_options = self._native_options(agent, options, claude_session, store, stream=True, resume_decision=resume_decision)
+            native_options = self._native_options(agent, options, claude_session, stream=True, resume_decision=resume_decision)
             async with ClaudeSDKClient(options=native_options) as client:
                 await client.query(self._prompt(content))
                 async for message in client.receive_response():
@@ -963,7 +876,7 @@ class ClaudeRunner(BaseRunner):
 
             if result is None:
                 raise RuntimeError("Claude Agent SDK resume stream ended without a result")
-            store.commit(result.session_id)
+            claude_session.bind(agent.name, result.session_id)
 
             if result.deferred_tool_use is not None and not result.is_error:
                 try:
@@ -984,8 +897,6 @@ class ClaudeRunner(BaseRunner):
         finally:
             if approval_token is not None:
                 _approval_guard.reset(approval_token)
-            if fw_token is not None:
-                _framework_context.reset(fw_token)
             if context is not None:
                 context.reset()
 
@@ -1021,8 +932,8 @@ class ClaudeAgent(BaseAgent):
         "fork_session": "the runner keeps one transcript per agent conversation",
         "resume_session_at": "the runner keeps one transcript per agent conversation",
         "resume_drops_turn": "the runner keeps one transcript per agent conversation",
-        "session_store": "the runner keeps the transcript on the Agent Kernel session through its own SessionStore",
-        "session_store_flush": "the runner saves the transcript when the turn's result arrives",
+        "session_store": "the runner keeps the transcript on the Agent Kernel session through the ClaudeSession",
+        "session_store_flush": "the runner sets how the SDK mirrors the transcript into the Agent Kernel session",
         "enable_file_checkpointing": "the SDK does not allow file checkpointing together with a SessionStore",
         "include_partial_messages": "set by the runner in stream mode, where its token events are mapped",
     }
@@ -1174,7 +1085,7 @@ class ClaudeModule(Module):
 class ClaudeToolBuilder(ToolBuilder):
     """
     Tool builder for the Claude Agent SDK. Wraps generic tool functions into the SDK's in-process `SdkMcpTool`s;
-    AK tools reach execution context via `ToolContext.get()` and `ClaudeToolContext.get()`.
+    AK tools reach execution context via `ToolContext.get()`, whose `framework_context` is the per-run caller state.
     """
 
     MCP_SERVER: ClassVar[str] = "ak"

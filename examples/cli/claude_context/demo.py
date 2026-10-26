@@ -1,6 +1,6 @@
-from agentkernel.claude import ClaudeAgentSpec, ClaudeModule, ClaudeToolBuilder, ClaudeToolContext
+from agentkernel.claude import ClaudeAgentSpec, ClaudeModule, ClaudeToolBuilder
 from agentkernel.cli import CLI
-from agentkernel.core import AgentReplyText, PostHook, PreHook
+from agentkernel.core import AgentReplyText, PostHook, PreHook, ToolContext
 from claude_agent_sdk import ClaudeAgentOptions
 
 CART_PREFIX = "Current cart:"
@@ -8,7 +8,7 @@ CART_PREFIX = "Current cart:"
 
 def add_to_cart(item: str) -> str:
     """Add a grocery item to the shopping cart."""
-    context = ClaudeToolContext.get()
+    context = ToolContext.get().framework_context
     assert context is not None  # SeedCartContextPreHook creates it before the tool runs.
     cart = context["cart"]
     cart.append(item)
@@ -17,7 +17,7 @@ def add_to_cart(item: str) -> str:
 
 def view_cart() -> str:
     """Show the grocery items currently in the shopping cart."""
-    context = ClaudeToolContext.get()
+    context = ToolContext.get().framework_context
     assert context is not None
     cart = context["cart"]
     return "The cart contains: " + ", ".join(cart) if cart else "The cart is empty."

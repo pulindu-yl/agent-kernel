@@ -239,7 +239,7 @@ context is set, a runner:
 | Smolagents | **Round-trips (filtered)** | `agent.run(..., additional_args=ctx)` — which smolagents **also appends to the task prompt** ([caveat](../frameworks/smolagents.md#per-run-contextstate)) | `agent.state` **restricted to pre-seeded keys** — brand-new keys are dropped |
 | LangGraph | **Declared channels only** | spread into the graph input alongside `messages` (written last, so a caller key cannot replace it) | only keys the graph's state schema declares as channels (prebuilt agents drop unknown keys) |
 | CrewAI | **Unsupported** | not injected | none — a set context is **ignored**, with one warning logged per runner |
-| Claude Agent SDK | **Full round-trip, adapter tools only** | an adapter-defined handle, `ClaudeToolContext.get()` — the SDK has no native context slot of its own; tools mutate the returned dict in place ([details](../frameworks/claude-agent-sdk.md#per-run-contextstate)) | the same dict, in full — but only for tools bound through `ClaudeToolBuilder`, never Claude's built-in tools or an external MCP server |
+| Claude Agent SDK | **Full round-trip, adapter tools only** | `ToolContext.get().framework_context` — the SDK has no native context slot of its own, so the adapter fills this `ToolContext` field; tools mutate the returned dict in place ([details](../frameworks/claude-agent-sdk.md#per-run-contextstate)) | the same dict, in full — but only for tools bound through `ClaudeToolBuilder`, never Claude's built-in tools or an external MCP server |
 
 Because of this divergence, tool authors who want a context write to be portable across every
 framework should **pre-seed every key they intend to write** before the run.

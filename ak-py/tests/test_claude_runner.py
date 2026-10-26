@@ -53,7 +53,6 @@ from agentkernel.framework.claude.claude import (
     ClaudeRunner,
     ClaudeSession,
     ClaudeToolBuilder,
-    _ClaudeSessionStore,
     _ClaudeStreamMapper,
 )
 
@@ -230,7 +229,7 @@ class TestRun:
         assert message == "Claude Agent SDK run failed (API error 529): Overloaded"
 
     @pytest.mark.asyncio
-    async def test_a_run_without_a_result_commits_nothing(self, fake_client, runtime):
+    async def test_a_run_without_a_result_keeps_what_the_sdk_mirrored(self, fake_client, runtime):
         agent = _module(_spec()).get_agent("general")
         session = Session("s")
         fake_client.script = [_mirror({"type": "user", "uuid": "u1"})]
@@ -238,10 +237,10 @@ class TestRun:
         reply = await agent.runner.run(agent, session, [AgentRequestText(prompt="hi")])
 
         assert "without a result" in reply.response
-        assert not session.get(FRAMEWORK).transcript("general")
+        assert session.get(FRAMEWORK).transcript("general")[""] == [{"type": "user", "uuid": "u1"}]
 
     @pytest.mark.asyncio
-    async def test_an_exception_mid_run_leaves_the_stored_transcript_intact(self, fake_client, runtime):
+    async def test_an_exception_mid_run_keeps_the_entries_mirrored_before_it(self, fake_client, runtime):
         agent = _module(_spec()).get_agent("general")
         session = Session("s")
         await _turn(fake_client, agent, session, prompt="first")
@@ -254,7 +253,7 @@ class TestRun:
         reply = await agent.runner.run(agent, session, [AgentRequestText(prompt="second")])
 
         assert "CLI died" in reply.response
-        assert session.get(FRAMEWORK).transcript("general")[""] == before
+        assert session.get(FRAMEWORK).transcript("general")[""] == [*before, {"type": "user", "uuid": "u-second"}]
 
     @pytest.mark.asyncio
     async def test_no_content_returns_before_resolving_options(self, fake_client, runtime):
@@ -318,65 +317,63 @@ class TestConversation:
 # --- session store --------------------------------------------------------------------------------------
 
 
-class TestSessionStore:
-    @staticmethod
-    def _saved(session_id, transcript):
-        claude_session = ClaudeSession()
-        claude_session.save("a", session_id, transcript)
-        return claude_session
+def _saved(agent_name, session_id, transcript):
+    """A ClaudeSession already holding an agent's conversation."""
+    claude_session = ClaudeSession()
+    claude_session.bind(agent_name, session_id)
+    claude_session._transcripts[session_id] = transcript
+    return claude_session
 
+
+class TestSessionStore:
     @pytest.mark.asyncio
     async def test_load_returns_none_for_an_unknown_transcript(self):
-        store = _ClaudeSessionStore(ClaudeSession(), "a")
-        assert await store.load({"project_key": "p", "session_id": "x"}) is None
+        assert await ClaudeSession().load({"project_key": "p", "session_id": "x"}) is None
 
     @pytest.mark.asyncio
-    async def test_appends_are_buffered_until_commit_and_deduplicated_by_uuid(self):
+    async def test_appends_are_stored_as_they_arrive_and_deduplicated_by_uuid(self):
         claude_session = ClaudeSession()
-        store = _ClaudeSessionStore(claude_session, "a")
+        claude_session.bind("a", "sid")
         key = {"project_key": "p", "session_id": "sid"}
 
-        await store.append(key, [{"type": "user", "uuid": "u1"}, {"type": "title"}])
-        await store.append(key, [{"type": "user", "uuid": "u1"}, {"type": "assistant", "uuid": "a1"}])
+        await claude_session.append(key, [{"type": "user", "uuid": "u1"}, {"type": "title"}])
+        assert len(claude_session.transcript("a")[""]) == 2
+        await claude_session.append(key, [{"type": "user", "uuid": "u1"}, {"type": "assistant", "uuid": "a1"}])
 
-        assert claude_session.transcript("a") == {}
-        assert await store.load(key) == [{"type": "user", "uuid": "u1"}, {"type": "title"}, {"type": "assistant", "uuid": "a1"}]
-        store.commit("sid")
-        assert claude_session.session_id("a") == "sid"
-        assert len(claude_session.transcript("a")[""]) == 3
+        expected = [{"type": "user", "uuid": "u1"}, {"type": "title"}, {"type": "assistant", "uuid": "a1"}]
+        assert await claude_session.load(key) == expected
+        assert claude_session.transcript("a")[""] == expected
 
     @pytest.mark.asyncio
     async def test_project_key_is_ignored(self):
-        store = _ClaudeSessionStore(self._saved("sid", {"": [{"type": "user", "uuid": "u1"}]}), "a")
+        claude_session = _saved("a", "sid", {"": [{"type": "user", "uuid": "u1"}]})
 
-        assert await store.load({"project_key": "another-cwd", "session_id": "sid"}) == [{"type": "user", "uuid": "u1"}]
+        assert await claude_session.load({"project_key": "another-cwd", "session_id": "sid"}) == [{"type": "user", "uuid": "u1"}]
 
     @pytest.mark.asyncio
     async def test_subagent_transcripts_are_listed_and_restored(self):
-        store = _ClaudeSessionStore(self._saved("sid", {"": [{"type": "user"}], "subagents/agent-1": [{"type": "user"}]}), "a")
-        await store.append({"project_key": "p", "session_id": "sid", "subpath": "subagents/agent-2"}, [{"type": "user"}])
+        claude_session = _saved("a", "sid", {"": [{"type": "user"}], "subagents/agent-1": [{"type": "user"}]})
+        await claude_session.append({"project_key": "p", "session_id": "sid", "subpath": "subagents/agent-2"}, [{"type": "user"}])
 
-        assert await store.list_subkeys({"project_key": "p", "session_id": "sid"}) == ["subagents/agent-1", "subagents/agent-2"]
-        assert await store.list_subkeys({"project_key": "p", "session_id": "other"}) == []
+        assert await claude_session.list_subkeys({"project_key": "p", "session_id": "sid"}) == ["subagents/agent-1", "subagents/agent-2"]
+        assert await claude_session.list_subkeys({"project_key": "p", "session_id": "other"}) == []
 
-    @pytest.mark.asyncio
-    async def test_commit_keeps_only_the_session_the_turn_ended_on(self):
-        claude_session = self._saved("old", {"": [{"type": "user", "uuid": "o1"}]})
-        store = _ClaudeSessionStore(claude_session, "a")
-        await store.append({"project_key": "p", "session_id": "new"}, [{"type": "user", "uuid": "n1"}])
+    def test_binding_to_a_new_session_drops_the_old_transcript(self):
+        claude_session = _saved("a", "old", {"": [{"type": "user", "uuid": "o1"}]})
 
-        store.commit("new")
+        claude_session.bind("a", "new")
 
         assert claude_session.session_id("a") == "new"
-        assert claude_session.transcript("a") == {"": [{"type": "user", "uuid": "n1"}]}
+        assert claude_session.transcript("a") == {}
+        assert "old" not in claude_session._transcripts
 
     def test_other_agents_conversations_are_untouched(self):
-        claude_session = self._saved("sid-a", {"": [{"type": "user"}]})
-        store = _ClaudeSessionStore(claude_session, "b")
+        claude_session = _saved("a", "sid-a", {"": [{"type": "user"}]})
 
-        store.commit("sid-b")
+        claude_session.bind("b", "sid-b")
 
         assert claude_session.session_id("a") == "sid-a"
+        assert claude_session.transcript("a") == {"": [{"type": "user"}]}
         assert claude_session.session_id("b") == "sid-b"
 
 
@@ -498,7 +495,7 @@ class TestRunOptions:
         await agent.runner.run(agent, Session("s"), [AgentRequestText(prompt="hi")])
 
         options = fake_client.instances[0].options
-        assert isinstance(options.session_store, _ClaudeSessionStore)
+        assert isinstance(options.session_store, ClaudeSession)
         assert options.session_store_flush == "batched"
         assert options.session_id != "declared"
 
@@ -515,7 +512,7 @@ class TestRunOptions:
         agent = _module(spec).get_agent("general")
         claude_session = ClaudeSession()
 
-        first = agent.runner._native_options(agent, {}, claude_session, _ClaudeSessionStore(claude_session, agent.name), stream=False)
+        first = agent.runner._native_options(agent, {}, claude_session, stream=False)
         assert first.session_id and first.resume is None
         assert first.continue_conversation is False
         assert first.fork_session is False
@@ -524,8 +521,9 @@ class TestRunOptions:
         assert first.enable_file_checkpointing is False
         assert first.include_partial_messages is False
 
-        claude_session.save(agent.name, "saved", {"": [{"type": "user", "uuid": "u1"}]})
-        later = agent.runner._native_options(agent, {}, claude_session, _ClaudeSessionStore(claude_session, agent.name), stream=True)
+        claude_session.bind(agent.name, "saved")
+        claude_session._transcripts["saved"] = {"": [{"type": "user", "uuid": "u1"}]}
+        later = agent.runner._native_options(agent, {}, claude_session, stream=True)
         assert later.resume == "saved" and later.session_id is None
         assert later.include_partial_messages is True
 
@@ -565,7 +563,7 @@ class TestRunOptions:
 class TestFrameworkContext:
     """
     framework_context injection and write-back for ClaudeRunner. There is no native context slot a Claude Agent
-    SDK tool handler can read, so the runner hands a copy through `ClaudeToolContext`, a per-run contextvar; a
+    SDK tool handler can read, so the runner hands a copy through `ToolContext.framework_context`; a
     tool mutating the dict it returns round-trips back to the session on a successful call.
     """
 
@@ -573,7 +571,7 @@ class TestFrameworkContext:
     async def test_tool_sees_and_mutates_the_context(self, fake_client, runtime):
         def add_item(item: str) -> str:
             """Append an item to the caller's cart carried in framework_context."""
-            claude_mod.ClaudeToolContext.get()["cart"].append(item)
+            ToolContext.get().framework_context["cart"].append(item)
             return "added"
 
         spec = _spec()
@@ -597,7 +595,7 @@ class TestFrameworkContext:
 
         def whoami() -> str:
             """Report whether a context dict is present."""
-            seen["context"] = claude_mod.ClaudeToolContext.get()
+            seen["context"] = ToolContext.get().framework_context
             return "ok"
 
         spec = _spec()
@@ -616,15 +614,10 @@ class TestFrameworkContext:
         assert session.get_framework_context() is None
 
     @pytest.mark.asyncio
-    async def test_get_outside_a_run_raises(self):
-        with pytest.raises(RuntimeError, match="running Claude Agent SDK tool call"):
-            claude_mod.ClaudeToolContext.get()
-
-    @pytest.mark.asyncio
     async def test_error_leaves_stored_context_intact(self, fake_client, runtime):
         def boom() -> str:
             """Mutate the context then fail the turn."""
-            claude_mod.ClaudeToolContext.get()["cart"].append("apple")
+            ToolContext.get().framework_context["cart"].append("apple")
             raise RuntimeError("tool boom")
 
         spec = _spec()
@@ -643,7 +636,7 @@ class TestFrameworkContext:
     async def test_stream_normal_drain_writes_back(self, fake_client, runtime):
         def add_item(item: str) -> str:
             """Append an item to the caller's cart carried in framework_context."""
-            claude_mod.ClaudeToolContext.get()["cart"].append(item)
+            ToolContext.get().framework_context["cart"].append(item)
             return "added"
 
         spec = _spec()
@@ -930,7 +923,7 @@ class TestSubagents:
     @staticmethod
     def _options(agent):
         claude_session = ClaudeSession()
-        return agent.runner._native_options(agent, {}, claude_session, _ClaudeSessionStore(claude_session, agent.name), stream=False)
+        return agent.runner._native_options(agent, {}, claude_session, stream=False)
 
     def test_native_subagent_fields_and_parent_tools_are_preserved(self, runtime):
         weather = AgentDefinition(

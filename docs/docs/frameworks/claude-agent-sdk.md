@@ -189,13 +189,15 @@ Each agent is its own Claude conversation. The CLI writes its transcript to loca
 replica does not have on the next turn, so Agent Kernel keeps the transcript in the **Agent Kernel session**
 through the SDK's `SessionStore` interface:
 
-- the SDK mirrors every transcript line to the store as the CLI runs;
-- once the turn's result arrives, the lines become part of the session, which your configured session store
-  (in-memory, Redis, Valkey, DynamoDB, …) persists as usual;
+- the SDK mirrors every transcript line to the store as the CLI runs, and each line is kept in the Agent Kernel
+  session as it arrives;
+- the session, with those lines, is persisted by your configured session store (in-memory, Redis, Valkey,
+  DynamoDB, …) as usual;
 - on the next turn, on any replica, the SDK restores the transcript and the CLI resumes the same Claude session.
 
-No configuration is needed. A turn that fails before its result, or a stream that is abandoned, leaves the
-previously stored transcript untouched. Two agents in one session do not share a transcript.
+No configuration is needed. A turn that fails before its result, or a stream that is abandoned, keeps the
+lines the SDK had already mirrored, and the next turn resumes from them. Two agents in one session do not share
+a transcript.
 
 :::caution Transcript size
 The transcript grows with every turn, including tool output and base64 images, and the whole session value is
@@ -236,21 +238,26 @@ blocks. `s3://` references and other file types are rejected; voice input is not
 ## Per-run context/state
 
 The SDK has no per-run caller-state slot of its own: a tool handler receives only its validated arguments. A
-`framework_context` set on the session is injected through an adapter-defined handle, `ClaudeToolContext`: a
-deep copy of the dict for the duration of one run, read with `ClaudeToolContext.get()` inside a tool bound with
-`ClaudeToolBuilder`. A tool mutates the dict it returns in place; the runner writes the touched keys back to
+`framework_context` set on the session is injected through `ToolContext.framework_context`, which only this adapter
+fills: a deep copy of the dict for the duration of one run, read with `ToolContext.get().framework_context` inside a
+tool bound with `ClaudeToolBuilder`. A tool mutates the dict it returns in place; the runner writes the touched keys back to
 the session after a successful run, the same load/mutate/write-back contract every other adapter's native
-handle gives:
+handle gives. Read it from `ToolContext.get().framework_context`, not from `ToolContext.get().session`, whose dict the
+write-back overwrites:
 
 ```python
 def add_item(item: str) -> str:
-    ClaudeToolContext.get()["cart"].append(item)
+    ToolContext.get().framework_context["cart"].append(item)
     return "added"
 ```
 
 This reaches only tools bound through `ClaudeToolBuilder.bind()` — never Claude's built-in tools (`Bash`,
 `Read`, ...) and never an externally connected MCP server, since neither is Python code Agent Kernel can hand
 the context to.
+
+`ToolContext.framework_context` is filled by the Claude adapter only. On every other framework it is `None`, so a
+tool that reads it is not portable; those frameworks hand the context to a tool through their own native slot. On
+Claude it is also `None` when the session has no `framework_context` set, so seed it first (see the example below).
 
 See the [runnable Claude context example](https://github.com/yaalalabs/agent-kernel/tree/develop/examples/cli/claude_context)
 for a cart that survives across turns.

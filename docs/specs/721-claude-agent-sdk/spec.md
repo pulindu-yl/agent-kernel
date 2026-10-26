@@ -9,14 +9,14 @@ This describes how the [design](design.md) maps the Claude Agent SDK onto Agent 
 | Location | Responsibility |
 | --- | --- |
 | `ak-py/src/agentkernel/framework/claude/claude.py` | Framework state, SDK bridge, stream mapper, runner, agent wrapper, module, and tool builder. |
-| `ak-py/src/agentkernel/framework/claude/__init__.py` | Export `ClaudeAgentSpec`, `ClaudeModule`, `ClaudeToolBuilder`, and `ClaudeToolContext`. |
+| `ak-py/src/agentkernel/framework/claude/__init__.py` | Export `ClaudeAgentSpec`, `ClaudeModule`, and `ClaudeToolBuilder`. |
 | `ak-py/src/agentkernel/claude.py` | Keep the short `agentkernel.claude` import path. |
 | `ak-py/src/agentkernel/trace/{langfuse,logfire,openllmetry,cloudwatch}/claude.py` | Framework-specific traced runners selected by the existing trace interface. |
 
 - Keep Claude SDK imports inside the adapter and Claude tracing modules. `core/` must not import the Claude SDK or depend on Claude-specific session data.
 - Keep `claude` as the optional package extra in `ak-py/pyproject.toml`. Loading the adapter requires that extra; other framework imports do not.
 - No new framework-neutral agent model, provider factory, or session backend is introduced. `ClaudeModule` is the same registration seam used by the other framework modules. A new pluggable backend is not being created.
-- In `claude.py`, place `ClaudeSession` and `_ClaudeSessionStore` before runner helpers, followed by `ClaudeRunner`, `ClaudeAgentSpec`/`ClaudeAgent`, `ClaudeModule`, and `ClaudeToolBuilder`. Helpers may sit before their consumer when Python needs them there.
+- In `claude.py`, place `ClaudeSession` before runner helpers, followed by `ClaudeRunner`, `ClaudeAgentSpec`/`ClaudeAgent`, `ClaudeModule`, and `ClaudeToolBuilder`. Helpers may sit before their consumer when Python needs them there.
 
 ### Main agent and native subagents
 
@@ -44,9 +44,7 @@ class ClaudeModule(Module):
 class ClaudeSession:
     def session_id(self, agent_name: str) -> str | None: ...
     def transcript(self, agent_name: str) -> dict[str, list[dict]]: ...
-    def save(self, agent_name: str, session_id: str, transcript: dict[str, list[dict]]) -> None: ...
-
-class _ClaudeSessionStore:
+    def bind(self, agent_name: str, session_id: str) -> None: ...
     async def append(self, key: Mapping[str, Any], entries: list[dict]) -> None: ...
     async def load(self, key: Mapping[str, Any]) -> list[dict] | None: ...
     async def list_subkeys(self, key: Mapping[str, Any]) -> list[str]: ...
@@ -54,9 +52,9 @@ class _ClaudeSessionStore:
 ```
 
 - `ClaudeRunner._session()` gets or creates one `ClaudeSession` under `Session.get("claude")` / `Session.set("claude", ...)`. That object stores IDs and plain JSON transcript entries by AK agent name. The empty subpath is the main transcript; named subpaths hold native subagent transcripts. No live `ClaudeSDKClient` is serialized.
-- Each run creates a short-lived `_ClaudeSessionStore` around one agent's `ClaudeSession` entry. Its `append()` buffers entries and skips UUIDs already saved or buffered; `load()` returns saved plus pending entries; `list_subkeys()` exposes subagent transcripts. The SDK's project key is ignored because the bridge is already scoped to the AK session and agent.
-- `_native_options()` gives the SDK this store with batched flushing. With no saved main transcript it assigns a fresh native session ID; with a saved main transcript it sets `resume` to the stored ID. The AK session ID and native Claude session ID remain distinct.
-- After a complete `ResultMessage`, `commit(result.session_id)` saves the buffered transcript, including a complete error result. A missing result or an abandoned stream does not commit. The configured AK session backend persists the enclosing `Session` after the runtime call.
+- `ClaudeSession` is also the SDK `SessionStore` of every run, as `OpenAISession` is the OpenAI SDK's session. Its `append()` stores entries as the SDK mirrors them, skipping UUIDs already stored; `load()` returns the stored entries; `list_subkeys()` exposes subagent transcripts. The SDK's project key is ignored because the session is already scoped to the AK session and agent.
+- `_native_options()` gives the SDK the `ClaudeSession` as its store, with batched flushing. With no saved main transcript it assigns a fresh native session ID and binds the agent to it; with a saved main transcript it sets `resume` to the stored ID. The AK session ID and native Claude session ID remain distinct.
+- Entries are stored as they arrive, so a turn that fails or is abandoned part way leaves what the SDK had mirrored, and the next turn resumes from it (as the OpenAI SDK does with its session). After a complete `ResultMessage`, the agent is bound to `result.session_id`. The configured AK session backend persists the enclosing `Session` after the runtime call.
 - A second AK agent name in the same session has its own native ID and transcript. Resume on another worker depends on the configured AK session backend carrying the complete transcript, not only the ID.
 - Transcript size grows with conversation length. The adapter has no compaction or separate transcript backend policy in this change; the design's size question remains open.
 
@@ -65,20 +63,20 @@ class _ClaudeSessionStore:
 - `ClaudeRunner.run()` and `stream()` resolve the agent's run options once, create the per-run context and SDK store, open a new `ClaudeSDKClient` in an async context manager, call `query()`, and read the SDK response. `resume()` and `resume_stream()` use the same client lifecycle after validating a paused record.
 - `_native_options()` copies `ClaudeAgentOptions`, overlays resolved native run options, and writes AK-owned conversation, session-store, and stream fields last. `ClaudeAgent.validate_run_options()` rejects caller declarations of those reserved fields, unknown option names, and an MCP server configuration incompatible with the AK tool server. A caller's other native options, hooks, and MCP servers remain available.
 - Text requests become a string prompt. Image and document requests become one native streaming-input user message. HTTPS media URLs and supported base64 media are accepted; S3 references, missing media types, and unsupported file types yield clear errors. An empty ordinary request returns a no-content reply before resolving run options.
-- A text result becomes `AgentReplyText`; a native structured output becomes `AgentReplyAny`. A complete SDK error result is converted to the normal AK user-facing error path while its transcript remains committed. A run with no result raises an error before commit.
-- `_ClaudeStreamMapper` is constructed per streamed run. It maps real native text, reasoning, tool-call, and tool-result messages to AK `StreamEvent`s, retains native IDs, and omits internal subagent traffic. Closing a stream early disconnects the SDK client and does not commit a partial transcript.
+- A text result becomes `AgentReplyText`; a native structured output becomes `AgentReplyAny`. A complete SDK error result is converted to the normal AK user-facing error path while its transcript remains stored. A run with no result raises an error.
+- `_ClaudeStreamMapper` is constructed per streamed run. It maps real native text, reasoning, tool-call, and tool-result messages to AK `StreamEvent`s, retains native IDs, and omits internal subagent traffic. Closing a stream early disconnects the SDK client; the entries mirrored so far stay stored.
 
 ### Bound tools and per-run context
 
 - `ClaudeToolBuilder.bind()` converts Python functions to SDK `SdkMcpTool`s with a schema from their signatures and optional SDK tool annotations. Variadic parameters and non-callables fail at bind time. Synchronous functions execute on a worker thread.
 - The runner serves bound tools through one in-process SDK MCP server named `ak`. It adds the server beside caller-supplied servers and approves ordinary bound tools by their native `mcp__ak__<name>` names. The name `ak` is reserved from caller MCP server declarations.
-- `ClaudeToolContext.get()` exposes a copy of AK's `framework_context` only while a bound tool runs. The runner stores changed keys back after a successful run or fully drained stream. Built-in Claude tools and external MCP servers cannot read this Python context handle. A failed run or early stream close leaves the stored context unchanged.
+- `ToolContext.get().framework_context` exposes a copy of AK's `framework_context` only while a bound tool runs. The runner stores changed keys back after a successful run or fully drained stream. Built-in Claude tools and external MCP servers cannot read this Python context handle. A failed run or early stream close leaves the stored context unchanged.
 - `ToolContext` is set for the SDK client lifetime and reset afterward. Context variables and the stream mapper belong to one run, not to the shared runner instance.
 
 ### Human approval and resume
 
 - A bound tool declared with `needs_approval=True` receives a `PreToolUse` hook that asks the SDK to `defer` the call. The adapter merges this hook with caller hooks. A per-run `_ClaudeApprovalGuard` also requires a matching one-use approval inside the tool handler, so an SDK permission mode that ignores `defer` cannot execute the tool unchecked.
-- On a `ResultMessage` with one deferred tool use, commit the transcript and create an AK `PausedRun` with the tool call ID, native session ID, and main-transcript position. Replace only an older pause for the Claude runner; leave another framework's pause alone.
+- On a `ResultMessage` with one deferred tool use, the transcript is already stored; create an AK `PausedRun` with the tool call ID, native session ID, and main-transcript position. Replace only an older pause for the Claude runner; leave another framework's pause alone.
 - Before resume, reject a missing or advanced transcript, a decision for anything other than the single deferred call, and an approved payload that is not a JSON object. Approved decisions allow the call, optionally with updated input; denied and cancelled decisions deny it with their respective messages.
 - A completed resume clears its paused record; a failed resume keeps it retryable. A new defer during resume supersedes the earlier record. Streamed pause/resume emits AK's pause event and closes stream boundaries.
 - The SDK's `defer` behavior and the exact resumed tool call still require a credentialed live run. `ak-py/tests/test_claude_hitl_live.py` is opt-in and skipped without credentials.
@@ -101,13 +99,13 @@ class _ClaudeSessionStore:
 
 - Declaration errors (missing name, reserved or unknown run option, MCP server collision, invalid tool signature) fail at declaration or module load with an actionable exception.
 - Unsupported request media becomes an AK error reply in `run()` or propagates through the stream path, matching the respective runner contract.
-- SDK/client failure before a complete result does not commit pending transcript entries. A complete SDK error result commits its transcript and reports the SDK error.
+- SDK/client failure before a complete result keeps the entries already mirrored and reports the failure. A complete SDK error result reports the SDK error.
 - Invalid resume decisions and stale saved conversations fail before entering the SDK client and preserve the pause record.
 - A tool awaiting approval returns an SDK tool error if invoked without a matching one-use grant. This remains enforced when the SDK's `defer` is not honored.
 
 ## Testing and acceptance
 
-- `ak-py/tests/test_claude_runner.py` patches `agentkernel.framework.claude.claude.ClaudeSDKClient` with `FakeClient`. Cover first/resumed turns, serialized session restore, agent isolation, transcript buffer/commit, native options and subagents, input/output mapping, stream close, context write-back, pause, and resume.
+- `ak-py/tests/test_claude_runner.py` patches `agentkernel.framework.claude.claude.ClaudeSDKClient` with `FakeClient`. Cover first/resumed turns, serialized session restore, agent isolation, transcript append/dedupe, native options and subagents, input/output mapping, stream close, context write-back, pause, and resume.
 - `ak-py/tests/test_tool_claude.py` covers tool schemas, annotations, validation, sync/async handlers, names, and `needs_approval` metadata.
 - `ak-py/tests/test_claude_traced_runner.py` patches `ClaudeRunner.resume`, `stream`, and `resume_stream` and checks trace contexts remain active through streamed iteration in each tracer.
 - `ak-py/tests/test_claude_hitl_live.py` is an opt-in credentialed check for an actual Claude CLI pause and resume. Before production claims, also run a credentialed two-turn session and native subagent flow, including a resumed turn after reloading the AK session from the configured backend.

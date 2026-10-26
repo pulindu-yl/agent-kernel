@@ -12,7 +12,7 @@ This design also simplifies the adapter already written on `feature/721-claude-a
   - A main run is configured with `ClaudeAgentOptions` and started with `query()` or `ClaudeSDKClient`; the options do not have an AK registry name or description. [Main agent configuration](https://code.claude.com/docs/en/agent-sdk/configuration), [Python SDK reference](https://code.claude.com/docs/en/agent-sdk/python).
   - The SDK **does** have `AgentDefinition`, but it is the native definition for a programmatic **subagent** in `ClaudeAgentOptions(agents={...})`. The dictionary key is its name. [Subagent guide](https://code.claude.com/docs/en/agent-sdk/subagents), [Python SDK reference](https://code.claude.com/docs/en/agent-sdk/python).
 - All adapters need conversation state. The OpenAI adapter keeps message items in `OpenAISession` (`ak-py/src/agentkernel/framework/openai/openai.py:62`). Claude resumes by session ID against a native transcript. The SDK writes transcripts to local disk and offers a `SessionStore` interface to mirror and restore them on another host. [Claude sessions](https://code.claude.com/docs/en/agent-sdk/sessions), [external session storage](https://code.claude.com/docs/en/agent-sdk/session-storage).
-- The Claude adapter has `ClaudeAgentSpec`, `ClaudeSession`, `_ClaudeSessionStore`, `ClaudeRunner`, and `_ClaudeStreamMapper` (`ak-py/src/agentkernel/framework/claude/claude.py`). An earlier `ClaudeAgentSpec.subagents` path mapped only some native subagent fields; the adapter now uses native `options.agents` directly.
+- The Claude adapter has `ClaudeAgentSpec`, `ClaudeSession`, `ClaudeRunner`, and `_ClaudeStreamMapper` (`ak-py/src/agentkernel/framework/claude/claude.py`). An earlier `ClaudeAgentSpec.subagents` path mapped only some native subagent fields; the adapter now uses native `options.agents` directly.
 
 ## Native Claude example
 
@@ -78,7 +78,7 @@ ClaudeModule([triage])
 | 4. Prepare input | `OpenAIRunner` converts `AgentRequest` values into OpenAI input. | `ClaudeRunner` converts them into Claude text or content blocks. Unsupported input must fail clearly. |
 | 5. Load conversation | AK `Session` holds `OpenAISession` message items, which are passed to the SDK as `session=`. | AK `Session` holds `ClaudeSession`: a Claude session ID and transcript entries for each AK agent name. The runner supplies `session_id` for a first turn or `resume` for a later turn. |
 | 6. Execute | Call the OpenAI SDK's `Runner.run(...)`. | Open a `ClaudeSDKClient`, call `query(...)`, and read SDK messages. The SDK starts and manages its Claude Code process. |
-| 7. Finish | Map `final_output` to `AgentReply`; the OpenAI SDK updates the supplied session. | Map the Claude result to `AgentReply`; commit the SDK transcript into `ClaudeSession` after a complete result. AK then persists its `Session` through its configured session backend. |
+| 7. Finish | Map `final_output` to `AgentReply`; the OpenAI SDK updates the supplied session. | Map the Claude result to `AgentReply`; the SDK transcript is already stored in `ClaudeSession`, which is the SDK's session store. AK then persists its `Session` through its configured session backend. |
 | 8. Stream | Map native OpenAI stream events to AK events. | Map native Claude stream events to AK events with a mapper local to that run. Close the client if the consumer stops early. |
 
 - AK's `Session` also holds application data. `ClaudeSession` is only the Claude **conversation** part; it is not a replacement for AK caches or other application state (`ak-py/src/agentkernel/core/base.py:28`).
@@ -97,18 +97,17 @@ flowchart TD
     Runner --> Input[Convert AK request to Claude input]
     Runner --> State[ClaudeSession: ID + transcript per AK agent]
     AKSession <--> State
-    State <--> Bridge[_ClaudeSessionStore: SDK transcript bridge]
     Runner --> Options[Build native options: new ID or resume]
     Options --> Client[ClaudeSDKClient]
     Input --> Client
-    Bridge <--> Client
+    State <--> Client
     Client --> CLI[Claude Code process and agent loop]
     Client --> Reply[AgentReply or _ClaudeStreamMapper]
     Reply --> Runtime
     AKSession --> Store[Configured AK SessionStore]
 ```
 
-- `ClaudeModule`, `ClaudeAgent`, `ClaudeRunner`, `ClaudeSession`, `_ClaudeSessionStore`, and `_ClaudeStreamMapper` are AK adapter parts. `ClaudeAgentOptions`, `AgentDefinition`, and `ClaudeSDKClient` come from the Claude SDK. The SDK, not AK, starts the Claude Code process.
+- `ClaudeModule`, `ClaudeAgent`, `ClaudeRunner`, `ClaudeSession`, and `_ClaudeStreamMapper` are AK adapter parts. `ClaudeAgentOptions`, `AgentDefinition`, and `ClaudeSDKClient` come from the Claude SDK. The SDK, not AK, starts the Claude Code process.
 - The diagram shows the target boundary; the current runner also has a `_subagent()` conversion that this design removes.
 
 ## Why the Claude adapter has extra parts
@@ -116,7 +115,7 @@ flowchart TD
 | Part | Why AK needs it | Assessment |
 | --- | --- | --- |
 | `ClaudeAgentSpec` | Gives the main SDK configuration an AK registry name and description. | A small wrapper is justified. A second AK subagent definition duplicates the SDK's `AgentDefinition` and loses native fields, so the target removes it. |
-| `ClaudeSession` and `_ClaudeSessionStore` | Connect AK's saved session to Claude's session ID and native transcript. | Needed for AK requests that may land on different workers. A single long-lived SDK client does not need this bridge. Transcript growth remains a backend limit to measure. |
+| `ClaudeSession` | Connect AK's saved session to Claude's session ID and native transcript, as the SDK's session store. | Needed for AK requests that may land on different workers. A single long-lived SDK client does not need this. Transcript growth remains a backend limit to measure. |
 | `ClaudeRunner` | Opens a client for each AK request, selects a new or resumed Claude session, and maps the result. | Required by AK's runner contract. SDK process startup and transport stay with the SDK. |
 | `_ClaudeStreamMapper` | Translates native text, reasoning, and tool events to AK stream events. | Normal adapter work; OpenAI also maps stream events. It is kept separate because Claude's event format and per-run state differ. |
 
@@ -135,10 +134,10 @@ flowchart TD
 
 - Reuse AK's existing `Session` and configured `SessionStore`. Store Claude conversation data under the `claude` framework key, alongside other AK session data. Add no new AK configuration field for this.
 - `ClaudeSession` holds a Claude session ID and ordered, opaque transcript entries for each AK agent name. It must not store a live SDK client or SDK-only object.
-- `_ClaudeSessionStore` implements the native SDK `SessionStore` methods needed to append and load the main transcript and discover subagent transcripts. Restore the same ordered entries when a conversation resumes on another worker. [SDK session-store contract](https://code.claude.com/docs/en/agent-sdk/session-storage).
+- `ClaudeSession` implements the native SDK `SessionStore` methods needed to append and load the main transcript and discover subagent transcripts. Restore the same ordered entries when a conversation resumes on another worker. [SDK session-store contract](https://code.claude.com/docs/en/agent-sdk/session-storage).
 - The first turn starts a new Claude session. A later turn with the same AK session and agent resumes its saved Claude session. Two AK agent names must not share a Claude conversation by accident.
-- Save a turn's transcript only after receiving a complete SDK `ResultMessage`; an interrupted stream without a result must leave the saved conversation unchanged. An SDK error result may still have a complete transcript and must be handled explicitly.
-- `framework_context` is injected through an adapter-defined handle, `ClaudeToolContext`, since the SDK has no native per-run caller-state slot of its own: the runner sets a per-run contextvar before the SDK client connects, a tool bound through `ClaudeToolBuilder` reads and mutates it with `ClaudeToolContext.get()`, and the runner writes the touched keys back to the session after a successful run. This reaches only AK-bound tools, never a Claude built-in tool or an external MCP server, which is documented as that boundary rather than implied as general support.
+- Store transcript lines as the SDK mirrors them, so an interrupted turn keeps what was mirrored and the next turn resumes from it, as the OpenAI SDK does with its session. An SDK error result may still have a complete transcript and must be handled explicitly.
+- `framework_context` is injected through `ToolContext.framework_context`, a field of the core `ToolContext` that only the Claude runner fills, since the SDK has no native per-run caller-state slot of its own: the runner sets it to a per-run copy before the SDK client connects, a tool bound through `ClaudeToolBuilder` reads and mutates it with `ToolContext.get().framework_context`, and the runner writes the touched keys back to the session after a successful run. This reaches only AK-bound tools, never a Claude built-in tool or an external MCP server.
 
 ### Runner and results
 
@@ -169,7 +168,7 @@ Durable human approval (`supports_pause`) uses the SDK's `defer` permission deci
 ## Open questions
 
 - How should AK handle a transcript larger than the configured AK session backend allows? Existing backends have different limits; this needs a measured policy before production use.
-- Should AK expose a separate native SDK `SessionStore` override for applications that want transcript storage outside the AK session? The current design uses the already pluggable AK session backend and reserves `session_store` for its bridge.
+- Should AK expose a separate native SDK `SessionStore` override for applications that want transcript storage outside the AK session? The current design uses the already pluggable AK session backend and reserves `session_store` for the `ClaudeSession`.
 - What deployment and credentialed test environment will verify resume across workers with the real Claude Code process?
 
 ## References

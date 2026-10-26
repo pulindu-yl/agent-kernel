@@ -60,7 +60,7 @@ Per-run framework context/state demos — a grocery assistant that carries a car
 - **`langgraph_context/`** - LangGraph, via a declared state channel on a custom graph
 - **`adk_context/`** - Google ADK, via `ToolContext.state`
 - **`pydanticai_context/`** - Pydantic AI, via `RunContext.deps`
-- **`claude_context/`** - Claude Agent SDK, via `ClaudeToolContext.get()` in bound Python tools
+- **`claude_context/`** - Claude Agent SDK, via `ToolContext.get().framework_context` in bound Python tools
 
 Per-agent native run options demos, one per framework plus a per-run factory variant: each declares that framework's turn-limit option and progress-hook option through `Module.run_options` and appends a deterministic `Run stats:` line to every reply (see the [Runner](../core-concepts/runner.md#native-run-options) guide):
 

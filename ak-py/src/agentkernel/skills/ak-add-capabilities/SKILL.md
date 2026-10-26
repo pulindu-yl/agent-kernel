@@ -766,7 +766,7 @@ these accessors are for hooks only. Tools must use their framework's native hand
 (`RunContextWrapper.context` on OpenAI, `RunContext.deps` on Pydantic AI, `tool_context.state` on ADK,
 ...) since a tool writing through `ToolContext.get().session` writes to a different object than the one
 the run is carrying. Round-trip fidelity is framework-dependent (full for OpenAI/Pydantic AI, partial for
-ADK/smolagents/LangGraph, supported for Claude-bound Python tools through `ClaudeToolContext.get()`, and unsupported for CrewAI) — see the framework's page under `docs/docs/frameworks/`
+ADK/smolagents/LangGraph, supported for Claude-bound Python tools through `ToolContext.get().framework_context`, and unsupported for CrewAI) — see the framework's page under `docs/docs/frameworks/`
 for specifics.
 
 **Accessing the framework-native session (optional):** unlike `framework_context` above (an app-defined
