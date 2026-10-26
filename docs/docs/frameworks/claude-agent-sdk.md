@@ -111,9 +111,9 @@ For agents that serve untrusted users, start from this lockdown and open up only
 | `cwd` | a dedicated directory | Where built-in file tools act |
 | `max_turns` / `max_budget_usd` | a limit | Bounds a runaway run |
 
-Tools you bind with `ClaudeToolBuilder` are always approved, the same as a bound tool simply runs in every other
-framework. To gate one, add a native `PreToolUse` hook matched on `mcp__ak__<tool name>`; hooks are evaluated
-before approvals.
+Tools you bind with `ClaudeToolBuilder` are approved by default, the same as a bound tool simply runs in every other
+framework. To gate one, bind it with `needs_approval=True` (the durable human approval described below), or add a
+native `PreToolUse` hook matched on `mcp__ak__<tool name>`; hooks are evaluated before approvals.
 
 ## Tool Binding
 
@@ -239,9 +239,11 @@ through the SDK's `SessionStore` interface:
   session as it arrives;
 - the session, with those lines, is persisted by your configured session store (in-memory, Redis, Valkey,
   DynamoDB, …) as usual;
-- on the next turn, on any replica, the SDK restores the transcript and the CLI resumes the same Claude session.
+- on the next turn the SDK restores the transcript from the session and the CLI resumes the same Claude session.
 
-No configuration is needed. A turn that fails before its result, or a stream that is abandoned, keeps the
+No configuration is needed. Continuity across turns in one process is covered by the example tests. Resuming on a
+*different* replica through a shared session backend (Redis, DynamoDB, ...) follows from this design but has not been
+validated against a live Claude CLI yet, so verify it with your backend before relying on it. A turn that fails before its result, or a stream that is abandoned, keeps the
 lines the SDK had already mirrored, and the next turn resumes from them. Two agents in one session do not share
 a transcript.
 
@@ -286,8 +288,8 @@ blocks. `s3://` references and other file types are rejected; voice input is not
 The SDK has no per-run caller-state slot of its own: a tool handler receives only its validated arguments. A
 `framework_context` set on the session is injected through `ToolContext.framework_context`, which only this adapter
 fills: a deep copy of the dict for the duration of one run, read with `ToolContext.get().framework_context` inside a
-tool bound with `ClaudeToolBuilder`. A tool mutates the dict it returns in place; the runner writes the touched keys back to
-the session after a successful run, the same load/mutate/write-back contract every other adapter's native
+tool bound with `ClaudeToolBuilder`. A tool mutates that dict in place (not the value it returns); the runner writes
+the touched keys back to the session after a successful run, the same load/mutate/write-back contract every other adapter's native
 handle gives. Read it from `ToolContext.get().framework_context`, not from `ToolContext.get().session`, whose dict the
 write-back overwrites:
 

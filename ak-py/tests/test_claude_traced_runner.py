@@ -84,10 +84,18 @@ def _openllmetry(probe):
 
     otel = MagicMock()
     otel.get_tracer.return_value.start_as_current_span.side_effect = lambda name, **kwargs: probe.span()
-    return module.OpenLLMetryClaudeRunner(), [patch.object(module, "trace_api", otel), patch.object(module, "TraceloopContext", _nothing)]
+    return module.OpenLLMetryClaudeRunner(), [
+        patch.object(module, "trace_api", otel),
+        patch.object(module, "TraceloopContext", _nothing),
+    ]
 
 
-BACKENDS = {"langfuse": _langfuse, "logfire": _logfire, "cloudwatch": _cloudwatch, "openllmetry": _openllmetry}
+BACKENDS = {
+    "langfuse": _langfuse,
+    "logfire": _logfire,
+    "cloudwatch": _cloudwatch,
+    "openllmetry": _openllmetry,
+}
 
 
 @pytest.fixture(params=sorted(BACKENDS))
@@ -139,3 +147,63 @@ async def test_openllmetry_creates_a_span_of_its_own():
     assert span.name == "Agent Kernel Claude"
     assert span.attributes["session_id"] == "s"
     assert span.attributes["traceloop.entity.input"] == "hi" and span.attributes["traceloop.entity.output"] == "answer"
+
+
+def _openllmetry_span(monkeypatch, content_env=None, override=None):
+    """Runs the OpenLLMetry Claude runner once against a real in-memory OpenTelemetry tracer; returns its span."""
+    import asyncio
+
+    from opentelemetry import context as context_api
+
+    import agentkernel.trace.openllmetry.claude as module
+
+    if content_env is None:
+        monkeypatch.delenv("TRACELOOP_TRACE_CONTENT", raising=False)
+    else:
+        monkeypatch.setenv("TRACELOOP_TRACE_CONTENT", content_env)
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    async def run(self, agent, session, requests):
+        return AgentReplyText(response="secret reply", prompt="secret prompt")
+
+    token = context_api.attach(context_api.set_value("override_enable_content_tracing", override)) if override is not None else None
+    try:
+        with patch.object(module.trace_api, "get_tracer", lambda name: provider.get_tracer(name)), patch.object(module, "TraceloopContext", _nothing):
+            with patch.object(ClaudeRunner, "run", run):
+                asyncio.run(
+                    module.OpenLLMetryClaudeRunner().run(
+                        object(),
+                        Session("s"),
+                        [AgentRequestText(prompt="secret prompt")],
+                    )
+                )
+    finally:
+        if token is not None:
+            context_api.detach(token)
+    (span,) = exporter.get_finished_spans()
+    return span
+
+
+def test_openllmetry_records_the_prompt_and_reply_by_default(monkeypatch):
+    span = _openllmetry_span(monkeypatch)
+
+    assert span.attributes["traceloop.entity.input"] == "secret prompt"
+    assert span.attributes["traceloop.entity.output"] == "secret reply"
+
+
+def test_openllmetry_leaves_the_prompt_and_reply_out_when_content_tracing_is_off(
+    monkeypatch,
+):
+    """TRACELOOP_TRACE_CONTENT=false is the user's request to keep prompts and replies out of traces; this span is written by hand, so it must honour it."""
+    span = _openllmetry_span(monkeypatch, content_env="false")
+
+    assert span.attributes["session_id"] == "s"
+    assert "traceloop.entity.input" not in span.attributes and "traceloop.entity.output" not in span.attributes
+
+
+def test_openllmetry_content_override_in_the_context_wins_over_the_switch(monkeypatch):
+    span = _openllmetry_span(monkeypatch, content_env="false", override=True)
+
+    assert span.attributes["traceloop.entity.input"] == "secret prompt"

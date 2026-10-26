@@ -1,8 +1,10 @@
 import logging
 from typing import Any
 
+from opentelemetry import context as context_api
 from opentelemetry import trace as trace_api
 from opentelemetry.semconv_ai import SpanAttributes
+from traceloop.sdk.config import is_content_tracing_enabled
 
 from ...core import Session
 from ...core.model import AgentReply, AgentRequest
@@ -24,6 +26,15 @@ class OpenLLMetryClaudeRunner(ClaudeRunner):
         super().__init__()
         self._log = logging.getLogger("ak.trace.openllmetry.claude")
 
+    @staticmethod
+    def _content_tracing_enabled() -> bool:
+        """
+        :return: Whether the prompt and reply may be recorded: OpenLLMetry's own switch (`TRACELOOP_TRACE_CONTENT`,
+            on by default) or its per-context override, as its instrumentations and decorators read them. The span
+            is written by hand rather than by an instrumentation, so the switch is not applied to it for us.
+        """
+        return is_content_tracing_enabled() or bool(context_api.get_value("override_enable_content_tracing"))
+
     async def run(self, agent: Any, session: Session, requests: list[AgentRequest]) -> AgentReply:
         """
         Runs the Claude agent with provided multi modal inputs.
@@ -38,6 +49,7 @@ class OpenLLMetryClaudeRunner(ClaudeRunner):
                 "Agent Kernel Claude", attributes={"session_id": session.id}
             ) as span:
                 result = await super().run(agent, session, requests)
-                span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_INPUT, result.prompt)
-                span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, str(result))
+                if self._content_tracing_enabled():
+                    span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_INPUT, result.prompt)
+                    span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, str(result))
         return result

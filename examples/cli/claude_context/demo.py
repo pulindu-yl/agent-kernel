@@ -27,8 +27,13 @@ class SeedCartContextPreHook(PreHook):
     """Create a cart for this session before its first Claude run."""
 
     async def on_run(self, session, agent, requests):
-        if session is not None and session.get_framework_context() is None:
+        if session is None:
+            return requests
+        context = session.get_framework_context()
+        if context is None:
             session.set_framework_context({"cart": []})
+        elif "cart" not in context:
+            context["cart"] = []  # keep what is already there, add what the tools need
         return requests
 
     def name(self) -> str:

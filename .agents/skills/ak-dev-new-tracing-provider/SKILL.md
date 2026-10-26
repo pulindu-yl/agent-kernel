@@ -102,6 +102,16 @@ class <Provider>(BaseTrace):
         from .smolagents import <Provider>SmolagentsRunner
 
         return <Provider>SmolagentsRunner(self._client)
+
+    def pydanticai(self) -> Runner:
+        from .pydanticai import <Provider>PydanticAIRunner
+
+        return <Provider>PydanticAIRunner(self._client)
+
+    def claude(self) -> Runner:
+        from .claude import <Provider>ClaudeRunner
+
+        return <Provider>ClaudeRunner(self._client)
 ```
 
 ### 3. Implement Framework-Specific Traced Runners
