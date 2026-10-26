@@ -1,8 +1,9 @@
 # Claude Agent SDK REST API example
 
 This example serves Claude Agent SDK agents through Agent Kernel's REST API. The `triage` agent
-delegates math, general and weather questions to Claude subagents. The weather agent calls a local
-Python function through `ClaudeToolBuilder`.
+delegates math, general and weather questions to Claude subagents, each declared once as a native
+`AgentDefinition` (only `triage` is registered with Agent Kernel). The weather subagent calls a local
+Python function bound to `triage` through `ClaudeToolBuilder`.
 
 ## Setup
 

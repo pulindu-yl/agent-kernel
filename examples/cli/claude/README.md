@@ -26,10 +26,15 @@ Each run starts a Claude Code CLI subprocess, bundled in the `claude-agent-sdk` 
 
 ## Multi-agent routing
 
-Claude's native multi-agent primitive is the **subagent**. The `triage` agent lists the specialist agents in
-native `AgentDefinition` entries in `ClaudeAgentOptions.agents`, and delegates to them
-through the SDK's `Agent` tool. The weather subagent calls `get_weather`, an Agent Kernel tool bound with
-`ClaudeToolBuilder`.
+Claude's native multi-agent primitive is the **subagent**. Each specialist is declared once, as a native
+`AgentDefinition` in the `triage` agent's `ClaudeAgentOptions.agents`, and `triage` delegates to them
+through the SDK's `Agent` tool. Only `triage` is registered with Agent Kernel: a subagent runs inside its run, and
+would be registered as an agent of its own only for callers that must address it directly.
+
+The weather subagent calls `get_weather`, an Agent Kernel tool bound to the `triage` agent with
+`ClaudeToolBuilder` and referred to by its MCP name in the subagent's `tools`. `triage` serves it from its own
+session, so it can call `get_weather` too. The math and general subagents list `tools=[]`: a subagent that lists no
+tools inherits every tool of the session.
 
 ## Built-in tools
 

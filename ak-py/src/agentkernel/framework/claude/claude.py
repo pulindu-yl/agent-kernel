@@ -658,8 +658,6 @@ class ClaudeRunner(BaseRunner):
 
             if result is None:
                 raise RuntimeError("Claude Agent SDK run ended without a result")
-            # The transcript is whole once the result arrives, even for an error or a deferred-tool stop.
-            claude_session.bind(agent.name, result.session_id)
 
             if result.deferred_tool_use is not None and not result.is_error:
                 self._store_framework_context(session, incoming, produced)
@@ -733,7 +731,6 @@ class ClaudeRunner(BaseRunner):
 
             if result is None:
                 raise RuntimeError("Claude Agent SDK resume ended without a result")
-            claude_session.bind(agent.name, result.session_id)
 
             if result.deferred_tool_use is not None and not result.is_error:
                 # A fresh pause (the same call deferred again, or a new one later in the turn) supersedes this
@@ -799,8 +796,6 @@ class ClaudeRunner(BaseRunner):
 
             if result is None:
                 raise RuntimeError("Claude Agent SDK stream ended without a result")
-            # After a normal drain only — a disconnect or error leaves the stored transcript intact.
-            claude_session.bind(agent.name, result.session_id)
 
             if result.deferred_tool_use is not None and not result.is_error:
                 try:
@@ -876,7 +871,6 @@ class ClaudeRunner(BaseRunner):
 
             if result is None:
                 raise RuntimeError("Claude Agent SDK resume stream ended without a result")
-            claude_session.bind(agent.name, result.session_id)
 
             if result.deferred_tool_use is not None and not result.is_error:
                 try:

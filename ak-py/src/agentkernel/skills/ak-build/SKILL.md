@@ -406,20 +406,25 @@ triage_agent = ToolCallingAgent(
 
 **Claude Agent SDK:**
 
-Add the new agent to the triage agent's `subagents` list. Agent Kernel turns each into a Claude subagent the triage
-agent delegates to through its `Agent` tool, and serves the subagent's tools from the triage agent's session:
+Add the new agent as a native `AgentDefinition` in the triage agent's `ClaudeAgentOptions.agents`. The triage agent
+delegates to it through its `Agent` tool, and Agent Kernel serves any bound tool from the triage agent's session:
 
 ```python
 triage_agent = ClaudeAgentSpec(
     name="triage",
     description="Routes requests to specialists",
-    options=ClaudeAgentOptions(model="sonnet", system_prompt="Route requests to the right specialist...", tools=[],
-                               setting_sources=[], permission_mode="dontAsk"),
-    subagents=[math_agent, general_agent, support_agent],  # Add here
+    options=ClaudeAgentOptions(
+        model="sonnet", system_prompt="Route requests to the right specialist...", tools=[],
+        setting_sources=[], permission_mode="dontAsk",
+        agents={
+            "math": AgentDefinition(description="Math questions", prompt="Answer math questions.", tools=[]),
+            "support": AgentDefinition(description="Support questions", prompt="Answer support questions.", tools=[]),  # Add here
+        },
+    ),
 )
 ```
 
-> **Gotcha (Claude Agent SDK):** A subagent's system prompt must be a string (or a custom prompt), not the `claude_code` preset. Subagent steps are not streamed; the subagent's answer arrives as the result of the parent's `Agent` tool call.
+> **Gotcha (Claude Agent SDK):** List `tools=` on every subagent (`tools=[]` for none): one that lists none inherits every tool of the session. A tool a subagent lists is served from the triage agent's session, so the triage agent can call it too. Subagent steps are not streamed; the subagent's answer arrives as the result of the parent's `Agent` tool call.
 
 ---
 

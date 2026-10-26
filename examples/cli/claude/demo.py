@@ -39,34 +39,9 @@ def options(system_prompt: str, agents: dict[str, AgentDefinition] | None = None
     )
 
 
-math_agent = ClaudeAgentSpec(
-    name="math",
-    description="Specialist agent for math questions",
-    options=options(
-        "You provide help with math problems. Give short and direct answers exactly to the question. "
-        "Don't provide any explanations nor additional details."
-    ),
-)
-
-general_agent = ClaudeAgentSpec(
-    name="general",
-    description="Agent for general questions",
-    options=options(
-        "You provide assistance with general queries. Give short and direct answers exactly to the question. "
-        "Don't provide any explanations nor additional details"
-    ),
-)
-
-weather_agent = ClaudeAgentSpec(
-    name="weather",
-    description="Agent that provides weather information",
-    options=options(
-        "You provide weather information upon request. Use the get_weather tool for all weather-related questions."
-    ),
-    tools=ClaudeToolBuilder.bind([get_weather]),
-)
-
-# The native subagents share triage's session. Its bound tool is served to the weather subagent by name.
+# Each specialist is declared once, as a native AgentDefinition, and only the triage agent is registered with Agent
+# Kernel. A subagent lists its tools: one that does not inherits every tool of the session, get_weather included.
+# get_weather is bound to the triage agent, which serves it from its own session, so the triage agent can call it too.
 triage_agent = ClaudeAgentSpec(
     name="triage",
     description="Front-line agent that routes each question to the right specialist",
@@ -74,21 +49,36 @@ triage_agent = ClaudeAgentSpec(
         "You determine which agent to use based on the user's question. Give short and direct answers "
         "exactly to the question. Don't provide any explanations nor additional details",
         agents={
-            "general": AgentDefinition(
-                description=general_agent.description, prompt=general_agent.options.system_prompt
+            "math": AgentDefinition(
+                description="Specialist agent for math questions",
+                prompt=(
+                    "You provide help with math problems. Give short and direct answers exactly to the question. "
+                    "Don't provide any explanations nor additional details."
+                ),
+                tools=[],
             ),
-            "math": AgentDefinition(description=math_agent.description, prompt=math_agent.options.system_prompt),
+            "general": AgentDefinition(
+                description="Agent for general questions",
+                prompt=(
+                    "You provide assistance with general queries. Give short and direct answers exactly to the "
+                    "question. Don't provide any explanations nor additional details"
+                ),
+                tools=[],
+            ),
             "weather": AgentDefinition(
-                description=weather_agent.description,
-                prompt=weather_agent.options.system_prompt,
+                description="Agent that provides weather information",
+                prompt=(
+                    "You provide weather information upon request. "
+                    "Use the get_weather tool for all weather-related questions."
+                ),
                 tools=[ClaudeToolBuilder.mcp_tool_name("get_weather")],
             ),
         },
     ),
-    tools=weather_agent.tools,
+    tools=ClaudeToolBuilder.bind([get_weather]),
 )
 
-ClaudeModule([triage_agent, math_agent, general_agent, weather_agent])
+ClaudeModule([triage_agent])
 
 if __name__ == "__main__":
     CLI.main()

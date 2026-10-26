@@ -966,6 +966,81 @@ class TestSubagents:
         assert options.agents["native"] is native
         assert options.tools == ["Agent"]
 
+    def test_a_tool_a_subagent_lists_is_still_served_and_approved_for_the_whole_session(self, runtime):
+        """Documented behavior: the tool is in the session-level server, so the parent can see and call it as well."""
+        weather = AgentDefinition(description="Weather", prompt="Use double.", tools=["mcp__ak__double"])
+        triage = ClaudeAgentSpec(
+            name="triage", options=ClaudeAgentOptions(tools=[], agents={"weather": weather}), tools=ClaudeToolBuilder.bind([double])
+        )
+
+        options = self._options(_module(triage).get_agent("triage"))
+
+        assert AK_MCP_SERVER in options.mcp_servers
+        assert "mcp__ak__double" in options.allowed_tools
+
+    def test_an_empty_tool_list_is_kept_so_the_subagent_inherits_nothing(self, runtime):
+        none = AgentDefinition(description="No tools", prompt="Answer.", tools=[])
+        triage = ClaudeAgentSpec(name="triage", options=ClaudeAgentOptions(tools=[], agents={"none": none}), tools=ClaudeToolBuilder.bind([double]))
+
+        options = self._options(_module(triage).get_agent("triage"))
+
+        assert options.agents["none"].tools == []
+
+    def test_a_subagents_own_mcp_servers_pass_through_untouched(self, runtime):
+        """A child-scoped server (the SDK's way to keep a tool from the parent) is the user's, and reaches the SDK as declared."""
+        server = {"weather": {"type": "http", "url": "http://127.0.0.1:1/mcp", "headers": {"Authorization": "Bearer x"}}}
+        weather = AgentDefinition(description="Weather", prompt="Use it.", tools=["mcp__weather__get_weather"], mcpServers=[server])
+        triage = ClaudeAgentSpec(name="triage", options=ClaudeAgentOptions(tools=[], agents={"weather": weather}))
+
+        options = self._options(_module(triage).get_agent("triage"))
+
+        assert options.agents["weather"] is weather
+        assert options.agents["weather"].mcpServers == [server]
+        assert AK_MCP_SERVER not in (options.mcp_servers or {})  # the agent has no tools of its own to serve
+
+    def test_hooks_the_user_declares_for_subagent_tool_calls_are_kept(self, runtime):
+        """The hook recipe (refuse a tool for the main thread) relies on AK not replacing declared hooks."""
+        from claude_agent_sdk import HookMatcher
+
+        async def refuse_main_thread(input_data, tool_use_id, context):
+            return {}
+
+        matcher = HookMatcher(matcher=None, hooks=[refuse_main_thread])
+        helper = AgentDefinition(description="Helper", prompt="Help.", tools=["mcp__ak__double"])
+        triage = ClaudeAgentSpec(
+            name="triage",
+            options=ClaudeAgentOptions(tools=[], agents={"helper": helper}, hooks={"PreToolUse": [matcher]}),
+            tools=ClaudeToolBuilder.bind([double]),
+        )
+
+        options = self._options(_module(triage).get_agent("triage"))
+
+        assert options.hooks == {"PreToolUse": [matcher]}
+
+    def test_native_subagents_are_kept_in_the_foreground(self, runtime):
+        """The CLI otherwise backgrounds a subagent, and the run's first result is then "still running"."""
+        helper = AgentDefinition(description="helper", prompt="Help.", tools=[])
+        triage = ClaudeAgentSpec(name="triage", options=ClaudeAgentOptions(tools=[], agents={"helper": helper}))
+
+        options = self._options(_module(triage).get_agent("triage"))
+
+        assert options.env == {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+        assert triage.options.env == {}
+
+    def test_an_env_the_agent_sets_wins_over_the_foreground_default(self, runtime):
+        helper = AgentDefinition(description="helper", prompt="Help.", tools=[])
+        env = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0", "OTHER": "1"}
+        triage = ClaudeAgentSpec(name="triage", options=ClaudeAgentOptions(tools=[], agents={"helper": helper}, env=env))
+
+        options = self._options(_module(triage).get_agent("triage"))
+
+        assert options.env == env
+
+    def test_an_agent_without_subagents_gets_no_env(self, runtime):
+        options = self._options(_module(_spec()).get_agent("general"))
+
+        assert options.env == {}
+
 
 # --- human in the loop ----------------------------------------------------------------------------------
 

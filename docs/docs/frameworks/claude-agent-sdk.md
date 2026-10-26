@@ -183,6 +183,57 @@ Agent Kernel enables and approves the parent's `Agent` tool.
 Subagent traffic is not streamed: the subagent's answer arrives as the result of the parent's `Agent` tool call. A
 subagent's own nested configuration follows the SDK's rules.
 
+Two things to know when a parent has bound tools:
+
+- **List every subagent's tools.** A subagent with no `tools=` inherits every tool of the session, the parent's
+  Agent Kernel tools included. Give one that needs none `tools=[]`.
+- **The parent sees its subagents' tools.** Agent Kernel serves the tools from the parent's session, as the SDK
+  does for any session-level MCP server, so a tool a subagent lists is available to the parent as well. `tools=`
+  limits what a *subagent* can use, not what the parent can. In practice a parent with a capable subagent delegates,
+  but nothing stops it calling the tool itself when asked to.
+
+### Keeping a tool from the parent
+
+How much isolation you need decides how to get it. Each option below was run against the SDK and CLI this adapter
+supports (`claude-agent-sdk` 0.2.165):
+
+| You need | Use | Parent can see the tool | Parent can run it |
+| :- | :- | :- | :- |
+| The parent to delegate rather than call | A clear system prompt, and `tools=` on every subagent | yes | yes |
+| The parent to be unable to run it | A `PreToolUse` hook in `ClaudeAgentOptions.hooks` (below) | **yes** | no |
+| The parent to be unable to see it | A server scoped to the subagent (below), or the specialist as an agent of its own | no | no |
+
+A `PreToolUse` hook gets `agent_id`, set only when the call is made inside a subagent, and `agent_type`, that
+subagent's name. A hook that returns `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision":
+"deny", "permissionDecisionReason": "..."}}` when `agent_id` is missing refuses the parent's call and lets the
+subagent's through. Agent Kernel keeps hooks you declare. This denies the *execution*: the tool is still in the
+parent's tool list, so the parent can try it and be refused. It is not isolation.
+
+For a tool that is not an Agent Kernel tool, the SDK's own way to give a tool to one subagent only is an MCP server
+declared on its `AgentDefinition`. The tool is then absent from the parent's tool list:
+
+```python
+"weather": AgentDefinition(
+    description="Agent that provides weather information",
+    prompt="Use the get_weather tool for weather questions.",
+    tools=["mcp__weather__get_weather"],
+    mcpServers=[{"weather": {"type": "http", "url": "http://127.0.0.1:8123/mcp"}}],
+)
+```
+
+Agent Kernel passes `mcpServers` through unchanged. Such a server runs outside Agent Kernel, so its tools have no
+`ToolContext`, session or framework context; and the SDK cannot send an in-process server (what `ClaudeToolBuilder`
+makes) this way, so an Agent Kernel tool cannot be scoped to a subagent. Where an Agent Kernel tool must stay
+invisible to the agent that routes to it, register the specialist as an agent of its own, as the other adapters do.
+
+Setting the parent's `disallowed_tools` for the tool does **not** work: the rule applies to the subagent as well, so
+the subagent fails to start, and the tool stays in the parent's list.
+
+With `agents=` set, Agent Kernel starts the CLI with `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`, so a subagent runs in
+the foreground and the run's first result is its answer. The CLI otherwise starts a subagent in the background and
+that first result is a "still running" note. Set the variable yourself in `ClaudeAgentOptions.env` to choose
+differently.
+
 ## Conversations and Sessions
 
 Each agent is its own Claude conversation. The CLI writes its transcript to local disk, which a stateless
