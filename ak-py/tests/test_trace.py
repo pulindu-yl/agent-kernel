@@ -97,6 +97,8 @@ def test_trace_langfuse_missing_extra_raises_friendly_import_error(monkeypatch):
 def test_trace_openllmetry_missing_extra_raises_friendly_import_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "traceloop", None)
     monkeypatch.setitem(sys.modules, "traceloop.sdk", None)
+    for name in [n for n in list(sys.modules) if n.startswith("agentkernel.trace.openllmetry")]:
+        monkeypatch.delitem(sys.modules, name, raising=False)  # a cached import would hide the missing extra
     with patch.object(AKConfig, "get", return_value=_config(True, "openllmetry")):
         with pytest.raises(ImportError) as exc_info:
             Trace.get()

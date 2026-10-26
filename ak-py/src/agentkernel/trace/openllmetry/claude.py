@@ -1,6 +1,9 @@
 import logging
 from typing import Any
 
+from opentelemetry import trace as trace_api
+from opentelemetry.semconv_ai import SpanAttributes
+
 from ...core import Session
 from ...core.model import AgentReply, AgentRequest
 from ...framework.claude.claude import ClaudeRunner
@@ -14,7 +17,9 @@ class OpenLLMetryClaudeRunner(ClaudeRunner):
         Initializes an OpenLLMetryClaudeRunner instance.
 
         OpenLLMetry has no Claude Agent SDK instrumentation, and its Anthropic instrumentation cannot see the
-        model calls, which the Claude Code CLI subprocess makes. Each run gets the outer Agent Kernel span only.
+        model calls, which the Claude Code CLI subprocess makes. `TraceloopContext` only attaches the session id to
+        whatever spans exist, so each run gets one Agent Kernel span of its own, from the OpenTelemetry tracer
+        Traceloop configures.
         """
         super().__init__()
         self._log = logging.getLogger("ak.trace.openllmetry.claude")
@@ -29,5 +34,10 @@ class OpenLLMetryClaudeRunner(ClaudeRunner):
         """
 
         with TraceloopContext(app_name="AgentKernel Claude", association_properties={"session_id": session.id}):
-            result = await super().run(agent, session, requests)
+            with trace_api.get_tracer("agentkernel.claude").start_as_current_span(
+                "Agent Kernel Claude", attributes={"session_id": session.id}
+            ) as span:
+                result = await super().run(agent, session, requests)
+                span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_INPUT, result.prompt)
+                span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_OUTPUT, str(result))
         return result
