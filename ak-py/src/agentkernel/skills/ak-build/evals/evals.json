@@ -96,6 +96,19 @@
       ]
     },
     {
+      "id": "build-tool-maf",
+      "name": "Add tool to Microsoft Agent Framework project",
+      "input": "Add a weather lookup tool to my Microsoft Agent Framework project",
+      "expected_outputs": [
+        "from agentkernel.core import ToolContext",
+        "ToolContext.get()",
+        "MAFToolBuilder.bind(["
+      ],
+      "must_not_contain": [
+        "OpenAIToolBuilder"
+      ]
+    },
+    {
       "id": "build-tool-claude",
       "name": "Add tool to Claude Agent SDK project",
       "input": "Add a weather lookup tool to my Claude Agent SDK project",
@@ -180,6 +193,18 @@
         "PydanticAIModule(["
       ],
       "description": "Must include name= and description= — Pydantic AI otherwise infers name lazily and has no description by default"
+    },
+    {
+      "id": "build-agent-maf",
+      "name": "Add agent to Microsoft Agent Framework project",
+      "input": "Add a support agent to my Microsoft Agent Framework project",
+      "expected_outputs": [
+        "from agent_framework import Agent",
+        "name=\"support\"",
+        "description=",
+        "MAFModule(["
+      ],
+      "description": "Must include name= — MAFModule raises ValueError for an unnamed agent because AK registers agents by name immediately"
     },
     {
       "id": "build-agent-claude",

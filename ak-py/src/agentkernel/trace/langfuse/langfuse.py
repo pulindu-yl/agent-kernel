@@ -75,6 +75,14 @@ class LangFuse(BaseTrace):
 
         return LangFusePydanticAIRunner(self._client)
 
+    def maf(self) -> Runner:
+        """
+        Returns the Langfuse MAF runner instance.
+        """
+        from .maf import LangFuseMAFRunner
+
+        return LangFuseMAFRunner(self._client)
+
     def claude(self) -> Runner:
         """
         Returns the Langfuse Claude Agent SDK runner instance.

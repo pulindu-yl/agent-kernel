@@ -39,6 +39,7 @@ import {
   FaInstagram,
   FaTelegram,
   FaGithub,
+  FaMicrosoft,
 } from "react-icons/fa";
 import {
   SiClaude,
@@ -781,6 +782,7 @@ function ProblemTable() {
 
 /* ─── Core Features ─────────────────────────────────────────────────────── */
 
+/** Render core capability cards with links to their documentation. */
 function CoreFeatures() {
   const sectionRef = useRef<HTMLElement>(null);
 
@@ -792,7 +794,7 @@ function CoreFeatures() {
         "Agent, Runner, Session, Module, Runtime, and Tools, a unified API across all frameworks. Build once, run on any supported framework.",
       highlights: [
         "Unified Python API",
-        "Framework adapters for 7 SDKs",
+        "Framework adapters for 8 SDKs",
         "Portable tool functions via ToolBuilder",
         "Framework-agnostic hooks",
       ],
@@ -802,7 +804,7 @@ function CoreFeatures() {
       icon: <MdSwapHoriz />,
       title: "Framework-Neutral Runtime",
       description:
-        "OpenAI Agents, LangGraph, CrewAI, Google ADK, Smolagents, Pydantic AI, and the Claude Agent SDK, run them all simultaneously in one runtime. Switch frameworks by changing 2 import lines.",
+        "OpenAI Agents, LangGraph, CrewAI, Google ADK, Smolagents, Pydantic AI, Microsoft Agent Framework, and the Claude Agent SDK, run them all simultaneously in one runtime. Switch frameworks by changing 2 import lines.",
       highlights: [
         "OpenAI Agents SDK",
         "LangGraph",
@@ -811,6 +813,7 @@ function CoreFeatures() {
         "Smolagents",
         "Pydantic AI",
         "Claude Agent SDK",
+        "Microsoft Agent Framework",
       ],
       link: "/docs/frameworks/overview",
     },
@@ -1166,6 +1169,7 @@ function SandboxSection() {
 
 /* ─── Framework Support ─────────────────────────────────────────────────── */
 
+/** Render supported framework links and the card for running multiple frameworks together. */
 function FrameworkSupport() {
   const sectionRef = useRef<HTMLElement>(null);
 
@@ -1275,6 +1279,14 @@ function FrameworkSupport() {
       // Drop /next after the Claude Agent SDK adapter is released.
       link: "/docs/next/frameworks/claude-agent-sdk",
       logo: <SiClaude className={styles.frameworkLogoImg} size={52} color="#D97757" aria-hidden="true" />,
+    },
+    {
+      key: "maf",
+      name: "Microsoft Agent Framework",
+      description:
+        "Microsoft Agent Framework (MAF), the unified successor to AutoGen and Semantic Kernel.",
+      link: "/docs/next/frameworks/microsoft-agents",
+      logo: <FaMicrosoft className={styles.frameworkLogoIcon} aria-hidden="true" />,
     },
   ];
 

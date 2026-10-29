@@ -148,6 +148,14 @@ class OpenLLMetry(BaseTrace):
 
         return OpenLLMetryPydanticAIRunner()
 
+    def maf(self) -> Runner:
+        """
+        Returns the OpenLLMetry MAF runner instance.
+        """
+        from .maf import OpenLLMetryMAFRunner
+
+        return OpenLLMetryMAFRunner()
+
     def claude(self) -> Runner:
         """
         Returns the OpenLLMetry Claude Agent SDK runner instance.

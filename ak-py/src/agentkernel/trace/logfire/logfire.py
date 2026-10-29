@@ -79,6 +79,14 @@ class Logfire(BaseTrace):
 
         return LogfirePydanticAIRunner()
 
+    def maf(self) -> Runner:
+        """
+        Returns the Logfire Microsoft Agent Framework runner instance.
+        """
+        from .maf import LogfireMAFRunner
+
+        return LogfireMAFRunner()
+
     def claude(self) -> Runner:
         """
         Returns the Logfire Claude Agent SDK runner instance.

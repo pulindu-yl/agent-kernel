@@ -57,6 +57,7 @@ const sidebars = {
         'frameworks/smolagents',
         'frameworks/pydantic-ai',
         'frameworks/claude-agent-sdk',
+        'frameworks/microsoft-agents',
         'frameworks/multi-framework',
       ],
     },

@@ -1,5 +1,5 @@
 import React from "react";
-import { FaAws } from "react-icons/fa";
+import { FaAws, FaMicrosoft } from "react-icons/fa";
 import { VscAzure } from "react-icons/vsc";
 import { TbPlugConnected } from "react-icons/tb";
 import {
@@ -76,6 +76,7 @@ export const INTEGRATION_ROWS: IntegrationRow[] = [
       { name: "Pydantic AI", role: "Framework", href: "/docs/frameworks/pydantic-ai", icon: <SiPydantic /> },
       // Drop /next after the Claude Agent SDK adapter is released.
       { name: "Claude Agent SDK", role: "Framework", href: "/docs/next/frameworks/claude-agent-sdk", icon: <SiClaude /> },
+      { name: "Microsoft Agent Framework", role: "Framework", href: "/docs/next/frameworks/microsoft-agents", icon: <FaMicrosoft /> },
       { name: "Claude Code", role: "Agent skills", href: SKILLS, icon: <SiClaude /> },
       { name: "Cursor", role: "Agent skills", href: SKILLS, icon: <SiCursor /> },
       { name: "Codex", role: "Agent skills", href: SKILLS, logo: "/img/integrations/openai.svg", mono: true },
